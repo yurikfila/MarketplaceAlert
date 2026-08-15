@@ -1,0 +1,759 @@
+# Changelog
+
+All notable changes to this project are recorded here. Format is roughly
+[Keep a Changelog](https://keepachangelog.com/); dates are `YYYY-MM-DD`.
+
+## [Unreleased]
+
+## 2026-08-15 — Robust Telegram delivery under bursts
+
+**Real-world issue observed**: a new Etsy + eBay saved search returned many
+new listings in one scan. Telegram successfully sent many notifications,
+but some failed outright with "Telegram API request failed" - burst
+sending with no pacing hit Telegram's own rate limiting, and there was no
+retry for transient failures. Fixed without adding any external queue
+infrastructure (no Redis/Celery/RabbitMQ) - the delivery path stays fully
+synchronous and provider-based, just more resilient.
+
+### Changed
+- `TelegramNotificationProvider.send_listing_alert`
+  (`marketplace_alert/notifications/telegram/provider.py`) now retries
+  *transient* failures - HTTP 429, 500, 502, 503, 504, and
+  timeout/connection errors - up to `max_retries` times (bounded, never
+  forever) with exponential backoff (`retry_base_seconds * 2^(attempt-1)`).
+  On HTTP 429, Telegram's own `parameters.retry_after` from the response
+  body is honored directly when present, instead of guessing a wait time.
+  *Permanent* failures - any other non-200 status (400 malformed request,
+  401/403 bad credentials, 404 chat not found, etc.) and a 200 response
+  with `"ok": false` - are never retried, since retrying a bad bot token or
+  chat ID could never succeed; they raise `NotificationError` on the first
+  attempt, exactly as before this change. The external contract
+  (`NotificationError` on failure, nothing on success) is unchanged -
+  callers don't need to know a retry happened.
+- `NotificationService.notify_new_listings`
+  (`marketplace_alert/core/notifications/service.py`) now sends listings
+  strictly in order, waiting `send_delay_seconds` between sends (never
+  before the first one, so a single new listing is never delayed) - a
+  generic pacing knob (not Telegram-specific logic) that governs the gap
+  *between* separate listings' sends, distinct from the provider's own
+  per-send retries. A failure on one listing (after the provider's own
+  retries are exhausted) is still logged and skipped, exactly as before -
+  it never stops the remaining listings in the batch, and
+  `notify_new_listings` itself still never raises.
+- `settings.telegram_send_delay_seconds` (default `1.0` - Telegram's own
+  documented guideline for messages to the same chat), `settings.telegram_max_retries`
+  (default `3`, so up to 4 attempts total), `settings.telegram_retry_base_seconds`
+  (default `2.0`) added to `marketplace_alert/config.py`, wired into
+  `NotificationService`/`TelegramNotificationProvider` construction in
+  `main.py`. `.env.example` updated with placeholder/default values only -
+  the developer's real `.env` was not modified.
+
+### Added
+- Structured logging (JSON, via the existing `configure_logging()`) for:
+  notification queued, notification sent, retry attempt (with the reason
+  and wait time), permanent failure, and final failure after retries
+  exhausted - all sanitized, same rule as every existing log line here:
+  never the bot token, chat ID, or any other credential.
+- Tests (205/205 passing, up from 180): extensive additions to
+  `tests/test_telegram_provider.py` (timeout/connection-error/500/502/503/504
+  retried then succeeding, HTTP 429 honoring `retry_after` vs. falling back
+  to backoff when absent, retries bounded then raising, `max_retries=0`
+  meaning a single attempt, permanent 400/401 and `"ok": false` never
+  retrying, credentials never appearing in a raised error message or in any
+  log line across a full retry sequence - via a new autouse fixture that
+  captures `time.sleep` calls instead of actually sleeping, so the whole
+  file still runs in well under a second) and `tests/test_notification_service.py`
+  (a burst of 5 listings paced with the expected gaps and no delay before
+  the first, a single new listing never delayed, zero/negative delay
+  configuration handled safely, send order preserved, one failed
+  notification not stopping delivery to the others in the same batch); new
+  cases in `tests/test_saved_search_scheduler.py` (a Telegram-side failure,
+  not a connector failure, surviving both a manual run and a full scheduler
+  tick with another saved search still completing in the same tick, and -
+  the key semantic guarantee - a listing persisted during a run where
+  notification failed is *not* re-notified on a later run, proving the
+  database and not delivery success is the source of truth for "already
+  discovered") and `tests/test_saved_searches_api.py` (the manual
+  `POST /saved-searches/{id}/run` endpoint surviving a notification
+  provider failure with a normal 200 response, not a 500). All existing
+  Etsy, eBay, mock, connector-registry, persistence, and dashboard tests
+  continue to pass unchanged - no marketplace connector, OAuth, saved-search,
+  or duplicate-detection code was touched by this change.
+
+### Not yet implemented
+- A persistent background notification queue/worker thread - considered
+  and deliberately not built for this; see `ARCHITECTURE.md` "Why these
+  choices" for the reasoning (mainly: it would decouple "the scan
+  finished" from "the alerts were sent" for no real benefit at this
+  scale, and complicate testing). Delivery stays synchronous: a saved
+  search with a very large burst of new listings will take proportionally
+  longer to return while pacing sends, rather than returning immediately
+  and delivering in the background.
+- Retry/backoff/rate limiting for the marketplace **connectors**
+  themselves (Etsy, eBay) - this change is Telegram notification delivery
+  only.
+- Redis, Celery, RabbitMQ, Kafka, or any other external queue
+  infrastructure - explicitly out of scope for this change.
+- User accounts, a web frontend beyond the existing MVP dashboard, mobile
+  app, cloud deployment, payments.
+
+## 2026-08-15 — Second real marketplace connector: eBay
+
+Phase 2's "prove one real connector works" claim is now proven a second
+time, via the eBay **Buy Browse API** - explicitly not the legacy Finding
+API, and never scraping. Endpoint, auth, and field mappings were verified
+against eBay's own official Browse API references before any code was
+written (see the connector and token-manager modules' docstrings for exact
+sources); the developer had also already manually confirmed, outside this
+codebase, that the same OAuth token request and search request both return
+real HTTP 200 responses against eBay's production API. No live eBay search
+was run as part of this change itself - only mocked-HTTP tests plus a
+dashboard-only smoke check confirming the connector reports itself
+configured.
+
+### Added
+- `EbayMarketplaceConnector`
+  (`marketplace_alert/connectors/ebay/connector.py`): calls
+  `GET https://api.ebay.com/buy/browse/v1/item_summary/search`. Supports
+  `q` (keyword), a safe configurable page size (`limit`, `ebay_result_limit`
+  setting, default 25, eBay's own max 200), and `offset` for pagination
+  (structured for future multi-page looping, not looped yet - same pattern
+  as Etsy). Maps `itemId` → `external_listing_id`, `title`,
+  `shortDescription` → `description`, `price.value`/`price.currency`
+  (eBay's `value` is a decimal string, e.g. `"89.99"`, unlike Etsy's scaled
+  integer `money` object), `itemWebUrl` → `listing_url`, `image.imageUrl`
+  → `image_url` (primary image only), `itemLocation` → `location`,
+  `seller.username` → `seller`, `condition` → `condition`,
+  `itemCreationDate` → `created_at`. Any field eBay doesn't return is left
+  `null`, never invented. Handles eBay's "0 results" shape correctly (the
+  `itemSummaries` key is omitted entirely, not an empty array) as distinct
+  from a genuinely malformed response.
+- `EbayTokenManager` (`marketplace_alert/connectors/ebay/token_manager.py`):
+  OAuth 2.0 **client_credentials** grant (an Application Access Token, no
+  user login) - `POST https://api.ebay.com/identity/v1/oauth2/token` with
+  `EBAY_APP_ID` as `client_id` and `EBAY_CERT_ID` as `client_secret`
+  (`EBAY_DEV_ID` is never read - the application-token flow doesn't need
+  it). The token is cached in memory and reused across every search -
+  refreshed only when missing or within 60 seconds of its own `expires_in`
+  (tracked via `time.monotonic()`), never fetched fresh per search.
+  `invalidate()` drops the cached token if a search itself comes back
+  401/403, in case it was revoked early. The token value is never logged
+  (not even at DEBUG), never persisted, and never exposed through any API
+  response.
+- `MarketplaceConnectorError` raised (same type Etsy already uses) for:
+  missing/partial credentials (checked before any network call, including
+  the token request), OAuth token request failures and non-200 responses,
+  401/403 (which also invalidate the cached token) and 429 on the search
+  request itself, timeouts, and non-JSON or malformed bodies - always after
+  logging a sanitized message, never the raw exception, response, or
+  credentials. A single malformed listing inside an otherwise-valid
+  response is skipped and logged, not fatal to the whole search.
+- `"ebay"` registered in the connector registry
+  (`marketplace_alert/connectors/registry.py`) - one line, same factory-dict
+  pattern as Etsy, wiring `settings.ebay_app_id`/`settings.ebay_cert_id`/
+  `settings.ebay_result_limit` in. `is_marketplace_supported("ebay")` is now
+  `True`, so saved searches can use `"ebay"` alone or alongside `"etsy"`/
+  `"mock"` with no other changes.
+- `settings.ebay_app_id` / `settings.ebay_cert_id` (both optional - missing
+  either disables the connector with a clear error when it's actually used,
+  not a startup crash) and `settings.ebay_result_limit` (default 25) in
+  `marketplace_alert/config.py`. `.env.example` updated with placeholder
+  values only (`EBAY_APP_ID`, `EBAY_DEV_ID`, `EBAY_CERT_ID`).
+- Dashboard: a new "eBay" status row (`marketplace_alert/templates/dashboard.html`),
+  reading `EbayMarketplaceConnector.is_configured` exactly like the
+  existing Etsy row - never a credential value. The marketplace checkbox
+  list and the supported-marketplace count already pick up `"ebay"`
+  automatically through the existing registry-based mechanism
+  (`list_supported_marketplaces()`) - no template changes were needed for
+  those.
+- Tests (180/180 passing, up from 137): new `tests/test_ebay_token_manager.py`
+  (configuration checks, request construction, caching, refresh near
+  expiry, `invalidate()`, transport failure, non-200/malformed/missing-field
+  responses, credentials never appear in a raised error message) and
+  `tests/test_ebay_connector.py` (request construction, token reuse across
+  searches, full and partial field normalization, missing/partial
+  credentials raising before any network call, empty/multi/malformed
+  results, a single malformed listing skipped, 401/403/429/500/timeout,
+  OAuth failure propagation, `health_check`); updates to
+  `tests/test_connector_registry.py` (eBay now resolves and is reported
+  supported - the old "ebay is unsupported" assertions were flipped, not
+  just added to), `tests/test_saved_searches_api.py` (the "unsupported
+  marketplace" example switched from `"ebay"` to `"vinted"` now that eBay
+  is real; a new create-with-Etsy-and-eBay case), and
+  `tests/test_saved_search_scheduler.py` (the scheduler surviving a *real*
+  `EbayMarketplaceConnector`'s HTTP failure; Etsy still running if eBay
+  fails on the same saved search and vice versa; an eBay-sourced listing
+  not notified twice across two runs; a same-titled "Makita" listing on
+  Etsy and eBay staying two independent, both-new listings - duplicate
+  detection never conflates marketplaces). All eBay tests monkeypatch
+  `httpx.get`/`httpx.post` - no test makes a real eBay API or OAuth call,
+  even though the developer's real, working production `.env` credentials
+  are present and the connector reports itself configured.
+- Documentation updates: `PROJECT_CONTEXT.md`, `ARCHITECTURE.md` (new "The
+  eBay connector" section with the verified endpoint/auth/field-mapping
+  details, updated registry/dashboard/layout sections), `ROADMAP.md`
+  (Phase 2's connector proof now shown twice; Phase 5 now "three
+  connectors", not two).
+
+### Not yet implemented
+- Additional real connectors beyond mock/Etsy/eBay (Vinted, Yad2, Facebook
+  Marketplace, Mercari, etc.).
+- eBay pagination beyond the first page - same structure/reasoning as
+  Etsy's existing single-page limitation.
+- A live eBay search has not been run as part of this change - deliberately,
+  per scope for this task (mocked-HTTP tests plus a dashboard smoke check
+  only).
+- User accounts, a web frontend beyond the existing MVP dashboard, mobile
+  app, cloud deployment, payments.
+
+## 2026-08-15 — Multi-marketplace saved searches
+
+The system was verified working end-to-end with real Etsy listings before
+this change. One saved search can now target several marketplaces at once
+(Phase 5's core claim), and existing real saved searches (Pokemon->mock,
+Maccabi->etsy, Makita->etsy) were migrated safely - verified against a real
+backup of the developer's database, not just the test suite. Two real bugs
+were caught this way that a purely synthetic test fixture had missed; see
+"Fixed" below.
+
+### Changed
+- **`SavedSearch.marketplace` (a single string) is now
+  `SavedSearch.marketplaces` (`list[str]`)**, backed by a new
+  `SavedSearchMarketplace` join table
+  (`marketplace_alert/core/saved_searches/models.py`) - never a
+  comma-separated string. `SavedSearchCreate`/`Update`/`Read` all changed
+  from `marketplace: str` to `marketplaces: list[str]` accordingly
+  (`marketplace_alert/core/saved_searches/schemas.py`).
+- `SavedSearchRunResponse` now carries a `results: list[MarketplaceRunResult]`
+  breakdown (`marketplace`, `new_count`, `already_seen_count`, `error`) in
+  addition to the existing aggregate `new_count`/`already_seen_count`
+  totals, so `POST /saved-searches/{id}/run` reports each marketplace's
+  outcome individually - e.g. `etsy: 2 new, 25 already seen` /
+  `mock: 0 new, 1 already seen` in one response.
+- `SavedSearchRunner.run()` now loops over every marketplace on the saved
+  search, independently. **Resilience is now split across two boundaries**:
+  the runner catches a failure in one marketplace so it can't stop the
+  other marketplaces in the *same* search (new); `BackgroundScanner` still
+  catches a failure in one saved search so it can't stop *other* saved
+  searches (unchanged). Neither replaces the other.
+- Dashboard create form: the single marketplace dropdown is now a group of
+  checkboxes (one per `list_supported_marketplaces()` entry, still the
+  single source of truth) plus a "Select all" convenience checkbox
+  (`marketplace_alert/templates/dashboard.html`,
+  `marketplace_alert/static/dashboard.js`). The saved-searches table shows
+  every selected marketplace per row (e.g. "Etsy, Mock").
+
+### Added
+- `SavedSearchMarketplace` model (`saved_search_marketplaces` table): `id`,
+  `saved_search_id` (FK, cascades on delete), `marketplace_name`, unique on
+  the pair - the actual duplicate-marketplace-per-search guarantee, at the
+  database level, not just application logic (same pattern as the
+  `discovered_listings` dedup constraint). `SavedSearch.marketplaces` is a
+  read-only `list[str]` property over the relationship.
+- Validation: `marketplaces` must be non-empty and duplicate-free (schema
+  level), and every entry must have a registered connector (service level,
+  via the existing injected `is_marketplace_supported` predicate - `core/`
+  still never imports the registry directly).
+- `marketplace_alert/core/saved_searches/migration.py`
+  (`migrate_legacy_marketplace_column`): a one-time, idempotent, hand-
+  written migration (this project has no Alembic). Runs once at startup,
+  right after `init_db()`. If `saved_searches` still has the old single
+  `marketplace` column, copies each row's value into
+  `saved_search_marketplaces` (skipping already-linked rows, so reruns are
+  safe) and drops the legacy column - a no-op once already applied, or on
+  a database that never had the old column. Runs inside one
+  `engine.begin()` transaction, so a failure rolls back cleanly.
+
+### Fixed
+- **Collection-replace ordering in `SavedSearchRepository.update()`.**
+  Reassigning `saved_search.marketplace_links` to a brand-new list in one
+  step let SQLAlchemy interleave the DELETE/INSERT statements, which
+  tripped the `(saved_search_id, marketplace_name)` unique constraint
+  whenever a marketplace was unchanged across an edit (e.g. `["mock"]` ->
+  `["etsy", "mock"]` - re-adding "mock" raced the deletion of the old
+  "mock" row). Fixed by clearing the collection and flushing *before*
+  extending it with the new list. Caught by
+  `tests/test_saved_searches_api.py::test_edit_saved_search_replaces_marketplace_selection`.
+- **The legacy-column migration's dangling index.** The original single-
+  marketplace model had `index=True` on that column. SQLite's
+  `ALTER TABLE ... DROP COLUMN` doesn't clean up indexes referencing the
+  dropped column, so the migration failed the first time it ran against a
+  real copy of the developer's database
+  (`error in index ix_saved_searches_marketplace after drop column`) - a
+  hand-built test fixture that omitted that index had passed, which is
+  exactly why it hadn't caught the bug. Fixed by having the migration look
+  up and drop any index touching the column before the `ALTER TABLE`, and
+  by rebuilding the test fixture to match the real schema exactly,
+  including the index (`tests/test_saved_search_migration.py`). The failed
+  attempt rolled back cleanly (one transaction) - real data was never at
+  risk, but a real backup (`marketplace_alert.db.backup-before-multi-marketplace`)
+  was taken before ever running the new code against the real database,
+  and the fix was re-verified against that same real database afterward.
+- Tests (137/137 passing, up from 118): every existing saved-search,
+  scheduler, and dashboard test updated for the `marketplaces` list shape;
+  new cases across `tests/test_saved_searches_api.py` (create with one and
+  with multiple marketplaces, reject zero/duplicate/unsupported
+  marketplaces on create *and* edit, retrieve/edit/remove marketplace
+  selections, per-marketplace run breakdown), `tests/test_saved_search_scheduler.py`
+  (the scheduler searching every marketplace on one saved search, one
+  failing marketplace not stopping another *in the same search* - distinct
+  from the existing one-saved-search-not-stopping-another test), new
+  `tests/test_saved_search_migration.py` (migrates real-shaped legacy data,
+  idempotent on rerun, no-op on a fresh database or a table-less one), and
+  `tests/test_dashboard.py` (checkboxes match the registry, a "select all"
+  checkbox exists, the saved-searches table shows every selected
+  marketplace). All still use the isolated-DB `client` fixture; nothing
+  touches the developer's real database or sends a real Telegram message.
+- Documentation updates: `PROJECT_CONTEXT.md`, `ARCHITECTURE.md` (rewritten
+  "Saved searches and background scanning" section covering the join table,
+  the runner's two-tier resilience, and the migration; updated dashboard
+  section for checkboxes), `ROADMAP.md` (Phase 5's core claim marked proven).
+
+### Not yet implemented
+- Editing marketplaces from the dashboard UI - `PATCH` fully supports it
+  and is tested, but the dashboard only exposes marketplace checkboxes on
+  the *create* form, not an "edit an existing search" control.
+- Additional real connectors beyond mock/Etsy (eBay still blocked on API
+  approval) - "multiple marketplaces" so far means "up to two".
+- User accounts, a web frontend beyond the existing MVP dashboard, mobile
+  app, cloud deployment, payments.
+
+## 2026-08-15 — Local web management dashboard
+
+Etsy is now verified working end-to-end in real use (real searches, real
+scheduled scans, real Telegram alerts on genuinely new listings). This
+change adds the first browser UI so a non-technical user can manage saved
+searches without `curl`, Swagger, or editing code - a local, unauthenticated
+MVP dashboard, per scope (no auth, no mobile app, no backend redesign).
+
+### Changed
+- **`GET /` now serves the dashboard, not the old JSON service-info blob.**
+  `{"name": ..., "version": ..., "environment": ...}` is no longer
+  returned from `/` - that endpoint wasn't in this task's "must keep
+  working" list (`/health`, `/search`, `/scan`, `/saved-searches*`,
+  `/docs` all are, and all are unchanged). `tests/test_main.py`'s
+  `test_root_endpoint` was updated (not removed) to assert the new,
+  intentional behavior - it now checks for the dashboard's HTML instead of
+  the old JSON fields, using the isolated-DB `client` fixture instead of
+  the module-level raw `TestClient`, since `/` now reads from the database.
+
+### Added
+- Dashboard template and assets: `marketplace_alert/templates/dashboard.html`
+  (Jinja2, autoescaped), `marketplace_alert/static/dashboard.css`
+  (hand-written, mobile-first, no framework), `marketplace_alert/static/dashboard.js`
+  (vanilla JS, no dependencies) - mounted at `/static` via `StaticFiles`.
+  Three sections, as specified: create a saved search (keyword, marketplace
+  dropdown, scan-interval dropdown with presets from 1 minute to 1 hour,
+  active checkbox), the saved-searches table (query, marketplace,
+  active/inactive, interval, last-scanned time, ID, and Run Now/Enable-
+  Disable/Delete actions - Delete asks for confirmation first), and a
+  system-status section (backend running; Telegram/Etsy configured as
+  booleans only; count of active saved searches; count of supported
+  marketplaces).
+- **No duplicated saved-search logic**: the initial page read
+  (`SavedSearchService.list_all()`, the same service the JSON API uses)
+  and every dashboard *action* (create/run/enable-disable/delete) is the
+  page's JS calling the pre-existing `/saved-searches*` endpoints - there
+  is exactly one implementation of each operation.
+- `list_supported_marketplaces()`
+  (`marketplace_alert/connectors/registry.py`) - the marketplace
+  dropdown's single source of truth, alongside the existing
+  `is_marketplace_supported`, so the dropdown can never list a marketplace
+  the backend would then reject.
+- `NotificationService.is_enabled`
+  (`marketplace_alert/core/notifications/service.py`) - a thin pass-
+  through to the provider's own `is_enabled`, so the dashboard's "Telegram
+  configured?" status doesn't need to reach into the service's private
+  state.
+- Success/error feedback: a one-shot banner shown after page actions
+  ("Search created.", "Scan completed: N new, M already seen.", "Search
+  deleted.", or the API's own sanitized error `detail` - e.g. "Saved
+  search not found") - passed across the post-action page reload via
+  `sessionStorage`, since there's no session/auth layer to hang it off yet.
+- Tests (118/118 passing, up from 99): new `tests/test_dashboard.py`
+  (all three sections present, empty-state message, saved searches listed,
+  marketplace dropdown matches the registry, action buttons carry correct
+  IDs, last-scanned display, active-count and marketplace-count badges,
+  Telegram/Etsy configured *and* not-configured status states, HTML-escaping
+  of a `<script>`-containing query to rule out stored XSS, no credential
+  *values* or credential *env-var names* anywhere in the rendered page,
+  static CSS/JS actually served, and existing `/saved-searches*` endpoints
+  still reachable alongside the dashboard) plus the `test_main.py` update
+  above. All dashboard tests use the isolated-DB `client` fixture - none
+  touch the developer's real `marketplace_alert.db`.
+- New dependency: `jinja2>=3.1` (`pyproject.toml`) - templating only, no
+  other new dependency (static files use Starlette's `StaticFiles`,
+  already available via FastAPI).
+- Documentation updates: `PROJECT_CONTEXT.md`, `ARCHITECTURE.md` (new
+  "The management dashboard" section), `ROADMAP.md` (Phase 7 marked
+  partially done - saved-search management exists; a discovered-listings
+  view and auth are still open).
+
+### Not yet implemented
+- Authentication on the dashboard (or anywhere) - local/unauthenticated by
+  design for this MVP; do not expose it beyond localhost as-is.
+- A discovered-listings view in the dashboard - it manages saved-search
+  definitions only, not the listings they've found.
+- Mobile app, cloud deployment, eBay integration, additional marketplaces,
+  payments, user accounts.
+
+## 2026-08-14 — First real marketplace connector: Etsy
+
+Phase 2's goal (prove a real connector end-to-end) is met via Etsy, not
+eBay - eBay is still blocked on Developer API approval and remains
+separate future work. Endpoint and authentication were verified against
+Etsy's official generated OpenAPI v3 spec, quickstart tutorial, and
+definitions page before any code was written (see the connector module's
+docstring for exact sources) - not guessed.
+
+### Added
+- `EtsyMarketplaceConnector`
+  (`marketplace_alert/connectors/etsy/connector.py`): calls Etsy Open API
+  v3's `GET /application/listings/active` (`findAllListingsActive`) - no
+  HTML scraping. Auth is an `x-api-key` header of
+  `"<ETSY_API_KEY>:<ETSY_SHARED_SECRET>"` (both required - the shared
+  secret is part of the header value itself, not just for OAuth); no OAuth
+  flow needed for this public, read-only search. Fetches one page per
+  search (`etsy_result_limit` setting, default 25, Etsy's own max 100;
+  structured with pagination in mind but not looped yet). Normalizes
+  Etsy's `money` object (`amount`/`divisor`/`currency_code`) into a plain
+  price - `amount / divisor`, not the raw integer. Maps `listing_id`,
+  `title`, `description`, `url`, price/currency, `images[0].url_570xN`
+  (or `url_fullxfull`), and `original_creation_timestamp` into `Listing`;
+  leaves `location`/`seller`/`condition` `null` rather than guessing at
+  unverified fields.
+- `MarketplaceConnectorError`
+  (`marketplace_alert/core/connectors/base.py`, alongside
+  `MarketplaceConnector` - the connector-level equivalent of
+  `NotificationError`). Raised for missing credentials, network errors,
+  timeouts, non-200 responses (including 429), and malformed/missing-
+  `results` bodies - always after logging a sanitized message, never the
+  raw exception, response, or credentials. A single malformed listing
+  inside an otherwise-valid response is skipped and logged, not fatal to
+  the whole search.
+- `"etsy"` registered in the connector registry
+  (`marketplace_alert/connectors/registry.py`), which required
+  generalizing its factory dict's value type from "a bare connector class"
+  to "a zero-arg callable", since Etsy needs credentials wired in from
+  `settings` that a plain class reference can't supply.
+  `is_marketplace_supported("etsy")` is now `True`, so saved searches can
+  use `marketplace="etsy"` with no other changes - proving the connector
+  interface's "add a marketplace without touching core" claim in practice.
+- `settings.etsy_api_key` / `settings.etsy_shared_secret` (both optional -
+  missing either disables the connector with a clear error when it's
+  actually used, not a startup crash) and `settings.etsy_result_limit`
+  (default 25) in `marketplace_alert/config.py`. `.env.example` updated
+  with placeholder values only.
+- Tests (99/99 passing, up from 81): `tests/test_etsy_connector.py`
+  (request construction incl. the `x-api-key` header and `keywords`/
+  `min_price`/`max_price` params, full and partial field normalization,
+  missing/partial credentials raising before any network call, empty and
+  multi-result responses, a malformed response as a whole and a single
+  malformed listing within an otherwise-good one, non-200 status including
+  429, non-JSON body, timeout, `health_check`), plus new cases in
+  `tests/test_saved_search_scheduler.py` (the background scanner surviving
+  a *real* `EtsyMarketplaceConnector`'s HTTP failure without stopping a
+  healthy saved search, and an Etsy-sourced listing not being notified
+  twice across two runs) and updates to `tests/test_connector_registry.py`
+  (etsy now resolves and is reported supported). All Etsy tests
+  monkeypatch `httpx.get` - no test makes a real Etsy API call, even
+  though the developer's real `.env` credentials are present and the
+  connector reports itself configured.
+- Documentation updates: `PROJECT_CONTEXT.md`, `ARCHITECTURE.md` (new
+  "The Etsy connector" section with the verified endpoint/auth/field-
+  mapping details), `ROADMAP.md` (Phase 2 marked done via Etsy; Phase 3/4's
+  "prove it works against a real connector" caveats resolved).
+
+### Not yet implemented
+- The real eBay connector (blocked on API approval) or any other
+  marketplace (Vinted, Yad2, etc.).
+- Etsy pagination beyond the first page.
+- Etsy `location`/`seller` (would need a verified `includes=Shop` field
+  mapping) - `condition` has no real Etsy equivalent at all.
+- An actual live Etsy search has not been run as part of this change (only
+  mocked-HTTP tests) - deliberately, per scope for this task.
+- Multiple marketplaces searched from a single saved search, user
+  accounts, a web frontend, mobile app, cloud deployment, payments.
+
+## 2026-08-14 — Saved searches and automatic background scanning
+
+eBay Developer API approval is still pending, so this was built and tested
+entirely against `MockMarketplaceConnector`. The system can now remember
+search definitions and scan them itself, on a schedule, instead of relying
+on someone manually hitting `/scan`.
+
+### Security fix
+- `httpx` logs every outbound request URL at INFO level by default,
+  independent of any of our own logging calls. Since the Telegram Bot API
+  URL embeds the bot token (`https://api.telegram.org/bot<TOKEN>/...`),
+  this leaked the real token into a local log file during manual testing
+  of the new scheduler. Fixed by having `configure_logging()`
+  (`marketplace_alert/core/logging_config.py`) explicitly set
+  `logging.getLogger("httpx")` to `WARNING`, regardless of the app's own
+  configured log level. Added a regression test
+  (`tests/test_logging_config.py`) asserting the httpx logger's effective
+  level stays at `WARNING` or above after `configure_logging()` runs. The
+  leaked log file was deleted; the token itself was not exposed elsewhere
+  and did not need to be rotated as a result of this specific incident.
+
+### Added
+- Connector registry (`marketplace_alert/connectors/registry.py`):
+  `get_connector(name)` / `is_marketplace_supported(name)`. The one place
+  outside a connector's own module allowed to import a concrete connector
+  class (`MockMarketplaceConnector` today). Everything in `core/` that
+  needs to resolve a connector takes an injected resolver function /
+  predicate instead of importing the registry, so `core/` stays free of
+  concrete-connector imports.
+- `SavedSearch` persistence
+  (`marketplace_alert/core/saved_searches/`):
+  - `models.py` — `SavedSearch` table: `id`, `query`, `marketplace`,
+    `is_active`, `scan_interval_seconds`, `created_at`, `updated_at`
+    (definition edits only), `last_scanned_at` (scan runs only).
+  - `schemas.py` — `SavedSearchCreate`/`Update`/`Read`. Validates `query`
+    isn't blank and `scan_interval_seconds >= MIN_SCAN_INTERVAL_SECONDS`
+    (60). `SavedSearchRead` reattaches UTC tzinfo on read, since SQLite
+    drops it on round-trip even for `DateTime(timezone=True)` columns.
+  - `repository.py` — `SavedSearchRepository`: CRUD plus
+    `list_due_for_scan()` (active searches never scanned, or overdue by
+    their own interval).
+  - `service.py` — `SavedSearchService`: validated CRUD for the API routes;
+    marketplace support is checked via an injected predicate, not by
+    importing the registry.
+  - `runner.py` — `SavedSearchRunner`: the *one* implementation of "run
+    this saved search" (resolve connector → search → dedup → notify →
+    mark scanned), used by both the manual endpoint and the scheduler so
+    they can never drift apart.
+- Background scanner (`marketplace_alert/core/scheduler/`):
+  - `guard.py` — `SavedSearchRunGuard`, a thread-safe overlap guard shared
+    between the scanner and the manual `/run` endpoint, so the same saved
+    search is never scanned by both (or two overlapping ticks) at once.
+  - `scanner.py` — `BackgroundScanner`: one central background thread
+    (not one per saved search) that ticks every `scheduler_tick_seconds`
+    (new setting, default 5s), runs each due saved search in its own
+    session/transaction, and logs-and-continues on a per-search failure
+    without stopping the tick, the loop, or any other saved search.
+    Started/stopped in `main.py`'s `lifespan`, bound to the real
+    `NotificationService` and `SessionLocal` (a background thread has no
+    FastAPI request to hang a `Depends` off).
+- API: `POST /saved-searches`, `GET /saved-searches`,
+  `GET /saved-searches/{id}`, `PATCH /saved-searches/{id}`,
+  `DELETE /saved-searches/{id}`, and `POST /saved-searches/{id}/run`
+  (manual trigger — 404 if not found, 409 if inactive or already running,
+  otherwise runs through the exact same `SavedSearchRunner` as the
+  scheduler). `/search` and `/scan` are unchanged.
+- Tests (81/81 passing, up from 79): `tests/test_connector_registry.py`,
+  `tests/test_saved_searches_api.py` (create/list/get/edit/disable/delete,
+  empty-query and interval-minimum and unsupported-marketplace validation,
+  manual run and its 404/409 cases, no re-notification on an already-seen
+  listing), `tests/test_saved_search_scheduler.py` (due/not-due/inactive
+  detection, a full scanner tick notifying only new listings, no
+  re-notification on an immediate second tick, one failing saved search
+  not stopping another, the run guard's overlap prevention), and
+  `tests/test_logging_config.py` (the httpx-logging fix above). Scheduler
+  tests construct their own `BackgroundScanner` with fake connectors/
+  notification providers and call `run_due_searches()` directly — no real
+  thread, timer, or sleep, and (like every other test) an isolated temp
+  database, never the developer's real one.
+- `settings.scheduler_tick_seconds` (`marketplace_alert/config.py`,
+  default 5.0) — the scanner's polling interval, distinct from each saved
+  search's own `scan_interval_seconds`.
+- Documentation updates: `PROJECT_CONTEXT.md`, `ARCHITECTURE.md` (new
+  "Saved searches and background scanning" section, connector-registry
+  rule, updated layout), `ROADMAP.md` (marked done-early against the mock
+  connector).
+
+### Not yet implemented
+- The real eBay connector (blocked on API approval — do not implement yet)
+  — `ebay`/`etsy`/`vinted` are recognized as future marketplace values but
+  `is_marketplace_supported` only accepts `"mock"` until each is registered.
+- User accounts / per-user saved searches, multiple Telegram recipients,
+  a web frontend, mobile app, cloud deployment, payments.
+
+## 2026-08-14 — Telegram notifications for new listings
+
+eBay Developer API approval is still pending, so this was built and tested
+entirely against `MockMarketplaceConnector`. Notifications depend only on
+the normalized `Listing` model and the `NotificationProvider` interface,
+not on any connector.
+
+### Fixed
+- The developer's local secrets file was saved as `.evn` instead of `.env`
+  (a typo), so `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` were never actually
+  loaded by `pydantic-settings`, and the file wasn't covered by
+  `.gitignore`'s `.env` rule. Renamed to `.env`; no other changes to its
+  contents.
+
+### Added
+- `NotificationProvider` interface and `NotificationError`
+  (`marketplace_alert/core/notifications/base.py`), mirroring the
+  `MarketplaceConnector` pattern: `is_enabled` (property) and
+  `send_listing_alert(listing)`.
+- `NotificationService.notify_new_listings(listings)`
+  (`marketplace_alert/core/notifications/service.py`) — sends one alert per
+  listing via whatever provider it's given, skips silently (with a log
+  line) when the provider is disabled, and never raises: a provider failure
+  on one listing is logged and the rest keep processing.
+- `TelegramNotificationProvider`
+  (`marketplace_alert/notifications/telegram/provider.py`) — calls the
+  Telegram Bot API's `sendMessage` directly via `httpx` (no SDK). Reads
+  `bot_token`/`chat_id` from what it's constructed with only, never
+  hard-coded. Disabled (logs a warning once) if either is missing. Message
+  includes title, marketplace, price + currency (if available), location
+  (if available), and the listing URL
+  (`format_listing_message()`, independently testable).
+  Never logs the bot token, the request URL, or raw exception/response
+  objects that could contain it — only exception type, HTTP status code,
+  or Telegram's own `description` field.
+- `/scan` now calls `NotificationService.notify_new_listings(result.new_listings)`
+  after persisting — only listings `ListingDiscoveryService` classified as
+  new trigger an alert; already-seen listings never do. A notification
+  failure (network error, Telegram API error) never fails the scan itself.
+- `settings.telegram_bot_token` / `settings.telegram_chat_id`
+  (`marketplace_alert/config.py`), both optional, read from
+  `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`. `.env.example` updated with
+  placeholder values only.
+- `main.py`: `get_notification_service()` FastAPI dependency wrapping a
+  module-level `NotificationService(TelegramNotificationProvider(...))`,
+  overridable in tests exactly like `get_db_session`.
+- `tests/conftest.py`: `FakeNotificationProvider` (records sent listings,
+  always enabled) and a `fake_notification_provider` fixture; the `client`
+  fixture now overrides both the database session and the notification
+  provider, so no test ever touches the real database or sends a real
+  Telegram message — even though a real `.env` may be present locally.
+- Tests: `tests/test_notification_service.py` (sends per new listing, no-op
+  on empty list, skips silently when disabled, never raises on provider
+  failure), `tests/test_telegram_provider.py` (message formatting with/without
+  optional fields, missing/partial credentials disable the provider, a
+  successful send posts the expected payload, non-200 responses / Telegram
+  `"ok": false` / network errors all raise `NotificationError` without
+  crashing - all via a monkeypatched `httpx.post`, no real network calls),
+  and new `tests/test_scan_endpoint.py` cases (notification sent on first
+  discovery, not sent on second/already-seen, `/scan` survives a failing
+  provider). Full suite: 47/47 passing.
+- New dependency: `httpx>=0.27` moved from dev-only to main dependencies
+  (`pyproject.toml`) — it's now used in production code, not just tests.
+- Documentation updates: `PROJECT_CONTEXT.md`, `ARCHITECTURE.md` (new
+  "Notifications" section, updated layout and overview), `ROADMAP.md`
+  (Phase 4 marked done-early against the mock connector).
+
+### Not yet implemented
+- The real eBay connector (blocked on API approval — do not implement yet).
+- Notification channels other than Telegram (email, push, webhook).
+- Multiple Telegram recipients / per-user chat IDs.
+- Background scheduling (recurring scans) — `/scan` is still per-request.
+- User accounts, cloud deployment, mobile app, payments.
+
+## 2026-08-14 — Local persistence and duplicate detection
+
+eBay Developer API approval is still pending, so this was built and tested
+entirely against `MockMarketplaceConnector`. The persistence layer itself
+depends only on the normalized `Listing` model, not on any connector.
+
+### Added
+- SQLAlchemy-based local persistence
+  (`marketplace_alert/core/persistence/`):
+  - `database.py` — engine/session setup from `DATABASE_URL` (SQLite
+    locally; PostgreSQL later needs no code change beyond the URL),
+    `init_db()`, and a `get_db_session()` FastAPI dependency.
+  - `models.py` — `DiscoveredListing` table: `id`, `marketplace`,
+    `external_listing_id`, `title`, `listing_url`, `first_discovered_at`,
+    `last_seen_at`, with a unique constraint on
+    `(marketplace, external_listing_id)` enforced at the database level.
+  - `repository.py` — `ListingRepository`, the only module that issues
+    SQL/ORM queries (`get`, `save_new`, `touch_last_seen`).
+  - `service.py` — `ListingDiscoveryService.process_listings(listings)`,
+    classifying each `Listing` as new (persisted) or already-seen
+    (`last_seen_at` bumped), returning `ListingDiscoveryResult(new_listings,
+    already_seen_count)`. Depends only on `Listing` — never imports any
+    connector.
+- Temporary `GET /scan?q=...` endpoint: runs `MockMarketplaceConnector`,
+  passes results through `ListingDiscoveryService`, saves newly-seen
+  listings, and returns only the new ones plus an already-seen count.
+  Stateful, unlike `/search` (which is unchanged and still stateless —
+  verified by test).
+- App startup (`lifespan` in `main.py`) now calls `init_db()` so the local
+  SQLite tables exist before the first request.
+- `tests/conftest.py`: fixtures (`db_engine`, `db_session`, `client`) that
+  build an isolated temp-file SQLite database per test and wire it into
+  the app via `app.dependency_overrides` — no test touches the developer's
+  real `marketplace_alert.db`.
+- Tests: `tests/test_persistence.py` (DB init, first discovery is new,
+  second is already-seen, same external ID allowed across marketplaces,
+  duplicate on the same marketplace rejected at the DB level) and
+  `tests/test_scan_endpoint.py` (`/scan` first request returns the new
+  listing, second returns zero new / one already-seen, no-match query,
+  `/search` stays stateless alongside `/scan`). Full suite: 32/32 passing.
+- New dependency: `sqlalchemy>=2.0` (`pyproject.toml`).
+- Documentation updates: `PROJECT_CONTEXT.md`, `ARCHITECTURE.md` (new
+  "Local persistence and duplicate detection" section, updated layout),
+  `ROADMAP.md` (Phase 3 marked done-early against the mock connector).
+
+### Not yet implemented
+- The real eBay connector (blocked on API approval — do not implement yet).
+- Schema migrations (Alembic) — `Base.metadata.create_all()` is sufficient
+  for the current single-table schema.
+- Notifications / alerting on newly discovered listings.
+- User accounts, scheduling/background jobs, cloud deployment, mobile app.
+
+## 2026-08-14 — Mock marketplace connector
+
+We are waiting on eBay Developer API approval, so a `MockMarketplaceConnector`
+was added to unblock development and testing of the rest of the system in
+the meantime.
+
+### Added
+- `MockMarketplaceConnector`
+  (`marketplace_alert/connectors/mock/connector.py`), implementing
+  `MarketplaceConnector` against a fixed, in-memory catalog of six fake
+  listings (Maccabi vintage shirt, Hapoel scarf, Rolex Submariner, Makita
+  drill, Pokemon card, Adidas jacket). Search is case-insensitive,
+  substring-based on `title`, supports optional `min_price`/`max_price`/
+  `condition` filters, and every listing has a unique `external_listing_id`.
+- Temporary `GET /search?q=...` endpoint on the FastAPI app, backed by
+  `MockMarketplaceConnector`, returning normalized `Listing` objects as JSON.
+- Tests for the mock connector (loading, arbitrary keyword search,
+  case-insensitivity, no-result search, normalized output, uniqueness of
+  IDs, filters) and for the `/search` endpoint
+  (`tests/test_mock_connector.py`, additions to `tests/test_main.py`).
+  Full suite: 23/23 passing.
+- Documentation updates: `PROJECT_CONTEXT.md` (current status, a new
+  "Waiting on" section for the eBay approval blocker) and `ARCHITECTURE.md`
+  (mock connector section, updated layout diagram).
+
+### Not yet implemented
+- The real eBay connector (blocked on API approval — do not implement yet).
+- Scraping of any kind.
+- Database / persistence.
+- Notifications / alerting.
+- Deployment.
+
+## 2026-08-14 — Relocated project root
+
+Moved the project root from `c:\UnityProjects\RussianNinja` (a shared
+folder that also contains an unrelated Unity project) to its own dedicated
+folder, `C:\Projects\MarketplaceAlert`. No source files changed; the venv
+was recreated at the new location and the full test suite was re-verified
+(10/10 passing).
+
+## 2026-08-14 — Project scaffold (Phase 1)
+
+### Added
+- Initial project structure and Python package layout (`marketplace_alert/`).
+- Documentation: `PROJECT_CONTEXT.md`, `ARCHITECTURE.md`, `ROADMAP.md`,
+  `README.md`, `.env.example`, `.gitignore`.
+- Basic FastAPI application (`marketplace_alert/main.py`) with `/` and
+  `/health` endpoints.
+- Structured (JSON) logging setup (`marketplace_alert/core/logging_config.py`).
+- Settings loaded from environment variables / `.env`
+  (`marketplace_alert/config.py`).
+- Abstract `MarketplaceConnector` interface
+  (`marketplace_alert/core/connectors/base.py`) — no concrete connector yet.
+- Normalized `Listing` Pydantic model
+  (`marketplace_alert/core/models/listing.py`).
+- Tests confirming the app and models load and behave correctly
+  (`tests/`).
+
+### Not yet implemented
+- Any real marketplace connector, database/persistence, duplicate
+  detection, alerting, user accounts, web UI, mobile app, payments, or
+  cloud deployment. See `PROJECT_CONTEXT.md` for the full list.

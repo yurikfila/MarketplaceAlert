@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ app_name }} — Dashboard</title>
+    <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+    <header class="topbar">
+        <h1>{{ app_name }}</h1>
+        <p class="subtitle">Local management dashboard</p>
+    </header>
+
+    <main>
+        <div id="banner" class="banner" hidden></div>
+
+        <section class="card" id="create-search">
+            <h2>Create a saved search</h2>
+            <form id="create-search-form">
+                <div class="field">
+                    <label for="query">Search keyword / phrase</label>
+                    <input type="text" id="query" name="query" placeholder="e.g. Maccabi vintage shirt" required>
+                </div>
+
+                <div class="field">
+                    <div class="field-label-row">
+                        <label>Marketplaces</label>
+                        <label class="select-all-label">
+                            <input type="checkbox" id="marketplaces-select-all" checked>
+                            Select all
+                        </label>
+                    </div>
+                    <div class="checkbox-group" id="marketplaces-group">
+                        {% for marketplace in marketplaces %}
+                        <label class="checkbox-option">
+                            <input type="checkbox" name="marketplaces" value="{{ marketplace }}" checked>
+                            {{ marketplace.title() }}
+                        </label>
+                        {% endfor %}
+                    </div>
+                </div>
+
+                <div class="field-row">
+                    <div class="field">
+                        <label for="scan_interval_seconds">Scan interval</label>
+                        <select id="scan_interval_seconds" name="scan_interval_seconds">
+                            {% for value, label in scan_interval_options %}
+                            <option value="{{ value }}" {% if value == 300 %}selected{% endif %}>{{ label }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <div class="field field-checkbox">
+                        <label>
+                            <input type="checkbox" id="is_active" name="is_active" checked>
+                            Active
+                        </label>
+                    </div>
+                </div>
+
+                <button type="submit" class="btn btn-primary">Create Search</button>
+            </form>
+        </section>
+
+        <section class="card" id="saved-searches">
+            <h2>Saved searches</h2>
+            {% if saved_searches %}
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Query</th>
+                            <th>Marketplaces</th>
+                            <th>Status</th>
+                            <th>Interval</th>
+                            <th>Last scanned</th>
+                            <th>ID</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for s in saved_searches %}
+                        <tr data-row-id="{{ s.id }}">
+                            <td data-label="Query">{{ s.query }}</td>
+                            <td data-label="Marketplaces">{{ s.marketplaces_display }}</td>
+                            <td data-label="Status">
+                                <span class="badge {{ 'badge-on' if s.is_active else 'badge-off' }}">
+                                    {{ 'Active' if s.is_active else 'Inactive' }}
+                                </span>
+                            </td>
+                            <td data-label="Interval">{{ s.scan_interval_display }}</td>
+                            <td data-label="Last scanned">{{ s.last_scanned_display }}</td>
+                            <td data-label="ID">{{ s.id }}</td>
+                            <td data-label="Actions" class="actions">
+                                <button class="btn btn-small" data-action="run" data-id="{{ s.id }}">Run Now</button>
+                                <button class="btn btn-small" data-action="toggle" data-id="{{ s.id }}" data-active="{{ 'true' if s.is_active else 'false' }}">{{ 'Disable' if s.is_active else 'Enable' }}</button>
+                                <button class="btn btn-small btn-danger" data-action="delete" data-id="{{ s.id }}">Delete</button>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <p class="empty">No saved searches yet. Create one above.</p>
+            {% endif %}
+        </section>
+
+        <section class="card" id="status">
+            <h2>System status</h2>
+            <ul class="status-list">
+                <li>
+                    <span>Backend</span>
+                    <span class="badge {{ 'badge-on' if status.backend_running else 'badge-off' }}">
+                        {{ 'Running' if status.backend_running else 'Not running' }}
+                    </span>
+                </li>
+                <li>
+                    <span>Telegram</span>
+                    <span class="badge {{ 'badge-on' if status.telegram_configured else 'badge-off' }}">
+                        {{ 'Configured' if status.telegram_configured else 'Not configured' }}
+                    </span>
+                </li>
+                <li>
+                    <span>Etsy</span>
+                    <span class="badge {{ 'badge-on' if status.etsy_configured else 'badge-off' }}">
+                        {{ 'Configured' if status.etsy_configured else 'Not configured' }}
+                    </span>
+                </li>
+                <li>
+                    <span>eBay</span>
+                    <span class="badge {{ 'badge-on' if status.ebay_configured else 'badge-off' }}">
+                        {{ 'Configured' if status.ebay_configured else 'Not configured' }}
+                    </span>
+                </li>
+                <li>
+                    <span>Active saved searches</span>
+                    <span class="badge badge-neutral">{{ status.active_saved_search_count }}</span>
+                </li>
+                <li>
+                    <span>Supported marketplaces</span>
+                    <span class="badge badge-neutral">{{ status.marketplace_count }}</span>
+                </li>
+            </ul>
+        </section>
+    </main>
+
+    <script src="/static/dashboard.js"></script>
+</body>
+</html>

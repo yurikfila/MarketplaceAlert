@@ -1,0 +1,68 @@
+"""Application configuration, loaded from environment variables / .env."""
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    app_name: str = "Marketplace Alert"
+    environment: str = "development"
+    log_level: str = "INFO"
+
+    # Used for local persistence and duplicate detection (Phase 3).
+    # Defaults to a local SQLite file so the app can still start without a .env.
+    # Point this at a PostgreSQL URL later without changing any other code.
+    database_url: str = "sqlite:///./marketplace_alert.db"
+
+    # Telegram notifications for newly discovered listings (Phase 4).
+    # Optional - if either is unset, notifications are disabled and the app
+    # still starts normally. Never hard-code real values here.
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+
+    # Robust delivery under bursts (many new listings discovered in one
+    # scan) - a fixed pacing delay between sends plus bounded retries with
+    # backoff for transient failures. Defaults are safe out of the box:
+    # ~1 msg/sec is Telegram's own documented guideline for messages to the
+    # same chat, and 3 retries is enough to ride out a brief rate-limit or
+    # 5xx blip without retrying forever. See
+    # `marketplace_alert/notifications/telegram/provider.py` and
+    # `marketplace_alert/core/notifications/service.py`.
+    telegram_send_delay_seconds: float = 1.0
+    telegram_max_retries: int = 3
+    telegram_retry_base_seconds: float = 2.0
+
+    # How often the background scanner checks for due saved searches
+    # (polling granularity, not a per-search interval - see
+    # core/saved_searches/schemas.py for the per-search minimum).
+    scheduler_tick_seconds: float = 5.0
+
+    # Etsy Open API v3 credentials (Phase 2 - first real connector).
+    # Optional - if either is unset, the Etsy connector reports a clear
+    # configuration error when actually used, but the app still starts
+    # normally and other connectors are unaffected. Never hard-code real
+    # values here. Both are required: Etsy's x-api-key header is
+    # "<ETSY_API_KEY>:<ETSY_SHARED_SECRET>", not the API key alone.
+    etsy_api_key: str | None = None
+    etsy_shared_secret: str | None = None
+
+    # Safe, configurable page size for Etsy searches (Etsy's own max is
+    # 100; this connector fetches one page, not all of them, for now).
+    etsy_result_limit: int = 25
+
+    # eBay Buy Browse API credentials (Phase 2 - second real connector).
+    # Optional - if either is unset, the eBay connector reports a clear
+    # configuration error when actually used, but the app still starts
+    # normally and other connectors are unaffected. Never hard-code real
+    # values here. EBAY_DEV_ID is not used - the Browse API's client_credentials
+    # OAuth flow only needs the App ID (client_id) and Cert ID (client_secret).
+    ebay_app_id: str | None = None
+    ebay_cert_id: str | None = None
+
+    # Safe, configurable page size for eBay searches (eBay's own max is
+    # 200; this connector fetches one page, not all of them, for now).
+    ebay_result_limit: int = 25
+
+
+settings = Settings()

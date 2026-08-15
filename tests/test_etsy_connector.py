@@ -1,0 +1,226 @@
+from datetime import datetime, timezone
+
+import httpx
+import pytest
+
+from marketplace_alert.connectors.etsy.connector import EtsyMarketplaceConnector
+from marketplace_alert.core.connectors.base import MarketplaceConnectorError
+from marketplace_alert.core.models.listing import Listing
+
+
+def _raw_listing(**overrides) -> dict:
+    base = {
+        "listing_id": 123456789,
+        "title": "Maccabi Tel Aviv Vintage Pennant",
+        "description": "A vintage felt pennant.",
+        "price": {"amount": 2500, "divisor": 100, "currency_code": "USD"},
+        "url": "https://www.etsy.com/listing/123456789/maccabi-vintage-pennant",
+        "state": "active",
+        "shop_id": 987654,
+        "original_creation_timestamp": 1700000000,
+        "images": [
+            {
+                "listing_image_id": 1,
+                "url_75x75": "https://i.etsystatic.com/1.jpg",
+                "url_170x135": "https://i.etsystatic.com/2.jpg",
+                "url_570xN": "https://i.etsystatic.com/3.jpg",
+                "url_fullxfull": "https://i.etsystatic.com/4.jpg",
+            }
+        ],
+    }
+    base.update(overrides)
+    return base
+
+
+def _connector(**overrides) -> EtsyMarketplaceConnector:
+    kwargs = {"api_key": "test-keystring", "shared_secret": "test-shared-secret"}
+    kwargs.update(overrides)
+    return EtsyMarketplaceConnector(**kwargs)
+
+
+# --- request construction --------------------------------------------------
+
+
+def test_search_requests_correct_url_params_and_auth_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    def fake_get(url, params, headers, timeout):
+        captured["url"] = url
+        captured["params"] = params
+        captured["headers"] = headers
+        return httpx.Response(200, json={"count": 0, "results": []})
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    connector = _connector(result_limit=10)
+    connector.search("Maccabi")
+
+    assert captured["url"] == "https://api.etsy.com/v3/application/listings/active"
+    assert captured["params"]["keywords"] == "Maccabi"
+    assert captured["params"]["limit"] == 10
+    assert captured["params"]["includes"] == "Images"
+    assert captured["headers"]["x-api-key"] == "test-keystring:test-shared-secret"
+
+
+def test_search_forwards_min_max_price_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    def fake_get(url, params, headers, timeout):
+        captured["params"] = params
+        return httpx.Response(200, json={"count": 0, "results": []})
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    _connector().search("Maccabi", filters={"min_price": 10, "max_price": 100})
+
+    assert captured["params"]["min_price"] == 10
+    assert captured["params"]["max_price"] == 100
+
+
+# --- normalization -----------------------------------------------------
+
+
+def test_normalize_listing_maps_all_available_fields() -> None:
+    listing = _connector().normalize_listing(_raw_listing())
+
+    assert isinstance(listing, Listing)
+    assert listing.marketplace == "etsy"
+    assert listing.external_listing_id == "123456789"
+    assert listing.title == "Maccabi Tel Aviv Vintage Pennant"
+    assert listing.description == "A vintage felt pennant."
+    assert listing.price == 25.0
+    assert listing.currency == "USD"
+    assert str(listing.listing_url) == "https://www.etsy.com/listing/123456789/maccabi-vintage-pennant"
+    assert str(listing.image_url) == "https://i.etsystatic.com/3.jpg"
+    assert listing.created_at == datetime.fromtimestamp(1700000000, tz=timezone.utc)
+    # Not available / not verified from Etsy for this endpoint - must be
+    # null rather than invented.
+    assert listing.location is None
+    assert listing.seller is None
+    assert listing.condition is None
+
+
+def test_normalize_listing_handles_missing_optional_fields() -> None:
+    raw = _raw_listing()
+    del raw["description"]
+    del raw["price"]
+    del raw["images"]
+    del raw["original_creation_timestamp"]
+
+    listing = _connector().normalize_listing(raw)
+
+    assert listing.title == raw["title"]
+    assert listing.description is None
+    assert listing.price is None
+    assert listing.currency is None
+    assert listing.image_url is None
+    assert listing.created_at is None
+
+
+# --- credentials ---------------------------------------------------------
+
+
+def test_missing_credentials_raises_before_any_network_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    called = False
+
+    def fake_get(*args, **kwargs):
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={"count": 0, "results": []})
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    connector = EtsyMarketplaceConnector(api_key=None, shared_secret=None)
+    with pytest.raises(MarketplaceConnectorError):
+        connector.search("Maccabi")
+
+    assert called is False
+
+
+def test_partial_credentials_also_raise(monkeypatch: pytest.MonkeyPatch) -> None:
+    connector = EtsyMarketplaceConnector(api_key="only-key", shared_secret=None)
+    assert connector.is_configured is False
+    with pytest.raises(MarketplaceConnectorError):
+        connector.search("Maccabi")
+
+
+def test_health_check_reflects_configuration() -> None:
+    assert _connector().health_check() is True
+    assert EtsyMarketplaceConnector(api_key=None, shared_secret=None).health_check() is False
+
+
+# --- result handling -------------------------------------------------------
+
+
+def test_empty_results_returns_empty_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        httpx, "get", lambda *a, **k: httpx.Response(200, json={"count": 0, "results": []})
+    )
+    assert _connector().search("Nonexistent Item Zyxwvut") == []
+
+
+def test_multiple_results_returns_multiple_listings(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = {
+        "count": 2,
+        "results": [_raw_listing(listing_id=1), _raw_listing(listing_id=2)],
+    }
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(200, json=body))
+
+    results = _connector().search("Maccabi")
+
+    assert len(results) == 2
+    assert {r.external_listing_id for r in results} == {"1", "2"}
+
+
+# --- malformed responses -----------------------------------------------
+
+
+def test_response_missing_results_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(200, json={"count": 0}))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().search("Maccabi")
+
+
+def test_non_json_response_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        httpx, "get", lambda *a, **k: httpx.Response(200, content=b"not valid json")
+    )
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().search("Maccabi")
+
+
+def test_one_malformed_listing_is_skipped_not_fatal(monkeypatch: pytest.MonkeyPatch) -> None:
+    good = _raw_listing(listing_id=1)
+    bad = _raw_listing(listing_id=2)
+    del bad["listing_id"]  # required field missing
+    body = {"count": 2, "results": [good, bad]}
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(200, json=body))
+
+    results = _connector().search("Maccabi")
+
+    assert len(results) == 1
+    assert results[0].external_listing_id == "1"
+
+
+# --- transport-level failures -----------------------------------------
+
+
+def test_api_error_status_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(500))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().search("Maccabi")
+
+
+def test_rate_limit_status_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(429))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().search("Maccabi")
+
+
+def test_timeout_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def raise_timeout(*args, **kwargs):
+        raise httpx.TimeoutException("simulated timeout")
+
+    monkeypatch.setattr(httpx, "get", raise_timeout)
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().search("Maccabi")

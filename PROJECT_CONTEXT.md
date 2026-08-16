@@ -130,6 +130,22 @@ Implemented so far:
   developer's local `marketplace_alert.db`, real Telegram credentials, or
   a real Etsy/eBay API call, even though a real `.env` with working
   production eBay credentials is present).
+- **PostgreSQL support, alongside SQLite - not replacing it.** The system
+  is live on Render, and a Render PostgreSQL database (`marketplacealert-db`)
+  already exists but the web service isn't connected to it yet - this adds
+  the *capability* to connect it later without deploying or touching Render
+  config now. `DATABASE_URL` set -> PostgreSQL (normalized centrally for
+  Render's `postgres://`/`postgresql://` URL forms and the `psycopg` (v3)
+  driver - `marketplace_alert/core/persistence/database.py:resolve_database_url`);
+  unset -> the exact same local SQLite default as before. SQLite keeps its
+  automatic `create_all()` bootstrap on startup (safe - additive only);
+  PostgreSQL does not - its schema is managed by
+  [Alembic](https://alembic.sqlalchemy.org/) migrations instead
+  (`alembic/`, one baseline migration representing today's schema), applied
+  deliberately (e.g. a Render Pre-Deploy Command), never implicitly
+  re-derived at every app startup. See `ARCHITECTURE.md` and README.md
+  "Database" for the full picture, and "Important architectural decisions"
+  below for why.
 
 ## Current milestone
 
@@ -155,18 +171,27 @@ duplicate detection, to the scheduler, or to the dashboard template logic
 (only a new status row). Since then, a real burst of new listings exposed
 Telegram sends failing under load with no pacing or retry - now fixed (see
 "Important architectural decisions" #12 and `ARCHITECTURE.md`); this was a
-reliability fix to Phase 4's existing alerting, not a new phase. None of
-this is a signal to start the rest of Phase 7's scope, Phase 6 (user
-accounts), or any other later phase, or to add a fourth marketplace
-connector yet.
+reliability fix to Phase 4's existing alerting, not a new phase. The system
+is now live on Render; PostgreSQL *support* has been added (selection,
+normalization, Alembic migrations - #13) since a Render PostgreSQL database
+already exists but the deployed Web Service isn't using it yet - this is
+schema/code readiness, not the actual production cutover (no Render config
+changed, nothing deployed, no local data migrated). None of this is a
+signal to start the rest of Phase 7's scope, Phase 6 (user accounts), or
+any other later phase, or to add a fourth marketplace connector yet.
 
 ## Chosen technology
 
 - Python 3.12+ (developed against 3.14 locally; no 3.14-only syntax used)
 - FastAPI for the backend API
 - Pydantic v2 for data models and settings
-- SQLAlchemy for persistence — SQLite locally (via `DATABASE_URL`),
-  PostgreSQL planned for later without code changes beyond the URL
+- SQLAlchemy for persistence — SQLite locally (the default when
+  `DATABASE_URL` is unset), PostgreSQL in production (`DATABASE_URL` set,
+  via the `psycopg` v3 driver) - same models, same code, selected purely
+  by that one environment variable
+- Alembic for PostgreSQL schema migrations (SQLite keeps its original
+  automatic `create_all()` bootstrap - see "Important architectural
+  decisions" #13 and README.md "Database")
 - httpx for outbound HTTP calls (the Telegram Bot API; Etsy Open API v3;
   eBay's OAuth token endpoint and Buy Browse API)
 - Jinja2 for server-rendered HTML (the `/` dashboard) plus a small amount
@@ -349,6 +374,71 @@ connector yet.
     source of truth for "already discovered" before this change; this
     change only makes delivery of the *alert* more reliable, never
     duplicate detection itself.
+13. **PostgreSQL is opt-in via `DATABASE_URL`, resolved and normalized in
+    exactly one place, and gets a different schema-management strategy
+    than SQLite - deliberately, not an oversight.** Three separate,
+    narrow decisions, each worth calling out on its own:
+    - **Selection.** `resolve_database_url()`
+      (`core/persistence/database.py`) is the only place "which database"
+      is decided: `settings.database_url` set -> use it (normalized);
+      unset -> the pre-existing local SQLite default, byte-for-byte
+      unchanged (`sqlite:///./marketplace_alert.db`). `config.py`'s
+      `database_url` field changed from a hard-coded SQLite default to
+      `None`, specifically so "unset" is representable and this function
+      is the single place that fills in what "unset" means - not two
+      places quietly agreeing (or disagreeing) on a default.
+    - **Normalization.** Render (like Heroku) can issue either
+      `postgres://` or `postgresql://` - both are rewritten to
+      `postgresql+psycopg://` in `normalize_database_url()`, so the
+      `psycopg` (v3) driver this project now depends on
+      (`pyproject.toml`) is always the one SQLAlchemy actually uses,
+      never an implicit/ambient default. `alembic/env.py` calls the exact
+      same `resolve_database_url()`/`settings.database_url` as the running
+      app (never alembic.ini's own `sqlalchemy.url`, left blank on
+      purpose) - migrations can never target a different database than
+      the app itself would use.
+    - **Schema strategy split by backend, not by environment flag.**
+      `init_db()` checks the *engine's actual dialect* (`sqlite` vs.
+      anything else) before calling `Base.metadata.create_all()` - SQLite
+      keeps the original zero-setup bootstrap (safe: `create_all()` only
+      ever adds missing tables, never drops or alters one); anything else
+      no-ops, logging why, rather than silently doing nothing. PostgreSQL
+      schema changes go through Alembic instead
+      (`alembic/versions/<rev>_baseline_schema.py` - one baseline
+      migration, autogenerated by diffing `Base.metadata` against a fresh,
+      *empty* temp SQLite database, never against the developer's real
+      local database or any production database - purely additive,
+      `create_table`/`create_index` only). This was a deliberate choice
+      over running migrations automatically at app startup: Render may run
+      more than one instance/worker, and several of them independently
+      attempting `alembic upgrade head` at the same moment is a real race;
+      a single, separate, explicit step (a Render Pre-Deploy Command, or a
+      manual `alembic upgrade head`) run once before the new app code
+      starts serving traffic avoids that entirely. See README.md
+      "Database" for the exact commands, including the `stamp` vs.
+      `upgrade` distinction for a database that already has the current
+      schema (e.g. the developer's existing local SQLite file) - `upgrade`
+      would fail there with "table already exists" (verified, not
+      guessed - a clean failure, not data loss) since Alembic has no
+      record of it being already-current; `stamp` records that without
+      executing any DDL.
+    - **Session handling needed no changes.** Reviewed as part of this
+      work: `get_db_session()` (web requests) and `BackgroundScanner`'s
+      `session_factory()` calls (scheduler) already create a fresh
+      `Session` per request/run and close it in `finally` - never one
+      `Session` reused globally across threads. What's shared globally
+      (`engine`, `SessionLocal`) is exactly what SQLAlchemy's own
+      thread-safety model says is safe to share (the `Engine` and its
+      connection pool). The one concrete addition: `pool_pre_ping=True` on
+      every engine (harmless for SQLite, important for PostgreSQL - a
+      managed Postgres instance can close idle connections server-side,
+      and pre-ping transparently detects and replaces a dead pooled
+      connection instead of a request failing with one).
+    - Nothing in this change touched the Etsy/eBay connectors, OAuth
+      logic, saved searches, multi-marketplace architecture, duplicate
+      detection, or the dashboard - and no local SQLite data was migrated
+      to PostgreSQL (out of scope for this change, to be handled
+      separately) or deleted.
 
 ## Things that have NOT yet been implemented
 
@@ -402,7 +492,19 @@ connector yet.
   scope ("...and viewing results"), not covered here.
 - Mobile application.
 - Payments / subscriptions.
-- Cloud deployment (local dev only for now).
+- **The production Render Web Service is not yet connected to PostgreSQL.**
+  PostgreSQL *support* now exists in the codebase (`DATABASE_URL` selection,
+  normalization, the `psycopg` driver, Alembic migrations - see "Important
+  architectural decisions" #13) and a Render PostgreSQL database
+  (`marketplacealert-db`) already exists, but wiring the two together -
+  setting `DATABASE_URL` on the Web Service, running the baseline migration
+  against it - is a deliberate, separate, not-yet-done step (no Render
+  configuration was touched as part of adding this support, and nothing
+  was deployed).
+- **Existing local SQLite data has not been copied to PostgreSQL.** Not
+  needed for the support added here (schema compatibility + selection
+  only) - production data initialization/migration is explicitly separate,
+  future work.
 - Rate limiting, retries, or resilience handling for **connectors** (Etsy,
   eBay) - a slow/rate-limited marketplace API still fails immediately
   today, same as before. This is now implemented for **Telegram

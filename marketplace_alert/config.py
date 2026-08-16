@@ -10,10 +10,15 @@ class Settings(BaseSettings):
     environment: str = "development"
     log_level: str = "INFO"
 
-    # Used for local persistence and duplicate detection (Phase 3).
-    # Defaults to a local SQLite file so the app can still start without a .env.
-    # Point this at a PostgreSQL URL later without changing any other code.
-    database_url: str = "sqlite:///./marketplace_alert.db"
+    # Used for local persistence and duplicate detection (Phase 3), and for
+    # PostgreSQL support in production (Phase 8). Unset (None) -> the app
+    # falls back to the local SQLite default; set -> that URL is used as-is
+    # (Render's PostgreSQL URLs, both `postgres://` and `postgresql://`
+    # forms, are normalized automatically - see
+    # `core/persistence/database.py:resolve_database_url`, the single place
+    # this decision is made). Never hard-code a real value here - this is
+    # read from the environment / `.env` only.
+    database_url: str | None = None
 
     # Telegram notifications for newly discovered listings (Phase 4).
     # Optional - if either is unset, notifications are disabled and the app

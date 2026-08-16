@@ -136,6 +136,10 @@ _background_scanner = BackgroundScanner(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("marketplace_alert starting up", extra={"environment": settings.environment})
+    # init_db() only actually does anything for SQLite (local dev/tests) -
+    # it no-ops for PostgreSQL, whose schema is managed by Alembic
+    # migrations instead, applied separately/deliberately (see
+    # `alembic/`, README.md "Database"). See database.py's docstring.
     init_db()
     migrate_legacy_marketplace_column(engine)
     _background_scanner.start()

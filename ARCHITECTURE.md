@@ -128,7 +128,7 @@ marketplace_alert/
         models/
             listing.py         Normalized Listing model (Pydantic)
         persistence/
-            database.py        SQLAlchemy engine/session/init_db
+            database.py        SQLAlchemy engine/session/init_db, DATABASE_URL selection
             models.py           DiscoveredListing table (SQLAlchemy)
             repository.py       Raw DB access (ListingRepository)
             service.py          Duplicate detection (ListingDiscoveryService)
@@ -157,6 +157,10 @@ marketplace_alert/
     notifications/
         telegram/
             provider.py          TelegramNotificationProvider
+alembic/
+    env.py                       Resolves DATABASE_URL the same way the app does
+    versions/                    One migration per schema change (baseline so far)
+alembic.ini                     Alembic config (sqlalchemy.url deliberately left blank)
 tests/                          Mirrors the package layout
 ```
 
@@ -358,11 +362,17 @@ routes (main.py)
 ```
 
 - **`database.py`** builds the SQLAlchemy engine and session from
-  `settings.database_url` (SQLite locally; swapping to PostgreSQL means
-  changing that one URL, nothing else). `get_db_session()` is a FastAPI
-  dependency, which is what lets tests override it with an isolated
-  temporary database via `app.dependency_overrides` instead of touching the
-  real `marketplace_alert.db` file.
+  `settings.database_url` - **SQLite locally (the default when
+  `DATABASE_URL` is unset), PostgreSQL in production (`DATABASE_URL` set)
+  - the same models and code either way, selected by that one setting.**
+  See "Database selection and PostgreSQL support" below for exactly how.
+  `get_db_session()` is a FastAPI dependency, which is what lets tests
+  override it with an isolated temporary database via
+  `app.dependency_overrides` instead of touching the real
+  `marketplace_alert.db` file - and creates a fresh `Session` per call,
+  closed in `finally`, never one reused globally across requests or
+  threads (see "Database selection and PostgreSQL support" for why this
+  needed no changes for PostgreSQL).
 - **`models.py`** defines `DiscoveredListing`, the SQLAlchemy table:
   `id`, `marketplace`, `external_listing_id`, `title`, `listing_url`,
   `first_discovered_at`, `last_seen_at`. A unique constraint on
@@ -387,6 +397,135 @@ listings plus a count of how many were already seen. Unlike `/search`,
 zero) new listings the second time. Route handlers only orchestrate
 (connector search -> service call -> shape the response) and never contain
 raw persistence logic themselves.
+
+## Database selection and PostgreSQL support
+
+The system is live on Render; a Render PostgreSQL database
+(`marketplacealert-db`) already exists, though the deployed Web Service
+isn't connected to it yet - this section covers the *capability* now in
+the codebase, not a production cutover (no Render config was touched, and
+nothing was deployed as part of this).
+
+```
+DATABASE_URL unset  -> resolve_database_url() -> sqlite:///./marketplace_alert.db  (unchanged default)
+DATABASE_URL set    -> resolve_database_url() -> normalize_database_url()
+                         (postgres:// or postgresql:// -> postgresql+psycopg://)
+                        -> create_db_engine()  (pool_pre_ping=True, no check_same_thread)
+```
+
+- **Selection**: `core/persistence/database.py:resolve_database_url()` is
+  the *one* place "which database" is decided - `settings.database_url`
+  set -> use it; unset -> the exact same local SQLite default as before
+  PostgreSQL support existed (`sqlite:///./marketplace_alert.db`).
+  `config.py`'s `database_url` field is `str | None = None` (changed from
+  a hard-coded SQLite default) specifically so "unset" is representable,
+  with this one function deciding what "unset" means, rather than the
+  default living in two places that could drift.
+- **Normalization**: `normalize_database_url()` rewrites Render's
+  `postgres://` and `postgresql://` URL forms to `postgresql+psycopg://`,
+  so SQLAlchemy always resolves to the `psycopg` (v3) driver this project
+  depends on (`pyproject.toml`) - not an ambient/implicit default (plain
+  `postgresql://` would otherwise resolve to `psycopg2`, which isn't a
+  dependency here). SQLite URLs pass through unchanged. This is the single
+  central place this normalization happens - `alembic/env.py` resolves its
+  URL the exact same way (see below), so migrations can never target a
+  different database than the running app does.
+- **Never logged**: neither `resolve_database_url()` nor
+  `create_db_engine()` ever logs the URL they're given - it may contain a
+  real password. The one log line `init_db()` emits when skipping
+  PostgreSQL (below) names only the dialect (`"postgresql"`), never the URL.
+- **Engine construction**: `create_db_engine()` sets
+  `connect_args={"check_same_thread": False}` for SQLite only (needed for
+  FastAPI's threaded request handling; meaningless for other backends) and
+  `pool_pre_ping=True` for every backend - cheap for SQLite, and
+  meaningful for PostgreSQL specifically: a managed Postgres instance
+  (Render's included) can close idle connections server-side, and
+  pre-ping detects and transparently replaces a dead pooled connection
+  instead of a request failing with one.
+- **Session handling needed no changes for PostgreSQL** - reviewed as part
+  of adding this support, not assumed. `get_db_session()` (web requests)
+  and `BackgroundScanner`'s per-run `session_factory()` calls (the
+  scheduler) already create a fresh `Session` per call and close it in
+  `finally` (see both sections above) - never one `Session` shared/reused
+  globally across requests or threads. What *is* shared globally (the
+  module-level `engine` and `SessionLocal` factory) is exactly what
+  SQLAlchemy's own thread-safety model says is safe to share - the
+  `Engine` and its connection pool, not individual `Session` objects. No
+  code changed here; this was a review, not a fix.
+- **Schema strategy differs by actual dialect, not by an environment
+  flag**: `init_db()` checks `engine.dialect.name` - `"sqlite"` keeps the
+  original automatic `Base.metadata.create_all()` bootstrap on every
+  startup (safe: additive only, never drops or alters an existing table);
+  anything else (PostgreSQL) no-ops, logging why, rather than either
+  crashing or silently doing nothing unexplained. **Do not rely on
+  `create_all()`/`init_db()` for PostgreSQL schema changes** - that's
+  Alembic's job now, below.
+
+### Migrations (Alembic)
+
+Introduced specifically because relying on `create_all()` in production
+against a real, persistent PostgreSQL database is unsafe as the schema
+evolves - it can only ever *add* missing tables, never alter an existing
+one to match a changed model, so a real schema change would need a manual,
+undocumented, one-off fix every time (exactly the problem the hand-written
+`core/saved_searches/migration.py` already solved once, out of necessity,
+for SQLite - see "Saved searches and background scanning" below; Alembic
+is the general-purpose version of that same problem, going forward, for
+any backend).
+
+- **`alembic/env.py` resolves its database URL from
+  `marketplace_alert.config.settings.database_url`** (via the exact same
+  `resolve_database_url()`/`normalize_database_url()` the running app
+  uses) - **not** from `alembic.ini`'s `sqlalchemy.url` (left blank in
+  `alembic.ini` on purpose, with a comment explaining why). This guarantees
+  a migration command can never accidentally target a different database
+  than the app itself would connect to. It also imports
+  `core/persistence/models.py` and `core/saved_searches/models.py` purely
+  for the side effect of registering their tables on `Base.metadata` -
+  `target_metadata = Base.metadata` is what `alembic revision
+  --autogenerate` diffs against, so a model module never imported here
+  would be invisible to it.
+- **`alembic/versions/<rev>_baseline_schema.py`** is the first, baseline
+  migration - it represents *today's* model schema (post multi-marketplace:
+  `saved_searches` has no `marketplace` column; `saved_search_marketplaces`
+  is the join table), autogenerated by diffing `Base.metadata` against a
+  fresh, completely *empty* temporary SQLite database - never against the
+  developer's real local database, and never against any production
+  database. Purely additive (`create_table`/`create_index` only) on the
+  upgrade path - no destructive operations. `downgrade()` is the standard
+  reverse and only runs if explicitly invoked (`alembic downgrade`), never
+  automatically.
+- **Adopting Alembic against a database that already has the current
+  schema needs `stamp`, not `upgrade`** - verified directly, not assumed:
+  running `alembic upgrade head` against a SQLite database that already
+  has these tables (e.g. the developer's existing local
+  `marketplace_alert.db`, built by `create_all()` before Alembic existed)
+  fails cleanly with "table already exists" (no data touched, nothing
+  dropped - a clean failure, not silent corruption), because Alembic has
+  no record of that schema being already-current. `alembic stamp head`
+  is the correct tool for that case - it records the revision as applied
+  without executing any DDL at all. A brand-new, empty database (a fresh
+  production PostgreSQL instance) uses `upgrade head` normally. See
+  README.md "Database" for the exact commands, and
+  `tests/test_alembic_migrations.py` for both scenarios verified against
+  real (temp-file) SQLite databases.
+- **Migrations are not run automatically inside the app's own startup**
+  (`main.py`'s `lifespan`) - deliberately. Render can run more than one
+  instance/worker process; several of them independently attempting
+  `alembic upgrade head` at the same moment as the app boots is a real
+  race with no benefit over running it once, separately, before any new
+  instance starts serving traffic (e.g. a Render Pre-Deploy Command, or a
+  manual `alembic upgrade head` before a deploy). `init_db()` still runs
+  in `lifespan` unconditionally, same as before - it's simply a no-op for
+  PostgreSQL now (see above), so this required no change to `main.py`'s
+  startup sequence itself, only to what `init_db()` does once it's there.
+- **Tests never require a real PostgreSQL server.** `create_engine()`
+  builds an `Engine` object lazily - it only actually opens a connection
+  when one is checked out of the pool - so `tests/test_database_config.py`
+  asserts on the resolved URL/dialect/driver without connecting anywhere,
+  and `tests/test_alembic_migrations.py` runs the real baseline migration
+  (upgrade, downgrade, re-upgrade, the `stamp`-vs-`upgrade` distinction)
+  against throwaway temp-file SQLite databases only.
 
 ## Notifications
 
@@ -718,10 +857,27 @@ Browser (dashboard.js, vanilla JS, no framework)
 - **Abstract base class over duck typing**: `ABC` + `@abstractmethod` gives
   a hard failure at instantiation time if a connector is incomplete, rather
   than a silent `AttributeError` at runtime.
-- **SQLAlchemy + SQLite locally**: gives duplicate detection a real
-  uniqueness guarantee (a DB constraint, not just application logic) while
-  staying file-based and zero-setup for local dev. `DATABASE_URL` is the
-  only thing that changes to move to PostgreSQL later.
+- **SQLAlchemy + SQLite locally, PostgreSQL in production via the same
+  models/code**: gives duplicate detection a real uniqueness guarantee (a
+  DB constraint, not just application logic) while staying file-based and
+  zero-setup for local dev. `DATABASE_URL` is the only thing that changes
+  to move to PostgreSQL - see "Database selection and PostgreSQL support"
+  above for exactly how that selection/normalization works.
+- **`psycopg` (v3), not `psycopg2`**: the actively-maintained, modern
+  PostgreSQL driver, with first-class SQLAlchemy 2.x support - no reason
+  to add the older `psycopg2` as a new dependency on a fresh integration.
+- **Alembic, not `create_all()`, for PostgreSQL schema changes**: a real
+  production database needs schema *changes* (add/alter/drop a column) to
+  be reviewed and applied deliberately, not implicitly re-derived from
+  whatever the model code happens to say at whatever moment the app
+  happens to restart - `create_all()` can only ever add a missing table,
+  never alter an existing one, so relying on it alone would mean every
+  real schema change needs an undocumented manual fix (this project
+  already hit exactly that problem once, for SQLite, before Alembic
+  existed - see `core/saved_searches/migration.py`, "Saved searches and
+  background scanning" below). SQLite keeps `create_all()` deliberately -
+  it's genuinely safe there (ephemeral, single-file, local/test-only) and
+  changing it would add ceremony to local dev for no benefit.
 - **Repository + service layers, not raw DB calls in routes**: keeps
   `main.py` thin and keeps every SQL/ORM detail in one place
   (`persistence/repository.py`), so persistence logic is testable without

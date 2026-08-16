@@ -48,6 +48,50 @@ Then visit:
 - http://127.0.0.1:8000/health — health check
 - http://127.0.0.1:8000/docs — interactive API docs (Swagger UI)
 
+## Database
+
+Local development uses SQLite by default - no setup required, and nothing
+below needs to be done to just run the app locally.
+
+- **`DATABASE_URL` unset** (the normal local case): SQLite,
+  `sqlite:///./marketplace_alert.db`, auto-created on startup.
+- **`DATABASE_URL` set** (production): PostgreSQL. Render's URL, in either
+  the `postgres://` or `postgresql://` form, is normalized automatically -
+  see `marketplace_alert/core/persistence/database.py`.
+
+### Migrations (Alembic)
+
+SQLite (local dev/tests) keeps auto-creating any missing tables on startup,
+same as before - safe, since that only ever adds tables, never drops or
+alters one. **PostgreSQL does not** - its schema is managed by
+[Alembic](https://alembic.sqlalchemy.org/) migrations instead, applied
+deliberately, not implicitly at every app startup.
+
+Run migrations locally (against whatever `DATABASE_URL` resolves to - unset
+means the local SQLite file):
+
+```bash
+alembic upgrade head
+```
+
+Adopting Alembic against a database that **already has the current schema**
+(e.g. an existing local SQLite file created before Alembic existed) needs
+`stamp`, not `upgrade` - `upgrade head` would fail with "table already
+exists" rather than do anything destructive:
+
+```bash
+alembic stamp head
+```
+
+Creating a new migration after changing a model:
+
+```bash
+alembic revision --autogenerate -m "describe the change"
+```
+
+See `PROJECT_CONTEXT.md`/`ARCHITECTURE.md` for the full reasoning, and
+`alembic/versions/` for the baseline migration.
+
 ## Running tests
 
 ```bash

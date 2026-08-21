@@ -1,5 +1,6 @@
 """Application configuration, loaded from environment variables / .env."""
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -68,6 +69,22 @@ class Settings(BaseSettings):
     # Safe, configurable page size for eBay searches (eBay's own max is
     # 200; this connector fetches one page, not all of them, for now).
     ebay_result_limit: int = 25
+
+    # CORS for future web/dev tooling (Phase 9 mobile-API prep). Native
+    # mobile apps don't need browser CORS at all - this exists only in
+    # case future web-based tooling (e.g. an Expo/React Native web
+    # preview) needs to call this API from a browser. Comma-separated
+    # list of allowed origins, e.g. "http://localhost:3000,https://app.example.com".
+    # Empty/unset by default - no cross-origin browser access is allowed
+    # until explicitly configured. Never set this to "*" - see main.py.
+    cors_allowed_origins: list[str] = []
+
+    @field_validator("cors_allowed_origins", mode="before")
+    @classmethod
+    def _parse_cors_allowed_origins(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [origin.strip() for origin in value.split(",") if origin.strip()]
+        return value
 
 
 settings = Settings()

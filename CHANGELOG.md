@@ -5,6 +5,129 @@ All notable changes to this project are recorded here. Format is roughly
 
 ## [Unreleased]
 
+## 2026-08-21 — Versioned Mobile API foundation (`/api/v1`)
+
+Groundwork for the next major goal - a real Android/iOS app - not the app
+itself. Adds a stable, JSON-only, versioned REST API under `/api/v1`
+alongside every existing route (dashboard, `/health`, `/search`, `/scan`,
+the legacy `/saved-searches*`), depending on no HTML/dashboard behavior
+and duplicating no business logic. No mobile app, authentication,
+payments, push notifications, or new marketplace was built - see "Not yet
+implemented" below.
+
+### Added
+- `GET /api/v1/status` - mobile-safe status (`status`, `backend`,
+  `database` - a real `SELECT 1` check, `telegram_configured`,
+  `supported_marketplaces`) - booleans and plain marketplace ids only,
+  never a credential value or the database connection string.
+- `GET /api/v1/marketplaces` - one entry per registered connector
+  (`id`, `name`, `configured`, `available`), driven entirely by
+  `list_supported_marketplaces()`/`get_connector()` - never a separately
+  hard-coded marketplace list. `configured` uses
+  `getattr(connector, "is_configured", True)` (not every connector has a
+  credentials concept); `available` is the connector's own
+  `health_check()`.
+- `GET`/`POST /api/v1/saved-searches`, `GET`/`PATCH`/`DELETE
+  /api/v1/saved-searches/{id}` - thin adapters over the exact same
+  `SavedSearchService` the legacy `/saved-searches*` routes use;
+  request/response schemas (`SavedSearchCreate`/`Update`/`Read`)
+  re-exported from `core/saved_searches/schemas.py`, not re-declared, so
+  the mobile and legacy contracts can't drift apart on something like the
+  minimum scan interval.
+- `POST /api/v1/saved-searches/{id}/run` - runs through the identical
+  `SavedSearchRunner`/`SavedSearchRunGuard` the legacy manual-run endpoint
+  uses (sharing the *same* run guard instance, so the same saved search
+  can never run through both endpoints, or the scheduler, at once); only
+  the response is reshaped - `marketplaces` keyed by marketplace name
+  (`{"etsy": {"new_count": 1, "already_seen_count": 15, "error": null}, ...}`)
+  plus `query`, `total_new_count`, `total_already_seen_count` - easier for
+  a mobile client to consume than the legacy list-shaped response.
+- `GET /api/v1/listings` - paginated (`limit`, default 20, max 100;
+  `offset`), optionally filtered by `marketplace` (422 on an unrecognized
+  one), sorted newest-discovered-first. Backed by two new
+  `ListingRepository` methods (`list_recent`, `count`) - no new table, no
+  new migration. **Two real, pre-existing limitations documented rather
+  than faked**, per this feature's own requirements:
+  - `price`/`currency`/`location`/`condition`/`image_url` are always
+    `null` - `DiscoveredListing` has never persisted them (only since
+    Phase 3's original design, not something this change removed).
+    Mapped explicitly, field-by-field, rather than via Pydantic's
+    `from_attributes` auto-mapping, so this is impossible to miss reading
+    the code.
+  - No `saved_search_id` or `only_new` filter - `DiscoveredListing` has no
+    relationship to `SavedSearch` (dedup identity is global, by design -
+    see Phase 3/`ListingDiscoveryService`), and "new" is a property of one
+    scan run, never a persisted column. Both would have required
+    inventing data or a relationship that isn't actually stored.
+- `marketplace_alert/api/v1/` - the new package (`schemas.py`, `status.py`,
+  `marketplaces.py`, `saved_searches.py`, `listings.py`, `__init__.py`
+  aggregating every sub-router under one `APIRouter(prefix="/api/v1")`).
+  Each sub-router carries its own OpenAPI tag
+  (`"Mobile API - Status"`/`"- Marketplaces"`/`"- Saved Searches"`/
+  `"- Listings"`, described via `FastAPI(openapi_tags=...)`) and every
+  operation has a `summary`/`description`, so `/docs` documents `/api/v1`
+  clearly and separately from the legacy operations.
+- CORS preparation: `CORSMiddleware` (FastAPI's own, no new dependency)
+  always added, `allow_origins` from the new
+  `settings.cors_allowed_origins` (`CORS_ALLOWED_ORIGINS`, comma-separated)
+  - empty/off by default, never `"*"`. Native mobile apps don't need
+  browser CORS at all; this is for possible future web-based tooling only.
+  `.env.example` updated with a placeholder (empty) value.
+
+### Changed
+- `marketplace_alert/dependencies.py` (new module) now owns the singletons
+  `main.py` used to construct itself (`NotificationService`,
+  `SavedSearchRunner`, `SavedSearchRunGuard`) - extracted so both the
+  legacy routes and the new `/api/v1` routers depend on the *exact same*
+  objects (critical for the run guard to actually prevent overlapping
+  runs across both). `main.py` re-imports everything under its original
+  (leading-underscore) names - a pure extraction, not a behavior change:
+  every existing test import (`from marketplace_alert.main import
+  get_notification_service`, `_saved_search_run_guard`, etc.) still
+  resolves to the identical objects, confirmed by the full existing test
+  suite passing unmodified.
+- `core/persistence/repository.py` (`ListingRepository`): added
+  `list_recent(limit, offset, marketplace=None)` and
+  `count(marketplace=None)` - the only new persistence-layer code this
+  change needed.
+
+### Tests
+- Tests (276/276 passing, up from 233): new `tests/test_api_v1.py`
+  (status shape and secrets-never-exposed, marketplace metadata matching
+  the registry and reflecting real credential configuration, saved-search
+  create/list/get/update/delete, invalid-marketplace and invalid-interval
+  validation (422), missing-saved-search 404s, manual run's structured
+  mobile response, run-guard sharing with the legacy endpoint verified
+  directly, listings pagination/ordering/marketplace-filtering, the
+  always-null unpersisted listing fields, invalid marketplace filter
+  (422), error responses never containing stack traces, and existing
+  legacy routes (`/`, `/health`, `/saved-searches`, `/docs`,
+  `/openapi.json`) still reachable alongside `/api/v1`) and
+  `tests/test_cors_config.py` (unset/empty default, comma-separated
+  parsing with whitespace/empty-entry handling, a real list passed
+  directly, never `"*"` by default, and an integration check that the
+  real app sends no CORS header for an unconfigured origin). All existing
+  Etsy/eBay/mock, persistence, saved-search, scheduler, Telegram, and
+  PostgreSQL/SQLite-selection tests continue to pass unchanged - no
+  marketplace, notification, scheduling, or database-selection code was
+  touched by this change. Every test uses the existing isolated-database,
+  fake-notification-provider `client` fixture (`tests/conftest.py`) -
+  `lifespan()` (and therefore the real background scanner) is never
+  triggered during the suite.
+
+### Not yet implemented
+- The actual mobile application (React Native, Expo, Flutter, native
+  Android/iOS) - `/api/v1` is groundwork for it, not the app.
+- Authentication on `/api/v1` - every endpoint is exactly as open as the
+  legacy routes today. The dependency-injection structure is ready for a
+  `Depends(...)`-based auth check to be added per endpoint later, but
+  nothing enforces it now, and no user id was fabricated.
+- Persisting `price`/`currency`/`location`/`condition`/`image_url` on
+  `DiscoveredListing`, and a `saved_search_id` relationship for listings -
+  both real, separate future work (a new migration, and a decision about
+  already-discovered rows), not addressed here.
+- Push notifications, payments, new marketplaces - none touched.
+
 ## 2026-08-15 — PostgreSQL support, alongside SQLite
 
 The system is live on Render; a Render PostgreSQL database

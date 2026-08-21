@@ -115,7 +115,16 @@ connectors.
 ```
 marketplace_alert/
     main.py                    FastAPI app entry point (incl. GET / dashboard route)
+    dependencies.py            Shared singletons/dependency providers (notification service, run guard, ...)
     config.py                  Settings loaded from environment / .env
+    api/
+        v1/
+            __init__.py          Aggregates every /api/v1 sub-router
+            schemas.py            Mobile API request/response schemas
+            status.py              GET /api/v1/status
+            marketplaces.py         GET /api/v1/marketplaces
+            saved_searches.py       /api/v1/saved-searches* (CRUD + run)
+            listings.py              GET /api/v1/listings
     templates/
         dashboard.html          Jinja2 template for the management dashboard
     static/
@@ -850,6 +859,132 @@ Browser (dashboard.js, vanilla JS, no framework)
   dashboard inherits that safety for free rather than needing its own
   error-sanitizing logic.
 
+## Mobile API
+
+`/api/v1` (`marketplace_alert/api/v1/`) is a versioned, JSON-only REST API
+- groundwork for a future Android/iOS app (not built yet - see
+PROJECT_CONTEXT.md). Added *alongside* every existing route (`/`, `/docs`,
+`/health`, `/search`, `/scan`, the legacy `/saved-searches*`) - nothing
+about it removes or changes any of them. It depends on no HTML/dashboard
+behavior at all, unlike the dashboard, which is itself just a browser
+client of the *legacy* JSON API.
+
+```
+main.py
+    -> app.include_router(api_v1_router)   (marketplace_alert/api/v1/__init__.py, prefix "/api/v1")
+
+GET  /api/v1/status            -> list_supported_marketplaces(), NotificationService.is_enabled, SELECT 1
+GET  /api/v1/marketplaces      -> list_supported_marketplaces() + get_connector(id).health_check()/is_configured
+GET  /api/v1/saved-searches    -> SavedSearchService.list_all()          (same service the legacy routes use)
+POST /api/v1/saved-searches    -> SavedSearchService.create(...)
+GET/PATCH/DELETE .../{id}      -> SavedSearchService.get/update/delete(...)
+POST .../{id}/run              -> SavedSearchRunner.run(...)             (same runner + run guard, reshaped response)
+GET  /api/v1/listings          -> ListingRepository.list_recent/count(...)
+```
+
+- **A shared-dependencies module, to avoid a circular import.**
+  `marketplace_alert/dependencies.py` now owns the singletons `main.py`
+  used to construct itself: the real `NotificationService`, the
+  `SavedSearchRunner`/`SavedSearchRunGuard` the scheduler and manual-run
+  endpoints share. Both `main.py`'s legacy routes and the `/api/v1`
+  routers depend on the *exact same* objects from here - `main.py` can't
+  be imported by `api/v1/` (it mounts `api/v1`'s router, so that would be
+  circular), and duplicating the singletons would let the same saved
+  search run through both an old and a new endpoint at once, bypassing the
+  run guard. `main.py` re-imports everything from `dependencies.py` under
+  its original (leading-underscore) names, so this is a pure extraction -
+  every existing test import (`from marketplace_alert.main import
+  get_notification_service`, `_saved_search_run_guard`, etc.) still
+  resolves to the identical objects, unchanged.
+- **No saved-search business logic is duplicated.**
+  `api/v1/saved_searches.py`'s five CRUD endpoints are thin adapters over
+  the exact same `SavedSearchService` (`get_saved_search_service`,
+  `dependencies.py`) the legacy routes use, and its manual-run endpoint
+  constructs a `SavedSearchRunner` and acquires `saved_search_run_guard`
+  exactly like the legacy `POST /saved-searches/{id}/run` does - the
+  *only* new code is reshaping the resulting `SavedSearchRunResult` (a
+  list of per-marketplace results) into the mobile response shape (a dict
+  keyed by marketplace name, plus `query` and renamed totals - see
+  `api/v1/schemas.py:SavedSearchRunResult`), genuinely more convenient for
+  a mobile client, not a second implementation of "run a saved search".
+  Request/response schemas for saved searches
+  (`SavedSearchCreate`/`Update`/`Read`) are literally re-exported from
+  `core/saved_searches/schemas.py`, not re-declared - the mobile contract
+  and the legacy one share one validated definition, so they can't
+  quietly drift out of sync on something like the minimum scan interval.
+- **`GET /api/v1/marketplaces` is entirely registry-driven.** Every id
+  comes from `list_supported_marketplaces()` - never a separately
+  maintained list (the only marketplace-specific data here is a small,
+  purely cosmetic id -> display-name lookup for brand casing, e.g.
+  `"ebay"` -> `"eBay"`; a marketplace missing from it still appears, just
+  title-cased instead). `configured` uses `getattr(connector,
+  "is_configured", True)` since not every connector has a credentials
+  concept (the mock one has nothing to configure); `available` is the
+  connector's own `health_check()` - part of the `MarketplaceConnector`
+  interface every connector implements, and for Etsy/eBay it happens to
+  return `is_configured` today (see their sections above), but the
+  contract here is `health_check()`, not `is_configured`, so a future
+  connector could make `available` a real liveness probe without changing
+  this endpoint.
+- **`GET /api/v1/listings` documents two real gaps instead of faking
+  data or a relationship that isn't stored** - required explicitly by
+  this feature's own brief, not just good practice:
+  - `price`/`currency`/`location`/`condition`/`image_url` are always
+    `null`. `DiscoveredListing` (`core/persistence/models.py`) has never
+    stored them - only `marketplace`, `external_listing_id`, `title`,
+    `listing_url`, and the two discovery timestamps, since Phase 3.
+    `api/v1/listings.py`'s `_to_listing_out()` maps `DiscoveredListing` ->
+    `ListingOut` *explicitly*, field by field, rather than via Pydantic's
+    `from_attributes` auto-mapping - deliberately, so the fact that five
+    fields don't exist on the source row is impossible to miss reading the
+    code, not hidden behind a generic mapper quietly defaulting them.
+  - **No `saved_search_id` filter.** `DiscoveredListing` has no
+    relationship to `SavedSearch` at all - its dedup identity
+    (`marketplace`, `external_listing_id`) is deliberately *global* across
+    every saved search that happens to match it (see "Local persistence
+    and duplicate detection" above), not scoped to whichever search first
+    discovered it. A `saved_search_id` filter would have to invent that
+    relationship.
+  - **No `only_new` filter.** "New" is a property of one specific scan run
+    (`ListingDiscoveryResult.new_listings`), never a column persisted on
+    the row itself - there is no reliable, stored "is this new" flag to
+    filter on.
+- **Pagination is `limit`/`offset` with a hard cap (100), sorted
+  newest-first** (`first_discovered_at DESC`, `id DESC` as a stable
+  tiebreaker) - `ListingRepository.list_recent()`/`count()`
+  (`core/persistence/repository.py`), the only new persistence-layer code
+  this added; no new table, no new migration.
+- **Errors stay in the existing `{"detail": "..."}` shape** (FastAPI's own
+  `HTTPException`), the same one the legacy routes and the dashboard's
+  error handling already depend on - a different mobile-specific error
+  envelope was deliberately not invented, since that would mean either two
+  incompatible error shapes across the same app or changing the legacy
+  routes' (and the dashboard's) existing error handling, which this task
+  explicitly rules out breaking.
+- **CORS is prepared, off by default.** `CORSMiddleware` (FastAPI's own,
+  no new dependency) is always added, with `allow_origins` from
+  `settings.cors_allowed_origins` (`CORS_ALLOWED_ORIGINS`, comma-separated)
+  - empty unless explicitly configured, so no cross-origin browser access
+  happens until someone opts in; never `"*"`. Native mobile apps don't use
+  browser CORS at all - this exists only for possible future browser-based
+  tooling.
+- **No authentication yet - not implemented, and not faked either.**
+  Every `/api/v1` endpoint is exactly as open as the legacy routes today
+  (consistent with "no auth anywhere yet" - see PROJECT_CONTEXT.md). The
+  extension point is already in place, though: every endpoint already
+  takes its dependencies via FastAPI `Depends(...)` (a service, a session),
+  so adding `Depends(require_authenticated_user)` (or similar) to each
+  endpoint's signature later is a small, additive change per endpoint, not
+  a rewrite - no placeholder/no-op check and no fabricated user id were
+  added now, since neither would be meaningfully different from having no
+  auth at all, just more confusing about it.
+- **Tags/OpenAPI**: each sub-router carries its own descriptive tag
+  (`"Mobile API - Status"`, `"- Marketplaces"`, `"- Saved Searches"`,
+  `"- Listings"`, registered with descriptions via `FastAPI(openapi_tags=...)`
+  in `main.py`) and every operation has a `summary`/`description`, so
+  `/docs` groups and documents `/api/v1` clearly, separately from the
+  legacy routes' operations.
+
 ## Why these choices
 
 - **FastAPI + Pydantic**: fast to build, validates data at the boundary,
@@ -946,6 +1081,33 @@ Browser (dashboard.js, vanilla JS, no framework)
   pre-existing single-marketplace rows on startup rather than requiring a
   destructive reset, since real saved searches already existed before this
   change - see `core/saved_searches/migration.py` above.
+- **`APIRouter`s under `marketplace_alert/api/v1/`, not more routes bolted
+  onto `main.py`**: `main.py` was already carrying the dashboard route,
+  every legacy JSON route, and app startup/lifespan wiring - adding a
+  second, versioned API's worth of endpoints directly into it would make
+  it the one file everything depends on understanding. Splitting `/api/v1`
+  into its own package (one module per resource, one shared schemas
+  module) keeps each concern small and gives FastAPI's own tag/description
+  metadata something clean to group in `/docs`. The `dependencies.py`
+  extraction (see "Mobile API" above) exists specifically so this split
+  doesn't introduce a circular import or a second set of singletons.
+- **Reshape the response, never re-implement the operation**: every
+  `/api/v1` endpoint that has a legacy equivalent (saved-search CRUD, the
+  manual run) calls the identical service/runner the legacy route calls -
+  the only mobile-specific code is how the *response* is shaped
+  (`api/v1/schemas.py`). This was the deliberate alternative to writing a
+  second "mobile saved-search service" that would need to be kept in sync
+  with the first one by hand forever.
+- **Document persistence/relationship gaps in `GET /api/v1/listings`
+  rather than inventing data or a relationship that isn't stored**: the
+  tempting shortcut - guessing a plausible `saved_search_id` from
+  matching titles, or silently omitting the null fields from the response
+  - would both misrepresent what the database actually contains to a
+  mobile client that has no way to know better. Returning explicit `null`
+  fields and simply not offering a filter the data model can't support
+  keeps the API honest about its own current limits; extending
+  `DiscoveredListing`'s schema is real, separate future work, not
+  something to fake around in an API-shape task.
 
 ## Non-goals (for now)
 

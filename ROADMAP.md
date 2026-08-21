@@ -120,7 +120,19 @@ on nothing technical - the schema/code support is in place - just not yet
 done, and explicitly out of scope for the change that added that support.
 
 ## Phase 9 — Android/iOS application
-Mobile clients on top of the existing API.
+Mobile clients on top of the existing API. **Not started - API groundwork
+only, ahead of schedule:** a versioned, JSON-only Mobile API now exists
+under `/api/v1` (status, marketplace metadata, saved-search CRUD + manual
+run, paginated discovered-listings browsing), added alongside every
+existing route with zero duplicated business logic - see `ARCHITECTURE.md`
+"Mobile API". CORS is prepared (off by default) and the endpoint structure
+is ready for auth to be added later, but **no mobile app was built** (no
+React Native/Expo/Flutter/native project), **no authentication exists
+yet**, and two real persistence gaps were surfaced rather than worked
+around: `DiscoveredListing` doesn't yet store
+price/currency/location/condition/image_url, and has no relationship to
+`SavedSearch` to filter listings by. This phase's actual goal - real
+Android/iOS clients - has not begun.
 
 ## Phase 10 — Subscriptions/payments
 Paid tiers, billing.

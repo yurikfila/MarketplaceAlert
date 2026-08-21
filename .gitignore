@@ -22,6 +22,9 @@ htmlcov/
 # Local database
 *.db
 *.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
 
 # Editors / OS
 .vscode/

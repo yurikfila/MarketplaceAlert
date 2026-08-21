@@ -7,7 +7,7 @@ details. Everything above it - the service layer, routes - works with
 
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from marketplace_alert.core.models.listing import Listing
@@ -47,3 +47,28 @@ class ListingRepository:
         """Update last_seen_at for a listing that showed up again."""
         row.last_seen_at = datetime.now(timezone.utc)
         self._session.add(row)
+
+    def list_recent(
+        self, *, limit: int, offset: int, marketplace: str | None = None
+    ) -> list[DiscoveredListing]:
+        """Discovered listings, newest-first (by first_discovered_at, then
+        id as a stable tiebreaker for rows with an identical timestamp).
+
+        Backs `GET /api/v1/listings` - see that route's docstring for the
+        query parameters intentionally NOT offered here (`saved_search_id`,
+        `only_new`) and why.
+        """
+        stmt = select(DiscoveredListing).order_by(
+            DiscoveredListing.first_discovered_at.desc(), DiscoveredListing.id.desc()
+        )
+        if marketplace is not None:
+            stmt = stmt.where(DiscoveredListing.marketplace == marketplace)
+        stmt = stmt.limit(limit).offset(offset)
+        return list(self._session.execute(stmt).scalars().all())
+
+    def count(self, *, marketplace: str | None = None) -> int:
+        """Total matching rows, ignoring limit/offset - for pagination metadata."""
+        stmt = select(func.count()).select_from(DiscoveredListing)
+        if marketplace is not None:
+            stmt = stmt.where(DiscoveredListing.marketplace == marketplace)
+        return self._session.execute(stmt).scalar_one()

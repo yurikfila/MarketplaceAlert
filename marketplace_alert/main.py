@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -17,6 +18,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from marketplace_alert import __version__
+from marketplace_alert.api.v1 import router as api_v1_router
 from marketplace_alert.config import settings
 from marketplace_alert.connectors.mock.connector import MockMarketplaceConnector
 from marketplace_alert.connectors.registry import (
@@ -41,9 +43,10 @@ from marketplace_alert.core.saved_searches.schemas import (
     SavedSearchUpdate,
 )
 from marketplace_alert.core.saved_searches.service import SavedSearchService, UnsupportedMarketplaceError
-from marketplace_alert.core.scheduler.guard import SavedSearchRunGuard
 from marketplace_alert.core.scheduler.scanner import BackgroundScanner
-from marketplace_alert.notifications.telegram.provider import TelegramNotificationProvider
+from marketplace_alert.dependencies import get_notification_service, get_saved_search_service
+from marketplace_alert.dependencies import saved_search_run_guard as _saved_search_run_guard
+from marketplace_alert.dependencies import saved_search_runner as _saved_search_runner
 
 configure_logging(settings.log_level)
 logger = logging.getLogger(__name__)
@@ -83,48 +86,11 @@ def _format_interval(seconds: int) -> str:
 # proper marketplace-selection mechanism.
 _mock_connector = MockMarketplaceConnector()
 
-# The concrete provider (Telegram) is chosen here, once, at startup - the
-# notification service and /scan route only ever depend on the
-# NotificationProvider interface. Disabled automatically if credentials are
-# missing (see TelegramNotificationProvider). The provider retries its own
-# transient failures (429/5xx/timeout, bounded, with backoff); the service
-# paces sends between separate listings - see both modules' docstrings.
-_notification_service = NotificationService(
-    TelegramNotificationProvider(
-        bot_token=settings.telegram_bot_token,
-        chat_id=settings.telegram_chat_id,
-        max_retries=settings.telegram_max_retries,
-        retry_base_seconds=settings.telegram_retry_base_seconds,
-    ),
-    send_delay_seconds=settings.telegram_send_delay_seconds,
-)
-
-
-def get_notification_service() -> NotificationService:
-    """FastAPI dependency, overridden in tests with a fake provider.
-
-    Never send real Telegram messages from automated tests - see
-    tests/conftest.py.
-    """
-    return _notification_service
-
-
-def get_saved_search_service(session: Session = Depends(get_db_session)) -> SavedSearchService:
-    """FastAPI dependency: validated saved-search CRUD, wired to the real connector registry."""
-    return SavedSearchService(session, is_marketplace_supported=is_marketplace_supported)
-
-
-# The background scanner's own runner is bound to the real notification
-# service, since a background thread has no per-request Depends to pull a
-# (possibly test-faked) one from. It resolves connectors only through
-# get_connector - it never imports MockMarketplaceConnector itself.
-_saved_search_runner = SavedSearchRunner(
-    notification_service=_notification_service,
-    resolve_connector=get_connector,
-)
-# Shared between the scheduler and the manual /run endpoint so the same
-# saved search can never be scanned by both at once.
-_saved_search_run_guard = SavedSearchRunGuard()
+# get_notification_service, get_saved_search_service, _saved_search_runner,
+# and _saved_search_run_guard are imported above from
+# marketplace_alert.dependencies - the one place these singletons are
+# constructed, shared with the /api/v1 routers too. See that module's
+# docstring.
 _background_scanner = BackgroundScanner(
     session_factory=SessionLocal,
     runner=_saved_search_runner,
@@ -154,8 +120,43 @@ app = FastAPI(
     version=__version__,
     description="Marketplace monitoring and alert platform.",
     lifespan=lifespan,
+    openapi_tags=[
+        {
+            "name": "Mobile API - Status",
+            "description": "Lightweight, mobile-safe backend/database/notification status.",
+        },
+        {
+            "name": "Mobile API - Marketplaces",
+            "description": "Marketplace metadata, driven entirely by the connector registry.",
+        },
+        {
+            "name": "Mobile API - Saved Searches",
+            "description": "Saved-search CRUD and manual run, for a future Android/iOS client.",
+        },
+        {
+            "name": "Mobile API - Listings",
+            "description": "Browse recently discovered listings (see known limitations in the endpoint description).",
+        },
+    ],
 )
+
+# Native mobile apps don't need browser CORS at all - this exists only for
+# future web/dev tooling (e.g. an Expo/React Native web preview) that might
+# call this API from a browser context. Empty by default (settings.
+# cors_allowed_origins, from CORS_ALLOWED_ORIGINS) - no cross-origin
+# browser access until explicitly configured; never "*" - see config.py.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_allowed_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.mount("/static", StaticFiles(directory=_BASE_DIR / "static"), name="static")
+# Versioned mobile API - see marketplace_alert/api/v1/__init__.py. Additive
+# only: nothing above/below this line changes for any existing route.
+app.include_router(api_v1_router)
 
 
 @app.get("/", response_class=HTMLResponse)

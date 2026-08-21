@@ -146,6 +146,24 @@ Implemented so far:
   re-derived at every app startup. See `ARCHITECTURE.md` and README.md
   "Database" for the full picture, and "Important architectural decisions"
   below for why.
+- **A versioned Mobile API, under `/api/v1`** - groundwork for a future
+  Android/iOS app (not built yet - see "Things that have NOT yet been
+  implemented"). Added *alongside* every existing route, never replacing
+  any of them: `GET /api/v1/status` (mobile-safe status - booleans and
+  marketplace ids only, no secrets), `GET /api/v1/marketplaces`
+  (marketplace metadata, entirely from the connector registry),
+  `GET`/`POST /api/v1/saved-searches`, `GET`/`PATCH`/`DELETE
+  /api/v1/saved-searches/{id}`, `POST /api/v1/saved-searches/{id}/run`
+  (same `SavedSearchService`/`SavedSearchRunner`/run-guard the legacy
+  routes already use - a mobile-shaped response, not a second
+  implementation), and `GET /api/v1/listings` (browse discovered listings,
+  paginated - see "Important architectural decisions" below for two real
+  limitations documented rather than faked: several listing fields aren't
+  persisted yet, and there's no stored relationship to filter listings by
+  saved search). CORS is prepared (`CORS_ALLOWED_ORIGINS`, empty/off by
+  default - native mobile apps don't need it) but no authentication yet -
+  deliberately out of scope for this change, see below. See
+  `ARCHITECTURE.md` "Mobile API".
 
 ## Current milestone
 
@@ -176,9 +194,17 @@ is now live on Render; PostgreSQL *support* has been added (selection,
 normalization, Alembic migrations - #13) since a Render PostgreSQL database
 already exists but the deployed Web Service isn't using it yet - this is
 schema/code readiness, not the actual production cutover (no Render config
-changed, nothing deployed, no local data migrated). None of this is a
-signal to start the rest of Phase 7's scope, Phase 6 (user accounts), or
-any other later phase, or to add a fourth marketplace connector yet.
+changed, nothing deployed, no local data migrated). A versioned Mobile API
+(`/api/v1` - #14) now exists too, as groundwork for the next major goal (a
+real Android/iOS app) - it's a stable, JSON-only, secrets-safe contract
+reusing every existing service/repository, added alongside the legacy
+routes without touching them. **This is API-side preparation only**: no
+mobile app was built, no authentication was added (the architecture is
+just structured so it can be, later, without rewriting these endpoints -
+see #14), and no new marketplace was added. None of this is a signal to
+start the rest of Phase 7's scope, Phase 6 (user accounts), Phase 9 (the
+actual mobile app), or any other later phase, or to add a fourth
+marketplace connector yet.
 
 ## Chosen technology
 
@@ -192,6 +218,8 @@ any other later phase, or to add a fourth marketplace connector yet.
 - Alembic for PostgreSQL schema migrations (SQLite keeps its original
   automatic `create_all()` bootstrap - see "Important architectural
   decisions" #13 and README.md "Database")
+- FastAPI's own `CORSMiddleware` for the Mobile API's CORS prep (no new
+  dependency) - off by default, see "Important architectural decisions" #14
 - httpx for outbound HTTP calls (the Telegram Bot API; Etsy Open API v3;
   eBay's OAuth token endpoint and Buy Browse API)
 - Jinja2 for server-rendered HTML (the `/` dashboard) plus a small amount
@@ -439,6 +467,70 @@ any other later phase, or to add a fourth marketplace connector yet.
       detection, or the dashboard - and no local SQLite data was migrated
       to PostgreSQL (out of scope for this change, to be handled
       separately) or deleted.
+14. **The Mobile API (`/api/v1`) is a thin, versioned adapter layer -
+    every endpoint reuses an existing service/repository, none duplicate
+    business logic, and two real persistence gaps were documented rather
+    than papered over.**
+    - **A shared-dependencies extraction, to avoid a circular import, not
+      a behavior change.** `main.py` used to construct
+      `NotificationService`, `SavedSearchRunner`, and `SavedSearchRunGuard`
+      as its own module-level singletons. Both `main.py`'s legacy routes
+      and the new `/api/v1` routers need the *exact same* singletons (so
+      the run guard actually prevents the same saved search running
+      through both an old and a new endpoint at once) - since `api/v1/`
+      can't import from `main.py` without a cycle (`main.py` mounts
+      `api/v1`'s router), these singletons moved to a new
+      `marketplace_alert/dependencies.py`, and `main.py` re-imports them
+      under their original names. Every existing test import
+      (`from marketplace_alert.main import get_notification_service`,
+      `_saved_search_run_guard`, etc.) keeps working unchanged, because
+      Python re-exports still expose the identical objects under
+      `main`'s namespace - confirmed by the full existing test suite
+      passing unmodified, not just asserted.
+    - **`GET /api/v1/listings` documents two real limitations instead of
+      faking them**, per this task's own explicit instruction:
+      - `price`/`currency`/`location`/`condition`/`image_url` are always
+        `null` - `DiscoveredListing` (`core/persistence/models.py`) only
+        ever stored `marketplace`/`external_listing_id`/`title`/
+        `listing_url` and two timestamps, going all the way back to when
+        persistence was first built (Phase 3) - nothing about *this*
+        change removed data that used to be there. Extending persistence
+        to store the rest of `Listing`'s fields is a separate, larger
+        change (a new column set, a migration, and deciding what to do
+        about already-discovered rows) - deliberately not bundled into
+        this one.
+      - No `saved_search_id` filter is offered - `DiscoveredListing` has
+        no relationship to `SavedSearch` at all; its dedup identity
+        (`marketplace`, `external_listing_id`) is intentionally *global*
+        across every saved search that happens to match it (see decision
+        #2 and `ListingDiscoveryService`), not scoped to whichever search
+        happened to discover it first. Inventing that relationship for
+        this endpoint would misrepresent what's actually stored.
+      - `only_new` is not offered either, for the same reason: "new" is a
+        property of one specific scan run (`ListingDiscoveryResult`), not
+        a persisted column on the row - there's nothing reliable to filter
+        on without pretending otherwise.
+    - **The manual-run response is intentionally reshaped, not
+      duplicated.** `POST /api/v1/saved-searches/{id}/run` calls the exact
+      same `SavedSearchRunner`/`SavedSearchRunGuard` the legacy
+      `POST /saved-searches/{id}/run` does - the only new code is mapping
+      the existing `SavedSearchRunResult` (a list of per-marketplace
+      results) into a dict keyed by marketplace name plus a `query` field
+      and renamed totals, genuinely easier for a mobile client to consume
+      without duplicating the run logic itself.
+    - **CORS is prepared, not left wide open.**
+      `settings.cors_allowed_origins` (from `CORS_ALLOWED_ORIGINS`,
+      comma-separated) defaults to an empty list - no cross-origin browser
+      access at all until explicitly configured, never `"*"`. Native
+      mobile apps don't need browser CORS in the first place; this exists
+      only for possible future web-based tooling.
+    - **No authentication was added, and none was faked.** Every
+      `/api/v1` endpoint already takes its dependencies via FastAPI
+      `Depends(...)` (services, sessions) - the same mechanism a future
+      `Depends(require_authenticated_user)` would use, added to each
+      endpoint's signature later without restructuring anything. No
+      placeholder/no-op auth check and no fabricated user id were added
+      now - see "Things that have NOT yet been implemented".
 
 ## Things that have NOT yet been implemented
 
@@ -490,7 +582,21 @@ any other later phase, or to add a fourth marketplace connector yet.
   *definitions* (create/list/run/enable/disable/delete) but does not show
   the discovered listings themselves; that's the rest of Phase 7's stated
   scope ("...and viewing results"), not covered here.
-- Mobile application.
+- **The actual mobile application** (React Native, Expo, Flutter, native
+  Android/iOS - none chosen yet) - `/api/v1` (this change) is groundwork
+  for it, not the app itself.
+- **User accounts / authentication on `/api/v1`** - every endpoint is
+  currently as open as the legacy routes (no auth anywhere yet, consistent
+  with "Things that have NOT yet been implemented" below). The dependency-
+  injection structure is deliberately ready for a `Depends(...)`-based auth
+  check to be added later per endpoint - see "Important architectural
+  decisions" #14 - but nothing enforces it today, and no user id is
+  fabricated anywhere.
+- **Extending `DiscoveredListing` to persist price/currency/location/
+  condition/image_url**, and a `saved_search_id`/listing relationship -
+  both real gaps surfaced (not hidden) while building `GET
+  /api/v1/listings` - see "Important architectural decisions" #14.
+- Push notifications (beyond the existing Telegram alerting).
 - Payments / subscriptions.
 - **The production Render Web Service is not yet connected to PostgreSQL.**
   PostgreSQL *support* now exists in the codebase (`DATABASE_URL` selection,

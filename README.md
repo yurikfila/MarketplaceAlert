@@ -44,9 +44,34 @@ uvicorn marketplace_alert.main:app --reload
 ```
 
 Then visit:
-- http://127.0.0.1:8000/ — basic service info
+- http://127.0.0.1:8000/ — the management dashboard
 - http://127.0.0.1:8000/health — health check
-- http://127.0.0.1:8000/docs — interactive API docs (Swagger UI)
+- http://127.0.0.1:8000/docs — interactive API docs (Swagger UI, includes both the legacy and `/api/v1` routes)
+
+## Mobile API
+
+**Base path: `/api/v1`** — a versioned, JSON-only REST API for a future
+Android/iOS app, added alongside (not replacing) the existing dashboard
+and legacy routes. It depends on no HTML/dashboard behavior and never
+exposes secrets. See `PROJECT_CONTEXT.md`/`ARCHITECTURE.md` "Mobile API"
+for the full design (including the known limitations of `GET
+/api/v1/listings` - several fields are not persisted yet, and there's no
+`saved_search_id` relationship to filter on).
+
+| Method | Path | What |
+|---|---|---|
+| GET | `/api/v1/status` | Mobile-safe backend/database/Telegram status |
+| GET | `/api/v1/marketplaces` | Marketplace metadata, from the connector registry |
+| GET | `/api/v1/saved-searches` | List saved searches |
+| POST | `/api/v1/saved-searches` | Create a saved search |
+| GET | `/api/v1/saved-searches/{id}` | Get one saved search |
+| PATCH | `/api/v1/saved-searches/{id}` | Update a saved search |
+| DELETE | `/api/v1/saved-searches/{id}` | Delete a saved search |
+| POST | `/api/v1/saved-searches/{id}/run` | Run a saved search now |
+| GET | `/api/v1/listings` | Browse recently discovered listings (paginated) |
+
+No mobile app (React Native, Expo, Flutter, native Android/iOS) or
+authentication is built yet - this is API-side groundwork only.
 
 ## Database
 

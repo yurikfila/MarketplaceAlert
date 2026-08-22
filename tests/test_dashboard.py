@@ -73,6 +73,28 @@ def test_dashboard_has_a_select_all_marketplaces_checkbox(client) -> None:
     assert 'id="marketplaces-select-all"' in body
 
 
+def test_dashboard_marketplace_checkbox_labels_use_brand_casing_not_title_case(client) -> None:
+    """Regression: the checkbox label used to be `{{ marketplace.title() }}`
+    - correct for "etsy"/"mock", but Python's `.title()` on "ebay" gives
+    "Ebay", not the correct "eBay". Now driven by the shared
+    `display_name_for()` (same source `GET /api/v1/marketplaces` uses),
+    so this must never regress back to raw title-casing."""
+    body = client.get("/").text
+    assert "eBay" in body
+    assert "Ebay" not in body
+
+
+def test_dashboard_saved_search_table_uses_brand_casing_for_marketplaces(client) -> None:
+    """Same regression, in the saved-searches table's marketplaces_display
+    column rather than the create-form checkboxes."""
+    _create_saved_search(client, query="Drill search", marketplaces=["ebay"])
+
+    body = client.get("/").text
+
+    assert "eBay" in body
+    assert "Ebay" not in body
+
+
 def test_dashboard_saved_search_table_shows_all_selected_marketplaces(client) -> None:
     _create_saved_search(client, query="Makita", marketplaces=["etsy", "mock"])
 

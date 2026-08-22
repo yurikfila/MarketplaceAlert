@@ -5,6 +5,168 @@ All notable changes to this project are recorded here. Format is roughly
 
 ## [Unreleased]
 
+## 2026-08-22 — Listings product-experience pass
+
+**Product Experience Phase 2**: turned the Listings feature from
+technically-working into practically useful for daily browsing, across
+the backend API, the mobile app, and the web dashboard. No new
+marketplace. The real gap this closed: `DiscoveredListing` never
+persisted most of what a connector actually returns
+(price/currency/location/seller/condition/image_url) - `GET
+/api/v1/listings` could only ever return `null` for all of them. Every
+downstream feature in this pass (rich listing cards, price filtering/
+sorting, condition/location display) depends on that being fixed first.
+
+### Added - Backend/API
+- `DiscoveredListing` gained `price`/`currency`/`location`/`seller`/
+  `condition`/`image_url`/`source_created_at` (all nullable, captured
+  once at first-discovery time - a later re-scan of the same listing
+  never overwrites them, even if the source price changed) and
+  `discovered_by_saved_search_id` (nullable FK to `saved_searches.id`,
+  `ON DELETE SET NULL`, indexed) - an honest "first discovered by"
+  attribution, not an exclusive-ownership relationship (the same listing
+  can independently match other saved searches too; only the first
+  discovery is recorded). New Alembic migration
+  (`alembic/versions/280fbde82447_...py`), purely additive, using
+  `op.batch_alter_table()` (plain `add_column`/`create_foreign_key`
+  fails on SQLite - no `ALTER TABLE ADD CONSTRAINT` support there -
+  batch mode compiles to the same plain statements on PostgreSQL).
+- `GET /api/v1/listings` gained real filtering and sorting:
+  `saved_search_id`, `marketplaces` (plural, repeated-param multi-select -
+  additive, alongside the existing singular `marketplace`, fully
+  backward compatible), `min_price`/`max_price`, `currency`, `condition`,
+  `location` (substring, case-insensitive), `discovered_after`/
+  `discovered_before`, `new_since` (an alias narrowing the same column as
+  `discovered_after`), and `sort` (`newest`/`oldest`/`price_asc`/
+  `price_desc` - a `null` price always sorts last in either price mode).
+  Validation: an unknown marketplace (singular or plural) is 422, so is
+  `min_price > max_price`, `saved_search_id <= 0`, an invalid `sort`
+  value, and the existing `limit`/`offset` bounds - a filter value that
+  simply matches nothing (e.g. a `saved_search_id` that doesn't exist)
+  returns an empty page, never a 404, since this is a list-with-filters
+  endpoint, not a single-resource lookup. `ListingOut` gained `seller`,
+  `source_created_at`, and `saved_search_id`. One consistent timestamp
+  strategy: every "how recent" filter/sort operates on
+  `first_discovered_at` only, never `source_created_at` (display-only) -
+  so a listing that's old on the marketplace but newly surfaced by a
+  brand-new saved search still counts as newly discovered.
+- `ListingRepository.list_recent()`/`.count()` share one
+  `_apply_filters()` helper, so pagination metadata (`total_count`) can
+  never drift out of sync with what a page actually contains.
+- `marketplace_alert/main.py` - a new `GET /listings` dashboard page
+  (`templates/listings.html`), the rest of Phase 7's stated scope
+  ("...and viewing results") alongside the existing saved-search
+  administration page. Plain server-rendered `<form method="get">`
+  filters (marketplace, saved search, price range, sort) - no
+  JavaScript, consistent with keeping the dashboard lightweight. Degrades
+  gracefully on a hand-edited/invalid query string (falls back to
+  unfiltered/default rather than a 422 error page, since this is a
+  browsable page, not an API). Image fallback via `onerror`, external
+  links open in a new tab (`target="_blank" rel="noopener noreferrer"`).
+- Fixed a real cosmetic bug (previously deferred): the dashboard's
+  create-search checkboxes and saved-search table used
+  `{{ marketplace.title() }}`, which gives "Ebay" for eBay - now uses the
+  shared `display_name_for()` (same source `GET /api/v1/marketplaces`
+  already used) via a new `marketplace_display_names` template context
+  var. `main.py`'s `marketplaces_display` field fixed the same way.
+
+### Added - Mobile
+- `ListingCard` redesigned: image (with a graceful placeholder when
+  absent, and a broken-image fallback via `onError`), brand-cased
+  marketplace badge, price (new format - see below), condition +
+  location on one line, seller, a relative-time meta line, and a
+  distinct "New" badge for a listing discovered within the last 30
+  minutes (separate from the meta line's own "Just now"/"X min ago" text
+  - showing "New" in both places for the same listing read as a bug, not
+  emphasis, during testing - fixed before it shipped).
+- `ListingFilterModal` (new) - marketplace multi-select, a saved-search
+  selector, min/max price, condition, and sort, in one full-screen modal
+  (this app's first use of `Modal` - no existing bottom-sheet/dedicated-
+  screen precedent to follow). A draft/applied split: editing filters
+  never refetches until "Apply filters" is pressed; "Clear all" resets
+  and applies immediately; closing without applying discards nothing -
+  the draft is still there next time the modal opens. An active-filter
+  count badge on the Listings screen's "Filters" button (sort is
+  deliberately excluded from that count - it reorders, it doesn't
+  narrow).
+- `ListingsScreen` rewritten around this: filters/sort persist for the
+  life of the screen, survive pull-to-refresh and the background
+  auto-refresh (both reuse the same applied-filters closure `loadPage`/
+  `refreshQuietly` already had), and survive a failed request (an error
+  never clears the current filter selection or the currently-shown
+  list). A client-side min>max price check before "Apply" surfaces a
+  plain alert instead of round-tripping to the API's own 422.
+- `SavedSearchDetailScreen` gained a "Listings found" count and a
+  "Latest listings" section (`GET /api/v1/listings?saved_search_id=`,
+  the new filter above) rendering the exact same `ListingCard` the
+  Listings screen uses - no duplicated card markup. Marketplace chips and
+  the per-marketplace run-result rows now use brand casing.
+- `HomeScreen`'s marketplace list and "Saved searches" card now use
+  brand casing, and gained a "Last scan activity" line - the most recent
+  `last_scanned_at` across every saved search, as relative time - a
+  quick "is the backend actually finding things" signal.
+- New shared utilities: `utils/marketplaces.ts`
+  (`displayNameForMarketplace()` - mirrors the backend's
+  `display_name_for()`, the one place a marketplace's brand casing is
+  defined in this app; every screen/component showing a marketplace name
+  now goes through it, replacing raw ids in `SavedSearchCard`,
+  `SavedSearchDetailScreen`, and `HomeScreen`) and `utils/linking.ts`
+  (`openListingUrl()` - validates the URL is genuinely `http(s)` before
+  ever calling `Linking.openURL`, checks `Linking.canOpenURL` first, and
+  reports any failure through a plain `Alert` instead of an unhandled
+  promise rejection - the user is never trapped in-app, an invalid/
+  missing URL simply does nothing rather than crashing).
+- `utils/format.ts`: `formatPrice()` rewritten to prefix the ISO currency
+  *code* (never a locale symbol like "$", since this app never converts
+  currencies) and only show cents when the price genuinely has them -
+  "USD 1,250", not "$1,250.00" or "USD 1,250.00" - mirrored exactly in
+  the web dashboard's new `_format_price()` (`main.py`) for consistency
+  across platforms. New `formatRelativeTime()`/`isRecentlyDiscovered()` -
+  one consistent relative-time strategy ("Just now" -> "X min ago" ->
+  "X hr ago" -> "Yesterday" (by calendar day, only once 24h+ has passed)
+  -> a locale date for anything older), timezone-safe by construction
+  (every timestamp `Date`-parses as an absolute instant; only the final
+  "older" tier renders in the device's local timezone, which is correct
+  there).
+- `api/client.ts`'s `apiRequest` gained repeated-query-param support
+  (`marketplaces: ['ebay', 'etsy']` -> `?marketplaces=ebay&marketplaces=etsy`),
+  matching FastAPI's own `list[str]` query param convention - needed for
+  the new marketplace multi-select filter.
+
+### Tests
+- Backend: 547/547 passing (up from 526) - new coverage for every
+  listings filter/sort/validation combination, the new migration
+  (columns/index/FK/`ondelete` behavior), `save_new`'s new field
+  persistence (including that `touch_last_seen` deliberately never
+  refreshes them), the saved-search-attribution flow end to end, the
+  dashboard listings page (rendering, filtering, graceful degradation on
+  bad input, XSS escaping, no credential leakage), and the marketplace
+  display-name regression (both the checkbox list and the saved-search
+  table).
+- Mobile: 150/150 passing (up from 63) - `formatPrice`'s new format
+  (whole-number/fractional/large/lowercase-currency/unrecognized-currency
+  cases), `formatRelativeTime`/`isRecentlyDiscovered` (every tier, clock
+  skew, invalid timestamps), `displayNameForMarketplace`, `openListingUrl`
+  (valid/missing/malformed URL, device-can't-open, `Linking` itself
+  rejecting - never throws), `ListingCard` (every field present/absent
+  combination, the "New" badge boundary, never crashing with everything
+  null), `ListingFilterModal` (every control, `activeFilterCount`'s
+  rules), `ListingsScreen` (load/error/empty states, applying/clearing
+  filters and sort with the right request params, the active-filter
+  badge, pull-to-refresh and a failed background auto-refresh both
+  preserving the current filters and the currently-shown list), and new
+  test files for `SavedSearchDetailScreen` and `HomeScreen` (neither had
+  any test coverage before this pass). `tsc --noEmit` clean; `npx expo
+  install --check` reports dependencies up to date.
+
+### Not changed
+- No new marketplace connector, no scheduler/relevance-engine/
+  notification change, no new database index beyond what's described
+  above (a price index was considered and deliberately not added - the
+  production table is still small enough that it isn't justified by any
+  observed query pattern; revisit if that changes), no destructive
+  production action, no secrets committed.
+
 ## 2026-08-22 — Automatic PostgreSQL migrations for Render Free
 
 **Discovered while following up on the previous hardening pass's one

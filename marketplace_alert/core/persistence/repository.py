@@ -6,12 +6,15 @@ details. Everything above it - the service layer, routes - works with
 """
 
 from datetime import datetime, timezone
+from typing import Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 
 from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.persistence.models import DiscoveredListing
+
+ListingSort = Literal["newest", "oldest", "price_asc", "price_desc"]
 
 
 class ListingRepository:
@@ -28,14 +31,33 @@ class ListingRepository:
         )
         return self._session.execute(stmt).scalar_one_or_none()
 
-    def save_new(self, listing: Listing) -> DiscoveredListing:
-        """Persist a listing seen for the first time."""
+    def save_new(self, listing: Listing, *, saved_search_id: int | None = None) -> DiscoveredListing:
+        """Persist a listing seen for the first time.
+
+        Every product-display field a connector filled in on `listing`
+        (price/currency/location/seller/condition/image_url/created_at)
+        is captured now, once - see `DiscoveredListing`'s docstring for
+        why `touch_last_seen` deliberately never refreshes these later.
+        `saved_search_id` records which saved search's scan first found
+        this row (`None` for the legacy `/scan` endpoint, which isn't
+        tied to any saved search) - see `DiscoveredListing
+        .discovered_by_saved_search_id`'s docstring for exactly what this
+        does and doesn't mean.
+        """
         now = datetime.now(timezone.utc)
         row = DiscoveredListing(
             marketplace=listing.marketplace,
             external_listing_id=listing.external_listing_id,
             title=listing.title,
             listing_url=str(listing.listing_url),
+            price=listing.price,
+            currency=listing.currency,
+            location=listing.location,
+            seller=listing.seller,
+            condition=listing.condition,
+            image_url=str(listing.image_url) if listing.image_url is not None else None,
+            source_created_at=listing.created_at,
+            discovered_by_saved_search_id=saved_search_id,
             first_discovered_at=now,
             last_seen_at=now,
         )
@@ -49,29 +71,167 @@ class ListingRepository:
         self._session.add(row)
 
     def list_recent(
-        self, *, limit: int, offset: int, marketplace: str | None = None
+        self,
+        *,
+        limit: int,
+        offset: int,
+        marketplace: str | None = None,
+        marketplaces: list[str] | None = None,
+        saved_search_id: int | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+        currency: str | None = None,
+        condition: str | None = None,
+        location: str | None = None,
+        discovered_after: datetime | None = None,
+        discovered_before: datetime | None = None,
+        new_since: datetime | None = None,
+        sort: ListingSort = "newest",
     ) -> list[DiscoveredListing]:
-        """Discovered listings, newest-first (by first_discovered_at, then
-        id as a stable tiebreaker for rows with an identical timestamp).
+        """Discovered listings matching every given filter, in `sort` order.
 
         Backs `GET /api/v1/listings` - see that route's docstring for the
-        query parameters intentionally NOT offered here (`saved_search_id`,
-        `only_new`) and why.
+        exact meaning of each filter/sort mode, and for what's
+        intentionally NOT offered (`only_new`) and why.
         """
-        stmt = select(DiscoveredListing).order_by(
-            DiscoveredListing.first_discovered_at.desc(), DiscoveredListing.id.desc()
+        stmt = self._apply_filters(
+            select(DiscoveredListing),
+            marketplace=marketplace,
+            marketplaces=marketplaces,
+            saved_search_id=saved_search_id,
+            min_price=min_price,
+            max_price=max_price,
+            currency=currency,
+            condition=condition,
+            location=location,
+            discovered_after=discovered_after,
+            discovered_before=discovered_before,
+            new_since=new_since,
         )
-        if marketplace is not None:
-            stmt = stmt.where(DiscoveredListing.marketplace == marketplace)
-        stmt = stmt.limit(limit).offset(offset)
+        stmt = stmt.order_by(*self._sort_clause(sort)).limit(limit).offset(offset)
         return list(self._session.execute(stmt).scalars().all())
 
-    def count(self, *, marketplace: str | None = None) -> int:
-        """Total matching rows, ignoring limit/offset - for pagination metadata."""
-        stmt = select(func.count()).select_from(DiscoveredListing)
+    def count(
+        self,
+        *,
+        marketplace: str | None = None,
+        marketplaces: list[str] | None = None,
+        saved_search_id: int | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+        currency: str | None = None,
+        condition: str | None = None,
+        location: str | None = None,
+        discovered_after: datetime | None = None,
+        discovered_before: datetime | None = None,
+        new_since: datetime | None = None,
+    ) -> int:
+        """Total rows matching the same filters `list_recent` would apply,
+        ignoring limit/offset/sort - for pagination metadata that reflects
+        the filtered set, not the whole table."""
+        stmt = self._apply_filters(
+            select(func.count()).select_from(DiscoveredListing),
+            marketplace=marketplace,
+            marketplaces=marketplaces,
+            saved_search_id=saved_search_id,
+            min_price=min_price,
+            max_price=max_price,
+            currency=currency,
+            condition=condition,
+            location=location,
+            discovered_after=discovered_after,
+            discovered_before=discovered_before,
+            new_since=new_since,
+        )
+        return self._session.execute(stmt).scalar_one()
+
+    def _apply_filters(
+        self,
+        stmt: Select,
+        *,
+        marketplace: str | None,
+        marketplaces: list[str] | None,
+        saved_search_id: int | None,
+        min_price: float | None,
+        max_price: float | None,
+        currency: str | None,
+        condition: str | None,
+        location: str | None,
+        discovered_after: datetime | None,
+        discovered_before: datetime | None,
+        new_since: datetime | None,
+    ) -> Select:
+        """The one place every `GET /api/v1/listings` filter becomes a
+        SQL predicate - shared by `list_recent` and `count` so pagination
+        metadata can never drift out of sync with what a page actually
+        contains.
+
+        `marketplace` (singular, exact match) and `marketplaces` (plural,
+        "is one of") are two independent, both-optional filters on the
+        same column - additive, backward-compatible: existing callers
+        using `marketplace` alone are completely unaffected by
+        `marketplaces` existing. A caller supplying both gets their
+        intersection (AND, not a real scenario any current caller uses).
+
+        `discovered_after` and `new_since` are two independent `>=`
+        predicates on the same column, applied as separate `WHERE`
+        clauses (SQL ANDs them together) rather than combined in Python -
+        deliberately, so there's no naive-vs-timezone-aware datetime
+        comparison to get wrong if a caller somehow supplies both.
+        """
         if marketplace is not None:
             stmt = stmt.where(DiscoveredListing.marketplace == marketplace)
-        return self._session.execute(stmt).scalar_one()
+        if marketplaces:
+            stmt = stmt.where(DiscoveredListing.marketplace.in_(marketplaces))
+        if saved_search_id is not None:
+            stmt = stmt.where(DiscoveredListing.discovered_by_saved_search_id == saved_search_id)
+        if min_price is not None:
+            stmt = stmt.where(DiscoveredListing.price >= min_price)
+        if max_price is not None:
+            stmt = stmt.where(DiscoveredListing.price <= max_price)
+        if currency is not None:
+            stmt = stmt.where(func.upper(DiscoveredListing.currency) == currency.upper())
+        if condition is not None:
+            stmt = stmt.where(func.lower(DiscoveredListing.condition) == condition.lower())
+        if location is not None:
+            stmt = stmt.where(DiscoveredListing.location.ilike(f"%{location}%"))
+        if discovered_after is not None:
+            stmt = stmt.where(DiscoveredListing.first_discovered_at >= discovered_after)
+        if discovered_before is not None:
+            stmt = stmt.where(DiscoveredListing.first_discovered_at <= discovered_before)
+        if new_since is not None:
+            stmt = stmt.where(DiscoveredListing.first_discovered_at >= new_since)
+        return stmt
+
+    @staticmethod
+    def _sort_clause(sort: ListingSort) -> tuple:
+        """`id DESC`/`id ASC` is always the tiebreaker, for a stable order
+        between rows that share an identical timestamp (or, for the price
+        sorts, an identical price - including two NULLs).
+
+        Price sorts put `NULL` prices last regardless of direction - a
+        listing with an unknown price is neither the cheapest nor the
+        most expensive result, so surfacing it at the *top* of either
+        sort would be actively misleading; showing it last in both is the
+        least surprising choice. Within each price tier, newest-first
+        breaks ties instead of `id`, so "same price" still feels
+        sensibly ordered rather than by an arbitrary internal id.
+        """
+        if sort == "oldest":
+            return (DiscoveredListing.first_discovered_at.asc(), DiscoveredListing.id.asc())
+        if sort == "price_asc":
+            return (
+                DiscoveredListing.price.asc().nulls_last(),
+                DiscoveredListing.first_discovered_at.desc(),
+                DiscoveredListing.id.desc(),
+            )
+        if sort == "price_desc":
+            return (
+                DiscoveredListing.price.desc().nulls_last(),
+                DiscoveredListing.first_discovered_at.desc(),
+                DiscoveredListing.id.desc(),
+            )
+        return (DiscoveredListing.first_discovered_at.desc(), DiscoveredListing.id.desc())  # "newest" (default)
 
     def list_all(self) -> list[DiscoveredListing]:
         """Every discovered listing, unpaginated - for maintenance operations

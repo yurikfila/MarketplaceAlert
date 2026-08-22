@@ -65,11 +65,16 @@ export interface SavedSearchRunResult {
 }
 
 /**
- * One row from GET /api/v1/listings. `price`/`currency`/`location`/
- * `condition`/`image_url` are currently always `null` - the backend does
- * not persist them yet (see mobile/README.md "Current limitations" and
- * the backend's own ARCHITECTURE.md "Mobile API"). Never invent values
- * for these in the UI - render them only when actually present.
+ * One row from GET /api/v1/listings. Every field below reflects whatever
+ * the connector that discovered it actually returned - genuinely `null`
+ * when a marketplace/connector didn't provide it for that listing (never
+ * invented). `saved_search_id` is the saved search whose scan *first*
+ * discovered this row - `null` for a listing discovered before that
+ * attribution existed, or found through a path not tied to any single
+ * saved search - and is a "first discovered by" attribution, not an
+ * exclusive-ownership relationship (the same listing may also match
+ * other saved searches independently). See mobile/README.md and the
+ * backend's ARCHITECTURE.md "Mobile API" for the full explanation.
  */
 export interface Listing {
   id: number;
@@ -79,11 +84,15 @@ export interface Listing {
   price: number | null;
   currency: string | null;
   location: string | null;
+  seller: string | null;
   condition: string | null;
   listing_url: string;
   image_url: string | null;
+  /** The marketplace's own listing-creation time, if known - display only, never used for "new"/sort/filter semantics (see ListingsScreen). */
+  source_created_at: string | null;
   first_discovered_at: string;
   last_seen_at: string;
+  saved_search_id: number | null;
 }
 
 export interface ListingListResponse {
@@ -93,8 +102,23 @@ export interface ListingListResponse {
   total_count: number;
 }
 
+/** Mirrors the backend's `ListingSort` (core/persistence/repository.py). */
+export type ListingSort = 'newest' | 'oldest' | 'price_asc' | 'price_desc';
+
 export interface ListListingsParams {
   limit?: number;
   offset?: number;
   marketplace?: string;
+  /** Zero or more marketplace ids - sent as a repeated query param (see api/client.ts:buildUrl). An empty array is the same as omitting it (no restriction). */
+  marketplaces?: string[];
+  saved_search_id?: number;
+  min_price?: number;
+  max_price?: number;
+  currency?: string;
+  condition?: string;
+  location?: string;
+  discovered_after?: string;
+  discovered_before?: string;
+  new_since?: string;
+  sort?: ListingSort;
 }

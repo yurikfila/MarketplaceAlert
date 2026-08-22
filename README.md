@@ -55,13 +55,11 @@ Then visit:
 
 ## Mobile API
 
-**Base path: `/api/v1`** — a versioned, JSON-only REST API for a future
-Android/iOS app, added alongside (not replacing) the existing dashboard
-and legacy routes. It depends on no HTML/dashboard behavior and never
-exposes secrets. See `PROJECT_CONTEXT.md`/`ARCHITECTURE.md` "Mobile API"
-for the full design (including the known limitations of `GET
-/api/v1/listings` - several fields are not persisted yet, and there's no
-`saved_search_id` relationship to filter on).
+**Base path: `/api/v1`** — a versioned, JSON-only REST API backing the
+React Native/Expo mobile app (`mobile/`, see `mobile/README.md`), added
+alongside (not replacing) the existing dashboard and legacy routes. It
+depends on no HTML/dashboard behavior and never exposes secrets. See
+`PROJECT_CONTEXT.md`/`ARCHITECTURE.md` "Mobile API" for the full design.
 
 | Method | Path | What |
 |---|---|---|
@@ -73,10 +71,39 @@ for the full design (including the known limitations of `GET
 | PATCH | `/api/v1/saved-searches/{id}` | Update a saved search |
 | DELETE | `/api/v1/saved-searches/{id}` | Delete a saved search |
 | POST | `/api/v1/saved-searches/{id}/run` | Run a saved search now |
-| GET | `/api/v1/listings` | Browse recently discovered listings (paginated) |
+| GET | `/api/v1/listings` | Browse, filter, and sort recently discovered listings (paginated) |
 
-No mobile app (React Native, Expo, Flutter, native Android/iOS) or
-authentication is built yet - this is API-side groundwork only.
+No authentication is built yet - every endpoint above is exactly as open
+as the legacy routes.
+
+### `GET /api/v1/listings` filters and sort
+
+All query parameters are optional and combine with AND. See
+`marketplace_alert/api/v1/listings.py`'s module docstring for the
+complete reference (including the one-consistent-timestamp-strategy rule
+and the one filter deliberately not offered).
+
+| Param | Meaning |
+|---|---|
+| `marketplace` | One marketplace id, e.g. `etsy` |
+| `marketplaces` | Several marketplace ids (repeat the param): `?marketplaces=ebay&marketplaces=etsy` |
+| `saved_search_id` | Listings first discovered by this saved search's scan (a "first discovered by" attribution, not exclusive ownership - see `ARCHITECTURE.md`) |
+| `min_price` / `max_price` | Inclusive price bounds - a listing with no known price never matches either |
+| `currency` | Exact match, case-insensitive |
+| `condition` | Exact match, case-insensitive |
+| `location` | Case-insensitive substring match |
+| `discovered_after` / `discovered_before` | Inclusive bounds on when *we* found it |
+| `new_since` | Alias for `discovered_after`, for "what's new since I last checked" |
+| `sort` | `newest` (default) \| `oldest` \| `price_asc` \| `price_desc` - a listing with no price always sorts last in either price mode |
+| `limit` / `offset` | Pagination - `limit` capped at 100 |
+
+```bash
+# Cheapest first, eBay or Etsy, $20-$150
+curl "http://127.0.0.1:8000/api/v1/listings?marketplaces=ebay&marketplaces=etsy&min_price=20&max_price=150&sort=price_asc"
+
+# Everything a specific saved search has found, newest first
+curl "http://127.0.0.1:8000/api/v1/listings?saved_search_id=1&sort=newest"
+```
 
 ## Database
 

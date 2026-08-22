@@ -148,14 +148,17 @@ Multi-user support: accounts, auth, and searches scoped to a user.
 
 ## Phase 7 — Web interface
 A UI for creating/managing searches and viewing results, on top of the
-existing API. **Partially done, ahead of schedule:** a local, unauthenticated
+existing API. **Done, ahead of schedule:** a local, unauthenticated
 `GET /` dashboard (`marketplace_alert/templates/dashboard.html` +
 `marketplace_alert/static/`) covers creating/listing/running/enabling-
 disabling/deleting saved searches, reusing the existing `/saved-searches*`
-endpoints for every action (no duplicated logic). Still open, and still
-this phase's job: a view of the *discovered listings* themselves (not just
-saved-search definitions), and authentication before this could ever be
-exposed beyond localhost (see Phase 6).
+endpoints for every action (no duplicated logic). `GET /listings`
+(added 2026-08-22, the Listings product-experience pass) covers the rest
+of this phase's stated scope - viewing the *discovered listings*
+themselves, with filtering (marketplace, saved search, price range) and
+sorting - server-rendered, no JavaScript needed, reusing the exact same
+`ListingRepository` `GET /api/v1/listings` uses. Still open: authentication
+before this could ever be exposed beyond localhost (see Phase 6).
 
 ## Phase 8 — Cloud deployment
 Move off local-only development; real hosting, real database, secrets
@@ -181,19 +184,25 @@ Phase 8. Superseded the original plan of a manual Pre-Deploy Command
 step, since Render's Free plan doesn't offer one.
 
 ## Phase 9 — Android/iOS application
-Mobile clients on top of the existing API. **Not started - API groundwork
-only, ahead of schedule:** a versioned, JSON-only Mobile API now exists
-under `/api/v1` (status, marketplace metadata, saved-search CRUD + manual
-run, paginated discovered-listings browsing), added alongside every
-existing route with zero duplicated business logic - see `ARCHITECTURE.md`
-"Mobile API". CORS is prepared (off by default) and the endpoint structure
-is ready for auth to be added later, but **no mobile app was built** (no
-React Native/Expo/Flutter/native project), **no authentication exists
-yet**, and two real persistence gaps were surfaced rather than worked
-around: `DiscoveredListing` doesn't yet store
-price/currency/location/condition/image_url, and has no relationship to
-`SavedSearch` to filter listings by. This phase's actual goal - real
-Android/iOS clients - has not begun.
+Mobile clients on top of the existing API. **Done, ahead of schedule:** a
+real React Native/Expo/TypeScript app (`mobile/`, see `mobile/README.md`)
+runs on Android and iOS via Expo Go, backed entirely by the versioned
+`/api/v1` Mobile API - status, marketplace metadata (registry-driven, so
+Reverb/Bonanza appear automatically), saved-search CRUD + manual run,
+and a Listings screen with real filtering/sorting/pagination
+(marketplace multi-select, saved-search selector, price range, sort -
+added 2026-08-22, the Listings product-experience pass). Home, Saved
+Searches, Create Search, Saved Search Detail, and Listings screens all
+exist, with automatic background refresh (interval polling + app-resume
++ screen-focus, see `mobile/README.md` "Automatic refresh"), graceful
+loading/empty/error states everywhere, and safe external-link opening
+(`utils/linking.ts` - never traps the user in-app). CORS is prepared
+(off by default) and the endpoint structure is ready for auth to be
+added later, but **no authentication exists yet** - every `/api/v1`
+endpoint is exactly as open as the legacy routes, and this app has no
+login/per-user data. No App Store/Play Store release yet either - this
+is a first version run through Expo Go/a dev build, not a store
+submission.
 
 ## Phase 10 — Subscriptions/payments
 Paid tiers, billing.

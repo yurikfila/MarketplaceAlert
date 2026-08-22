@@ -13,8 +13,18 @@ import { useAsyncData } from '../hooks/useAsyncData';
 import { useAutoRefresh } from '../hooks/useAutoRefresh';
 import type { RootStackParamList } from '../navigation/types';
 import { colors, fontSize, radius, spacing } from '../theme/colors';
+import { formatRelativeTime } from '../utils/format';
+import { displayNameForMarketplace } from '../utils/marketplaces';
 
 const RECENT_LISTINGS_LIMIT = 5;
+
+/** The most recent `last_scanned_at` across every saved search, or null if none has ever run - a quick "is the backend actually finding things" signal, distinct from the per-search timestamps shown on SavedSearchDetailScreen. */
+function mostRecentScanTime(savedSearches: { last_scanned_at: string | null }[] | null): string | null {
+  if (!savedSearches) return null;
+  const timestamps = savedSearches.map((s) => s.last_scanned_at).filter((t): t is string => t !== null);
+  if (timestamps.length === 0) return null;
+  return timestamps.reduce((latest, current) => (current > latest ? current : latest));
+}
 
 export function HomeScreen() {
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
@@ -42,6 +52,7 @@ export function HomeScreen() {
   useAutoRefresh(refreshAllQuietly);
 
   const activeCount = savedSearches.data?.filter((s) => s.is_active).length ?? null;
+  const lastScanTime = mostRecentScanTime(savedSearches.data);
   const anyRefreshing = status.refreshing || savedSearches.refreshing || recentListings.refreshing;
 
   return (
@@ -66,7 +77,8 @@ export function HomeScreen() {
                 {status.data?.telegram_configured ? 'configured' : 'not configured'}
               </Text>
               <Text style={styles.metaText}>
-                Marketplaces: {status.data?.supported_marketplaces.join(', ') ?? '—'}
+                Marketplaces:{' '}
+                {status.data?.supported_marketplaces.map(displayNameForMarketplace).join(', ') ?? '—'}
               </Text>
             </>
           )}
@@ -79,7 +91,12 @@ export function HomeScreen() {
           ) : savedSearches.error ? (
             <ErrorState message={savedSearches.error} onRetry={savedSearches.retry} />
           ) : (
-            <Text style={styles.bigNumber}>{activeCount} active</Text>
+            <>
+              <Text style={styles.bigNumber}>{activeCount} active</Text>
+              <Text style={styles.metaText}>
+                Last scan activity: {lastScanTime ? formatRelativeTime(lastScanTime) : 'None yet'}
+              </Text>
+            </>
           )}
           <PrimaryButton label="Create a saved search" onPress={() => navigation.navigate('CreateSearch')} />
         </View>

@@ -71,6 +71,51 @@ def test_upgrade_head_creates_the_first_discovered_at_index(tmp_path, monkeypatc
     assert "ix_discovered_listings_first_discovered_at" in index_names
 
 
+def test_upgrade_head_adds_listing_product_fields_and_saved_search_attribution(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Part of the Listings product-experience pass: `discovered_listings`
+    gained price/currency/location/seller/condition/image_url/
+    source_created_at (all nullable) plus a nullable, indexed
+    `discovered_by_saved_search_id` foreign key to `saved_searches.id`
+    (`ON DELETE SET NULL`). Confirms every one of these is actually
+    applied on a fresh database, not just present in the model - and that
+    the foreign key's `ondelete` behavior is really `SET NULL`, not the
+    database default (which would be more destructive)."""
+    db_path = tmp_path / "alembic_listing_fields_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        columns = {col["name"] for col in inspector.get_columns("discovered_listings")}
+        for column_name in (
+            "price",
+            "currency",
+            "location",
+            "seller",
+            "condition",
+            "image_url",
+            "source_created_at",
+            "discovered_by_saved_search_id",
+        ):
+            assert column_name in columns
+
+        index_names = {idx["name"] for idx in inspector.get_indexes("discovered_listings")}
+        assert "ix_discovered_listings_discovered_by_saved_search_id" in index_names
+
+        foreign_keys = inspector.get_foreign_keys("discovered_listings")
+        assert len(foreign_keys) == 1
+        fk = foreign_keys[0]
+        assert fk["referred_table"] == "saved_searches"
+        assert fk["constrained_columns"] == ["discovered_by_saved_search_id"]
+        assert fk["options"].get("ondelete") == "SET NULL"
+    finally:
+        engine.dispose()
+
+
 def test_upgrade_head_matches_base_metadata_tables(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The baseline migration must create exactly the tables the current
     SQLAlchemy models define - no more, no less (aside from Alembic's own

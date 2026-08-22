@@ -10,6 +10,10 @@
     <header class="topbar">
         <h1>{{ app_name }}</h1>
         <p class="subtitle">Local management dashboard</p>
+        <nav class="top-nav">
+            <a href="/" class="top-nav-active">Saved searches</a>
+            <a href="/listings">Listings</a>
+        </nav>
     </header>
 
     <main>
@@ -35,7 +39,7 @@
                         {% for marketplace in marketplaces %}
                         <label class="checkbox-option">
                             <input type="checkbox" name="marketplaces" value="{{ marketplace }}" checked>
-                            {{ marketplace.title() }}
+                            {{ marketplace_display_names[marketplace] }}
                         </label>
                         {% endfor %}
                     </div>

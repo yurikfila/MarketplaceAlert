@@ -700,19 +700,34 @@ routes (main.py)
   needed no changes for PostgreSQL).
 - **`models.py`** defines `DiscoveredListing`, the SQLAlchemy table:
   `id`, `marketplace`, `external_listing_id`, `title`, `listing_url`,
-  `first_discovered_at`, `last_seen_at`. A unique constraint on
-  `(marketplace, external_listing_id)` is the actual dedup guarantee — it
-  holds even if application code has a bug, not just because the service
-  layer happens to check first.
+  `first_discovered_at`, `last_seen_at`, plus - added in the Listings
+  product-experience pass (2026-08-22) - `price`/`currency`/`location`/
+  `seller`/`condition`/`image_url`/`source_created_at` (all nullable,
+  captured once at first discovery only - see that pass's entry in
+  CHANGELOG.md/PROJECT_CONTEXT.md decision #21 for why `touch_last_seen`
+  deliberately never refreshes them) and `discovered_by_saved_search_id`
+  (nullable FK to `saved_searches.id`, `ON DELETE SET NULL`, indexed - an
+  honest "first discovered by" attribution, not exclusive ownership). A
+  unique constraint on `(marketplace, external_listing_id)` is the actual
+  dedup guarantee — it holds even if application code has a bug, not just
+  because the service layer happens to check first.
 - **`repository.py`** (`ListingRepository`) is the only place that writes
-  SQL/ORM queries. It exposes `get`, `save_new`, `touch_last_seen` — nothing
-  above it touches a `Session` or the ORM model directly.
+  SQL/ORM queries. It exposes `get`, `save_new`, `touch_last_seen`,
+  `list_recent`/`count` (paginated, filtered, sorted - see "Mobile API"
+  below for the full filter/sort reference) — nothing above it touches a
+  `Session` or the ORM model directly. `save_new` and `process_listings`
+  (below) both take an optional `saved_search_id`, recorded only on a
+  genuinely new row.
 - **`service.py`** (`ListingDiscoveryService`) is what routes call. Its
-  `process_listings(listings: list[Listing])` classifies each listing as
-  new (persists it) or already-seen (bumps `last_seen_at`), and returns a
-  `ListingDiscoveryResult(new_listings, already_seen_count)`. It works with
-  `Listing` objects from **any** connector — it has never imported
-  `MockMarketplaceConnector` or any real connector, and must not.
+  `process_listings(listings: list[Listing], *, saved_search_id=None)`
+  classifies each listing as new (persists it, with every connector-
+  provided field and the given attribution) or already-seen (bumps
+  `last_seen_at` only), and returns a `ListingDiscoveryResult(new_listings,
+  already_seen_count)`. It works with `Listing` objects from **any**
+  connector — it has never imported `MockMarketplaceConnector` or any real
+  connector, and must not. `SavedSearchRunner` passes its own saved
+  search's id; the legacy `/scan` endpoint passes none (it isn't tied to
+  any saved search).
 
 `marketplace_alert/main.py` exposes this through a **temporary**
 `GET /scan?q=...` endpoint: it runs the mock connector's `search()`, feeds
@@ -1515,6 +1530,51 @@ Browser (dashboard.js, vanilla JS, no framework)
   dashboard inherits that safety for free rather than needing its own
   error-sanitizing logic.
 
+### `GET /listings` - viewing discovered listings from a browser
+
+Added in the Listings product-experience pass (2026-08-22) - the rest of
+Phase 7's stated dashboard scope ("...and viewing results"), alongside
+`GET /`'s existing saved-search *administration*.
+
+```
+GET /listings  (main.py: listings_page())
+    -> ListingRepository.list_recent()/count()   (the exact same repository GET /api/v1/listings uses)
+    -> SavedSearchService.list_all()              (for the saved-search filter dropdown)
+    -> templates/listings.html (Jinja2, autoescaped)
+```
+
+- **No JavaScript at all - a plain `<form method="get">`.** Filters
+  (marketplace, saved search, price range, sort) submit as query-string
+  params and reload the page; pagination is "Newer"/"Older" links built
+  server-side via Starlette's `request.url.include_query_params()`. This
+  is even simpler than the existing create-search form (which needs
+  `dashboard.js` for its "select all" checkbox and `fetch()`-based
+  actions) - a pure read/filter page has no state to keep in sync with
+  the server, so there was nothing for client-side JS to usefully do.
+- **Degrades gracefully on a hand-edited/invalid query string, unlike
+  the JSON API.** `GET /api/v1/listings` correctly 422s an unknown
+  marketplace or `min_price > max_price` - the right behavior for an API
+  contract. This page is browsable, not an API a program calls, so an
+  invalid filter value (or a stale bookmark from before a marketplace
+  was removed) silently falls back to the unfiltered/default value
+  instead of showing an error page - `listings_page()` clamps/discards
+  invalid filter values itself, before ever calling the repository,
+  rather than reusing the API route's raise-on-invalid behavior.
+- **Price formatting is mirrored, not shared, with the mobile app.**
+  `main.py`'s `_format_price()` implements the exact same rule
+  `mobile/src/utils/format.ts:formatPrice()` does (ISO currency-code
+  prefix, cents only when the price genuinely has them - "USD 1,250",
+  never "$1,250.00") - necessarily a second implementation, since Python
+  and TypeScript can't share one function, but the same rule stated in
+  both places so the two never visibly disagree.
+- **Image fallback, safe external links, same rules as the mobile app.**
+  A missing `image_url` shows a plain placeholder box (CSS only); a
+  broken one falls back to the same via the `<img>` tag's `onerror`.
+  Every listing card links to the original listing with `target="_blank"
+  rel="noopener noreferrer"` - opens in a new tab, never inside an
+  `<iframe>`-like embedded context, and `rel="noopener noreferrer"`
+  prevents the opened page from getting a handle back to this one.
+
 ## Mobile API
 
 `/api/v1` (`marketplace_alert/api/v1/`) is a versioned, JSON-only REST API
@@ -1582,34 +1642,67 @@ GET  /api/v1/listings          -> ListingRepository.list_recent/count(...)
   contract here is `health_check()`, not `is_configured`, so a future
   connector could make `available` a real liveness probe without changing
   this endpoint.
-- **`GET /api/v1/listings` documents two real gaps instead of faking
-  data or a relationship that isn't stored** - required explicitly by
-  this feature's own brief, not just good practice:
-  - `price`/`currency`/`location`/`condition`/`image_url` are always
-    `null`. `DiscoveredListing` (`core/persistence/models.py`) has never
-    stored them - only `marketplace`, `external_listing_id`, `title`,
-    `listing_url`, and the two discovery timestamps, since Phase 3.
-    `api/v1/listings.py`'s `_to_listing_out()` maps `DiscoveredListing` ->
-    `ListingOut` *explicitly*, field by field, rather than via Pydantic's
-    `from_attributes` auto-mapping - deliberately, so the fact that five
-    fields don't exist on the source row is impossible to miss reading the
-    code, not hidden behind a generic mapper quietly defaulting them.
-  - **No `saved_search_id` filter.** `DiscoveredListing` has no
-    relationship to `SavedSearch` at all - its dedup identity
-    (`marketplace`, `external_listing_id`) is deliberately *global* across
-    every saved search that happens to match it (see "Local persistence
-    and duplicate detection" above), not scoped to whichever search first
-    discovered it. A `saved_search_id` filter would have to invent that
-    relationship.
-  - **No `only_new` filter.** "New" is a property of one specific scan run
-    (`ListingDiscoveryResult.new_listings`), never a column persisted on
-    the row itself - there is no reliable, stored "is this new" flag to
-    filter on.
+- **`GET /api/v1/listings` - full filtering and sorting, since the
+  Listings product-experience pass (2026-08-22).** `price`/`currency`/
+  `location`/`seller`/`condition`/`image_url`/`source_created_at` now
+  reflect whatever the discovering connector actually returned (see
+  "Local persistence and duplicate detection" above and
+  PROJECT_CONTEXT.md decision #21 for why this used to be impossible and
+  what changed) - `_to_listing_out()` still maps `DiscoveredListing` ->
+  `ListingOut` explicitly, field by field, never via Pydantic's
+  `from_attributes` auto-mapping, so every field's source column stays
+  visible in one place.
+  - **Filters** (`api/v1/listings.py`, all optional, ANDed together):
+    `marketplace` (one id) and `marketplaces` (plural, repeated query
+    param - `?marketplaces=ebay&marketplaces=etsy` - for a mobile-style
+    multi-select; additive alongside the singular filter, fully
+    backward compatible), `saved_search_id` (the saved search that
+    *first* discovered a row - see below), `min_price`/`max_price`,
+    `currency` (exact, case-insensitive), `condition` (exact,
+    case-insensitive), `location` (substring, case-insensitive),
+    `discovered_after`/`discovered_before`, and `new_since` (an alias
+    narrowing the same `first_discovered_at` column as
+    `discovered_after` - both apply as independent SQL `WHERE` clauses
+    if somehow both given, never combined in Python, so there's no
+    naive-vs-aware datetime comparison to get wrong).
+  - **`saved_search_id`, filled in going forward.** `DiscoveredListing`
+    still has no general relationship to `SavedSearch` - what changed is
+    a new nullable `discovered_by_saved_search_id` column, set once, at
+    insert time, to whichever saved search's scan first produced that
+    row (`SavedSearchRunner` -> `ListingDiscoveryService
+    .process_listings(..., saved_search_id=...)` ->
+    `ListingRepository.save_new(..., saved_search_id=...)`; the legacy
+    `/scan` endpoint, not tied to any saved search, passes none). This is
+    a "first discovered by" attribution, not exclusive ownership - the
+    same listing can independently match a different saved search later
+    without that being recorded. A `saved_search_id` filter value that
+    matches no rows returns an empty page, never a 404 - this endpoint
+    never validates that the id refers to an existing saved search, only
+    that it's structurally a positive integer.
+  - **No `only_new` filter**, still. "New" is a property of one specific
+    scan run (`ListingDiscoveryResult.new_listings`), never a column
+    persisted on the row itself - use `new_since`/`discovered_after`
+    with a client-tracked timestamp instead.
+  - **Sort** (`sort`, default `newest`): `newest`/`oldest`/`price_asc`/
+    `price_desc`. A `null` price sorts *last* in both price modes
+    (`ListingRepository._sort_clause()`'s `.nulls_last()`) - an unknown
+    price is neither the cheapest nor priciest result, so it would be
+    actively misleading at the top of either sort.
+  - **One consistent timestamp strategy**: every filter/sort above that
+    means "how recent" operates on `first_discovered_at` only - never
+    `source_created_at` (the marketplace's own listing-creation time,
+    display-only). A listing old on the marketplace but freshly
+    surfaced by a brand-new saved search still counts as newly
+    discovered.
+  - **Validation**: an unknown marketplace (singular or any value in the
+    plural list) is 422, so is `min_price > max_price`, `saved_search_id
+    <= 0`, an invalid `sort` value, and the existing `limit`/`offset`
+    bounds.
 - **Pagination is `limit`/`offset` with a hard cap (100), sorted
-  newest-first** (`first_discovered_at DESC`, `id DESC` as a stable
-  tiebreaker) - `ListingRepository.list_recent()`/`count()`
-  (`core/persistence/repository.py`), the only new persistence-layer code
-  this added; no new table, no new migration.
+  newest-first by default** - `ListingRepository.list_recent()`/
+  `count()` (`core/persistence/repository.py`) share one
+  `_apply_filters()` helper, so `total_count` can never drift out of
+  sync with what a page of filtered results actually contains.
 - **Errors stay in the existing `{"detail": "..."}` shape** (FastAPI's own
   `HTTPException`), the same one the legacy routes and the dashboard's
   error handling already depend on - a different mobile-specific error

@@ -52,6 +52,27 @@ describe('apiRequest', () => {
     expect(String(url)).not.toContain('marketplace=');
   });
 
+  it('repeats the query param once per array entry, matching FastAPI list[str] params', async () => {
+    const fetchMock = jest.fn().mockResolvedValue(jsonResponse(200, { items: [] }));
+    global.fetch = fetchMock;
+
+    await apiRequest('/listings', { query: { marketplaces: ['ebay', 'etsy'] } });
+
+    const [url] = fetchMock.mock.calls[0];
+    const params = new URL(String(url)).searchParams.getAll('marketplaces');
+    expect(params).toEqual(['ebay', 'etsy']);
+  });
+
+  it('sends no query param at all for an empty array', async () => {
+    const fetchMock = jest.fn().mockResolvedValue(jsonResponse(200, { items: [] }));
+    global.fetch = fetchMock;
+
+    await apiRequest('/listings', { query: { marketplaces: [] } });
+
+    const [url] = fetchMock.mock.calls[0];
+    expect(String(url)).not.toContain('marketplaces');
+  });
+
   it('sends a JSON body and Content-Type header on POST', async () => {
     const fetchMock = jest.fn().mockResolvedValue(jsonResponse(201, { id: 1 }));
     global.fetch = fetchMock;

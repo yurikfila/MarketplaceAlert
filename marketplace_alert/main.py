@@ -24,6 +24,7 @@ from marketplace_alert.connectors.mock.connector import MockMarketplaceConnector
 from marketplace_alert.connectors.registry import (
     display_name_for,
     get_connector,
+    is_marketplace_supported,
     list_supported_marketplaces,
 )
 from marketplace_alert.core.logging_config import configure_logging
@@ -31,6 +32,7 @@ from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.notifications.service import NotificationService
 from marketplace_alert.core.persistence.database import SessionLocal, engine, get_db_session, init_db
 from marketplace_alert.core.persistence.migrations import run_pending_migrations
+from marketplace_alert.core.persistence.repository import ListingRepository
 from marketplace_alert.core.persistence.service import ListingDiscoveryService
 from marketplace_alert.core.relevance import filter_relevant_listings
 from marketplace_alert.core.saved_searches.migration import migrate_legacy_marketplace_column
@@ -186,7 +188,7 @@ def dashboard(
             "id": s.id,
             "query": s.query,
             "marketplaces": s.marketplaces,
-            "marketplaces_display": ", ".join(m.title() for m in s.marketplaces),
+            "marketplaces_display": ", ".join(display_name_for(m) for m in s.marketplaces),
             "is_active": s.is_active,
             "scan_interval_display": _format_interval(s.scan_interval_seconds),
             "last_scanned_display": (
@@ -196,6 +198,12 @@ def dashboard(
         for s in saved_search_rows
     ]
     marketplaces = list_supported_marketplaces()
+    # Brand-cased display names for the create-search checkboxes
+    # (dashboard.html) - the template must never derive one itself (e.g.
+    # Python's `.title()` on "ebay" gives "Ebay", not "eBay") - the one
+    # shared `display_name_for()` is the single source of truth, same as
+    # `marketplace_status` below and `GET /api/v1/marketplaces`.
+    marketplace_display_names = {name: display_name_for(name) for name in marketplaces}
     # One entry per registered connector, driven entirely by the registry -
     # never hard-code a marketplace's name here (see
     # `api/v1/marketplaces.py`, which the mobile client uses the same way,
@@ -218,6 +226,7 @@ def dashboard(
         "app_name": settings.app_name,
         "saved_searches": saved_searches,
         "marketplaces": marketplaces,
+        "marketplace_display_names": marketplace_display_names,
         "scan_interval_options": SCAN_INTERVAL_OPTIONS,
         "min_scan_interval_seconds": MIN_SCAN_INTERVAL_SECONDS,
         "status": {
@@ -229,6 +238,113 @@ def dashboard(
         },
     }
     return templates.TemplateResponse(request, "dashboard.html", context)
+
+
+_LISTINGS_PAGE_SIZE = 24
+_VALID_LISTING_SORTS = {"newest", "oldest", "price_asc", "price_desc"}
+
+
+def _format_price(price: float | None, currency: str | None) -> str | None:
+    """Mirrors mobile's `src/utils/format.ts:formatPrice()` exactly (ISO
+    currency-code prefix, no invented `.00` unless the price genuinely has
+    cents, thousands-separated) - one consistent price format between the
+    dashboard and the mobile app, see ARCHITECTURE.md "Why these choices"."""
+    if price is None:
+        return None
+    has_fraction = price != int(price)
+    formatted_number = f"{price:,.2f}" if has_fraction else f"{int(price):,}"
+    return f"{currency.upper()} {formatted_number}" if currency else formatted_number
+
+
+@app.get("/listings", response_class=HTMLResponse)
+def listings_page(
+    request: Request,
+    marketplace: str | None = None,
+    saved_search_id: int | None = None,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    sort: str = "newest",
+    offset: int = 0,
+    session: Session = Depends(get_db_session),
+    service: SavedSearchService = Depends(get_saved_search_service),
+) -> HTMLResponse:
+    """Browse recently discovered listings from a browser - the rest of
+    Phase 7's stated dashboard scope ("...and viewing results"), on top of
+    the saved-search *administration* `GET /` already covers. Reads
+    through the exact same `ListingRepository` `GET /api/v1/listings`
+    uses - no second implementation of listing filtering/sorting. A plain
+    server-rendered `<form method="get">` (see `templates/listings.html`)
+    submits filters as query-string params and reloads the page - no
+    JavaScript needed, consistent with keeping this dashboard lightweight.
+    """
+    # A browser query string can be hand-edited to anything - degrade to
+    # sensible defaults instead of a 422 error page for a page meant to be
+    # browsed, not called as an API. Same reasoning for `offset`/prices
+    # below (clamped, never trusted as already-valid).
+    if marketplace is not None and not is_marketplace_supported(marketplace):
+        marketplace = None
+    if sort not in _VALID_LISTING_SORTS:
+        sort = "newest"
+    if min_price is not None and max_price is not None and min_price > max_price:
+        min_price, max_price = None, None
+    offset = max(offset, 0)
+
+    repository = ListingRepository(session)
+    filters = {
+        "marketplace": marketplace,
+        "saved_search_id": saved_search_id,
+        "min_price": min_price,
+        "max_price": max_price,
+    }
+    rows = repository.list_recent(limit=_LISTINGS_PAGE_SIZE, offset=offset, sort=sort, **filters)
+    total_count = repository.count(**filters)
+
+    listings = [
+        {
+            "marketplace": row.marketplace,
+            "marketplace_display": display_name_for(row.marketplace),
+            "title": row.title,
+            "price_display": _format_price(row.price, row.currency),
+            "condition": row.condition,
+            "location": row.location,
+            "image_url": row.image_url,
+            "listing_url": row.listing_url,
+            "discovered_display": row.first_discovered_at.strftime("%Y-%m-%d %H:%M UTC"),
+        }
+        for row in rows
+    ]
+
+    marketplaces = list_supported_marketplaces()
+    saved_search_options = [{"id": s.id, "query": s.query} for s in service.list_all()]
+
+    context = {
+        "app_name": settings.app_name,
+        "listings": listings,
+        "total_count": total_count,
+        "marketplaces": marketplaces,
+        "marketplace_display_names": {name: display_name_for(name) for name in marketplaces},
+        "saved_search_options": saved_search_options,
+        "sorts": [
+            ("newest", "Newest first"),
+            ("oldest", "Oldest first"),
+            ("price_asc", "Price: low to high"),
+            ("price_desc", "Price: high to low"),
+        ],
+        "filters": {
+            "marketplace": marketplace or "",
+            "saved_search_id": saved_search_id,
+            "min_price": min_price,
+            "max_price": max_price,
+            "sort": sort,
+        },
+        "pagination": {
+            "has_previous": offset > 0,
+            "has_next": offset + _LISTINGS_PAGE_SIZE < total_count,
+            "previous_url": str(request.url.include_query_params(offset=max(offset - _LISTINGS_PAGE_SIZE, 0))),
+            "next_url": str(request.url.include_query_params(offset=offset + _LISTINGS_PAGE_SIZE)),
+        },
+    }
+    return templates.TemplateResponse(request, "listings.html", context)
 
 
 @app.get("/health")

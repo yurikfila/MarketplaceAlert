@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ app_name }} — Listings</title>
+    <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+    <header class="topbar">
+        <h1>{{ app_name }}</h1>
+        <p class="subtitle">Recently discovered listings</p>
+        <nav class="top-nav">
+            <a href="/">Saved searches</a>
+            <a href="/listings" class="top-nav-active">Listings</a>
+        </nav>
+    </header>
+
+    <main>
+        <section class="card" id="listing-filters">
+            <h2>Filters</h2>
+            <form method="get" action="/listings" class="filter-form">
+                <div class="field-row">
+                    <div class="field">
+                        <label for="marketplace">Marketplace</label>
+                        <select id="marketplace" name="marketplace">
+                            <option value="">All marketplaces</option>
+                            {% for marketplace in marketplaces %}
+                            <option value="{{ marketplace }}" {% if filters.marketplace == marketplace %}selected{% endif %}>
+                                {{ marketplace_display_names[marketplace] }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <div class="field">
+                        <label for="saved_search_id">Saved search</label>
+                        <select id="saved_search_id" name="saved_search_id">
+                            <option value="">Any saved search</option>
+                            {% for option in saved_search_options %}
+                            <option value="{{ option.id }}" {% if filters.saved_search_id == option.id %}selected{% endif %}>
+                                {{ option.query }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <div class="field">
+                        <label for="sort">Sort</label>
+                        <select id="sort" name="sort">
+                            {% for value, label in sorts %}
+                            <option value="{{ value }}" {% if filters.sort == value %}selected{% endif %}>{{ label }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                </div>
+
+                <div class="field-row">
+                    <div class="field">
+                        <label for="min_price">Min price</label>
+                        <input type="number" id="min_price" name="min_price" min="0" step="0.01" value="{{ filters.min_price if filters.min_price is not none else '' }}">
+                    </div>
+                    <div class="field">
+                        <label for="max_price">Max price</label>
+                        <input type="number" id="max_price" name="max_price" min="0" step="0.01" value="{{ filters.max_price if filters.max_price is not none else '' }}">
+                    </div>
+                    <div class="field field-checkbox">
+                        <button type="submit" class="btn btn-primary">Apply filters</button>
+                    </div>
+                </div>
+            </form>
+            {% if filters.marketplace or filters.saved_search_id or filters.min_price is not none or filters.max_price is not none %}
+            <a href="/listings" class="clear-filters-link">Clear all filters</a>
+            {% endif %}
+        </section>
+
+        <section class="card" id="listings">
+            <h2>{{ total_count }} listing{{ 's' if total_count != 1 else '' }}</h2>
+            {% if listings %}
+            <div class="listing-grid">
+                {% for listing in listings %}
+                <a class="listing-card" href="{{ listing.listing_url }}" target="_blank" rel="noopener noreferrer">
+                    {% if listing.image_url %}
+                    <img class="listing-image" src="{{ listing.image_url }}" alt="" loading="lazy" onerror="this.style.display='none'">
+                    {% else %}
+                    <div class="listing-image listing-image-placeholder"></div>
+                    {% endif %}
+                    <div class="listing-body">
+                        <div class="listing-header-row">
+                            <span class="badge badge-neutral">{{ listing.marketplace_display }}</span>
+                            {% if listing.price_display %}
+                            <span class="listing-price">{{ listing.price_display }}</span>
+                            {% endif %}
+                        </div>
+                        <p class="listing-title">{{ listing.title }}</p>
+                        <p class="listing-meta">
+                            {% if listing.condition %}{{ listing.condition }}{% endif %}
+                            {% if listing.condition and listing.location %} · {% endif %}
+                            {% if listing.location %}{{ listing.location }}{% endif %}
+                        </p>
+                        <p class="listing-meta">Discovered {{ listing.discovered_display }}</p>
+                    </div>
+                </a>
+                {% endfor %}
+            </div>
+
+            <div class="pagination">
+                {% if pagination.has_previous %}
+                <a class="btn btn-small" href="{{ pagination.previous_url }}">&laquo; Newer</a>
+                {% endif %}
+                {% if pagination.has_next %}
+                <a class="btn btn-small" href="{{ pagination.next_url }}">Older &raquo;</a>
+                {% endif %}
+            </div>
+            {% else %}
+            <p class="empty">No listings match these filters yet.</p>
+            {% endif %}
+        </section>
+    </main>
+</body>
+</html>

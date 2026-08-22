@@ -41,7 +41,7 @@ export class ApiError extends Error {
   }
 }
 
-type QueryValue = string | number | boolean | undefined;
+type QueryValue = string | number | boolean | undefined | string[];
 
 export interface ApiRequestOptions {
   method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
@@ -50,13 +50,27 @@ export interface ApiRequestOptions {
   timeoutMs?: number;
 }
 
+/**
+ * An array value repeats the query param once per entry
+ * (`?marketplaces=ebay&marketplaces=etsy`), matching FastAPI's own
+ * convention for a `list[str]` query parameter (`GET /api/v1/listings`'s
+ * `marketplaces` filter) - never a comma-joined single value, which
+ * FastAPI would not parse as a list.
+ */
 function buildUrl(path: string, query?: Record<string, QueryValue>): string {
   const url = new URL(`${API_V1_BASE_URL}${path}`);
   if (query) {
     for (const [key, value] of Object.entries(query)) {
-      if (value !== undefined) {
-        url.searchParams.set(key, String(value));
+      if (value === undefined) {
+        continue;
       }
+      if (Array.isArray(value)) {
+        for (const entry of value) {
+          url.searchParams.append(key, entry);
+        }
+        continue;
+      }
+      url.searchParams.set(key, String(value));
     }
   }
   return url.toString();

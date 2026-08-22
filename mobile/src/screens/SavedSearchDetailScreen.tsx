@@ -5,10 +5,11 @@ import { useCallback, useState } from 'react';
 import { Alert, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import { ApiError } from '../api/client';
-import { deleteSavedSearch, getSavedSearch, runSavedSearch, updateSavedSearch } from '../api/endpoints';
+import { deleteSavedSearch, getSavedSearch, listListings, runSavedSearch, updateSavedSearch } from '../api/endpoints';
 import type { SavedSearchRunResult } from '../api/types';
 import { Chip } from '../components/Chip';
 import { ErrorState } from '../components/ErrorState';
+import { ListingCard } from '../components/ListingCard';
 import { LoadingView } from '../components/LoadingView';
 import { PrimaryButton } from '../components/PrimaryButton';
 import { Screen } from '../components/Screen';
@@ -18,8 +19,11 @@ import { useAutoRefresh } from '../hooks/useAutoRefresh';
 import type { RootStackParamList } from '../navigation/types';
 import { colors, fontSize, radius, spacing } from '../theme/colors';
 import { formatIntervalSeconds, formatTimestamp } from '../utils/format';
+import { displayNameForMarketplace } from '../utils/marketplaces';
 
 type DetailRouteProp = RouteProp<RootStackParamList, 'SavedSearchDetail'>;
+
+const LATEST_LISTINGS_LIMIT = 5;
 
 export function SavedSearchDetailScreen() {
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
@@ -27,6 +31,10 @@ export function SavedSearchDetailScreen() {
   const { id } = params;
 
   const detail = useAsyncData(() => getSavedSearch(id), [id]);
+  const latestListings = useAsyncData(
+    () => listListings({ saved_search_id: id, limit: LATEST_LISTINGS_LIMIT, sort: 'newest' }),
+    [id],
+  );
 
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
@@ -35,15 +43,20 @@ export function SavedSearchDetailScreen() {
   const [deleting, setDeleting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  // Keeps this saved search's status/last-scanned time current while its
-  // detail screen is open. Suspended for the duration of any in-flight
-  // mutation on this screen (Run Now, Pause/Resume, Delete) - a
-  // concurrent background refetch racing one of those could otherwise
-  // clobber the optimistic "loading" state those actions show, or refetch
-  // right before Run Now's own explicit `detail.refresh()` call and make
-  // it look like nothing happened. See mobile/README.md "Automatic
-  // refresh".
-  useAutoRefresh(detail.refreshQuietly, { enabled: !running && !togglingActive && !deleting });
+  // Keeps this saved search's status/last-scanned time, and its latest-
+  // listings preview, current while its detail screen is open. Suspended
+  // for the duration of any in-flight mutation on this screen (Run Now,
+  // Pause/Resume, Delete) - a concurrent background refetch racing one of
+  // those could otherwise clobber the optimistic "loading" state those
+  // actions show, or refetch right before Run Now's own explicit
+  // `detail.refresh()`/`latestListings.refresh()` calls and make it look
+  // like nothing happened. See mobile/README.md "Automatic refresh".
+  const refreshBothQuietly = useCallback(() => {
+    detail.refreshQuietly();
+    latestListings.refreshQuietly();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useAutoRefresh(refreshBothQuietly, { enabled: !running && !togglingActive && !deleting });
 
   const handleRunNow = useCallback(async () => {
     setRunning(true);
@@ -52,6 +65,7 @@ export function SavedSearchDetailScreen() {
       const result = await runSavedSearch(id);
       setRunResult(result);
       detail.refresh();
+      latestListings.refresh();
     } catch (error) {
       setRunError(error instanceof ApiError ? error.message : 'Could not run this saved search.');
     } finally {
@@ -127,7 +141,7 @@ export function SavedSearchDetailScreen() {
 
         <View style={styles.chipRow}>
           {savedSearch.marketplaces.map((marketplace) => (
-            <Chip key={marketplace} label={marketplace} muted />
+            <Chip key={marketplace} label={displayNameForMarketplace(marketplace)} muted />
           ))}
         </View>
 
@@ -136,6 +150,10 @@ export function SavedSearchDetailScreen() {
           <InfoRow label="Last scanned" value={formatTimestamp(savedSearch.last_scanned_at)} />
           <InfoRow label="Created" value={formatTimestamp(savedSearch.created_at)} />
           <InfoRow label="Updated" value={formatTimestamp(savedSearch.updated_at)} />
+          <InfoRow
+            label="Listings found"
+            value={latestListings.data ? String(latestListings.data.total_count) : '—'}
+          />
         </View>
 
         {actionError ? <Text style={styles.errorText}>{actionError}</Text> : null}
@@ -160,7 +178,7 @@ export function SavedSearchDetailScreen() {
             </Text>
             {Object.entries(runResult.marketplaces).map(([marketplace, outcome]) => (
               <View key={marketplace} style={styles.resultRow}>
-                <Text style={styles.resultMarketplace}>{marketplace}</Text>
+                <Text style={styles.resultMarketplace}>{displayNameForMarketplace(marketplace)}</Text>
                 <Text style={styles.resultCounts}>
                   {outcome.error ? `Failed: ${outcome.error}` : `${outcome.new_count} new, ${outcome.already_seen_count} already seen`}
                 </Text>
@@ -168,6 +186,23 @@ export function SavedSearchDetailScreen() {
             ))}
           </View>
         ) : null}
+
+        <View style={styles.latestSection}>
+          <Text style={styles.sectionTitle}>Latest listings</Text>
+          {latestListings.loading ? (
+            <Text style={styles.metaText}>Loading…</Text>
+          ) : latestListings.error ? (
+            <ErrorState message={latestListings.error} onRetry={latestListings.retry} />
+          ) : latestListings.data && latestListings.data.items.length > 0 ? (
+            <View style={styles.listingList}>
+              {latestListings.data.items.map((listing) => (
+                <ListingCard key={`${listing.marketplace}-${listing.id}`} listing={listing} />
+              ))}
+            </View>
+          ) : (
+            <Text style={styles.metaText}>No listings discovered by this saved search yet.</Text>
+          )}
+        </View>
       </ScrollView>
     </Screen>
   );
@@ -250,5 +285,20 @@ const styles = StyleSheet.create({
   resultCounts: {
     fontSize: fontSize.sm,
     color: colors.textSecondary,
+  },
+  latestSection: {
+    gap: spacing.sm,
+  },
+  sectionTitle: {
+    fontSize: fontSize.md,
+    fontWeight: '700',
+    color: colors.textPrimary,
+  },
+  metaText: {
+    fontSize: fontSize.sm,
+    color: colors.textSecondary,
+  },
+  listingList: {
+    gap: spacing.sm,
   },
 });

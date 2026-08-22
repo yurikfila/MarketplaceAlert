@@ -26,13 +26,21 @@ class ListingDiscoveryService:
     def __init__(self, session: Session) -> None:
         self._repository = ListingRepository(session)
 
-    def process_listings(self, listings: list[Listing]) -> ListingDiscoveryResult:
-        """Classify each listing as new or already-seen, saving new ones as it goes."""
+    def process_listings(
+        self, listings: list[Listing], *, saved_search_id: int | None = None
+    ) -> ListingDiscoveryResult:
+        """Classify each listing as new or already-seen, saving new ones as it goes.
+
+        `saved_search_id` (the saved search whose scan produced `listings`,
+        if any - `None` for the legacy `/scan` endpoint) is recorded only
+        on newly-discovered rows - see `ListingRepository.save_new()` and
+        `DiscoveredListing.discovered_by_saved_search_id`'s docstring.
+        """
         result = ListingDiscoveryResult()
         for listing in listings:
             existing = self._repository.get(listing.marketplace, listing.external_listing_id)
             if existing is None:
-                self._repository.save_new(listing)
+                self._repository.save_new(listing, saved_search_id=saved_search_id)
                 result.new_listings.append(listing)
             else:
                 self._repository.touch_last_seen(existing)

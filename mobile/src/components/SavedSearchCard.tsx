@@ -3,6 +3,7 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 import type { SavedSearch } from '../api/types';
 import { colors, fontSize, radius, spacing } from '../theme/colors';
 import { formatIntervalSeconds, formatTimestamp } from '../utils/format';
+import { displayNameForMarketplace } from '../utils/marketplaces';
 import { Chip } from './Chip';
 import { StatusPill } from './StatusPill';
 
@@ -31,7 +32,7 @@ export function SavedSearchCard({ savedSearch, onPress }: SavedSearchCardProps) 
 
       <View style={styles.chipRow}>
         {savedSearch.marketplaces.map((marketplace) => (
-          <Chip key={marketplace} label={marketplace} muted />
+          <Chip key={marketplace} label={displayNameForMarketplace(marketplace)} muted />
         ))}
       </View>
 

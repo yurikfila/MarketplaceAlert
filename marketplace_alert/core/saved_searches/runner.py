@@ -128,7 +128,9 @@ class SavedSearchRunner:
             saved_search_id=saved_search.id,
         )
 
-        discovery_result = ListingDiscoveryService(session).process_listings(filter_result.relevant_listings)
+        discovery_result = ListingDiscoveryService(session).process_listings(
+            filter_result.relevant_listings, saved_search_id=saved_search.id
+        )
         self._notification_service.notify_new_listings(discovery_result.new_listings)
 
         logger.info(

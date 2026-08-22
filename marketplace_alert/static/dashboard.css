@@ -46,6 +46,30 @@ body {
   font-size: 0.9rem;
 }
 
+.top-nav {
+  display: flex;
+  gap: 1rem;
+  margin-top: 0.75rem;
+}
+
+.top-nav a {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding-bottom: 0.25rem;
+  border-bottom: 2px solid transparent;
+}
+
+.top-nav a:hover {
+  color: var(--text);
+}
+
+.top-nav a.top-nav-active {
+  color: var(--primary);
+  border-bottom-color: var(--primary);
+}
+
 main {
   max-width: 900px;
   margin: 0 auto;
@@ -241,6 +265,96 @@ th {
 
 .empty {
   color: var(--muted);
+}
+
+/* --- Listings page --- */
+
+.filter-form {
+  margin-bottom: 0;
+}
+
+.clear-filters-link {
+  display: inline-block;
+  margin-top: 0.25rem;
+  font-size: 0.85rem;
+  color: var(--primary);
+}
+
+.listing-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+.listing-card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--card-bg);
+  text-decoration: none;
+  color: inherit;
+  transition: box-shadow 0.15s ease;
+}
+
+.listing-card:hover {
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+}
+
+.listing-image {
+  width: 100%;
+  height: 140px;
+  object-fit: cover;
+  background: var(--neutral-bg);
+  display: block;
+}
+
+.listing-image-placeholder {
+  display: flex;
+}
+
+.listing-body {
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.listing-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.listing-price {
+  font-weight: 700;
+  font-size: 0.9rem;
+  color: var(--text);
+}
+
+.listing-title {
+  margin: 0;
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.listing-meta {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.pagination {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 1rem;
 }
 
 .banner {

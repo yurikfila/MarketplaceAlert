@@ -488,7 +488,10 @@ marketplace connector yet.
       `main`'s namespace - confirmed by the full existing test suite
       passing unmodified, not just asserted.
     - **`GET /api/v1/listings` documents two real limitations instead of
-      faking them**, per this task's own explicit instruction:
+      faking them**, per this task's own explicit instruction (**both
+      superseded by decision #21, the Listings product-experience pass -
+      left here as the historical record of why they existed in the
+      first place**):
       - `price`/`currency`/`location`/`condition`/`image_url` are always
         `null` - `DiscoveredListing` (`core/persistence/models.py`) only
         ever stored `marketplace`/`external_listing_id`/`title`/
@@ -939,6 +942,108 @@ marketplace connector yet.
       it's genuinely CWD-independent and that the resulting schema
       matches what `tests/test_alembic_migrations.py` already expects.
 
+21. **Listings product-experience pass (2026-08-22): the Listings
+    feature went from technically-working to practically useful for
+    daily browsing, across the backend API, mobile app, and web
+    dashboard.** No new marketplace. Full write-up in CHANGELOG.md's
+    2026-08-22 "Listings product-experience pass" entry; the
+    load-bearing points:
+    - **The real gap was persistence, not the API.** `DiscoveredListing`
+      never stored most of what a connector actually returns - decisions
+      #14/the entry directly above documented this as an *intentional*
+      limitation at the time, honest but incomplete. Rich listing cards,
+      price filtering, and price sorting are all impossible without that
+      data actually being on the row, so this pass's first, highest-
+      leverage change was extending the schema: `price`/`currency`/
+      `location`/`seller`/`condition`/`image_url` (all nullable,
+      populated once at first-discovery time from whatever the connector
+      already extracts onto the transient `Listing` object - no
+      connector changed) plus `source_created_at` (the marketplace's own
+      listing-creation time, display-only) and
+      `discovered_by_saved_search_id` (see next point). One new,
+      purely-additive Alembic migration, verified via the usual
+      upgrade/downgrade/re-upgrade cycle against a throwaway SQLite
+      database - `op.batch_alter_table()` was required (not just plain
+      `op.add_column()`/`op.create_foreign_key()`), since SQLite has no
+      `ALTER TABLE ADD CONSTRAINT` at all; batch mode compiles to the
+      same plain statements on PostgreSQL, so production behavior is
+      unaffected.
+    - **A deliberate, narrow reversal of decision #14's "no
+      `saved_search_id` filter" stance - as an honest attribution, not
+      an invented relationship.** The original reasoning (no way to know
+      which saved search discovered a given row) is still true in
+      general; what changed is that `discovered_by_saved_search_id` is
+      now recorded **going forward**, at the moment `save_new()` first
+      persists a row, by threading the running saved search's id through
+      `SavedSearchRunner` -> `ListingDiscoveryService.process_listings()`
+      -> `ListingRepository.save_new()`. This is explicitly a "first
+      discovered by" attribution, not an exclusive-ownership
+      relationship - the same listing can independently match a
+      *different* saved search later, and that later match is not
+      recorded (the row already exists, so only `touch_last_seen()` runs
+      for it, which never touches this column). Rows discovered before
+      this column existed, or via the legacy `/scan` endpoint, are
+      simply `NULL` - never backfilled or guessed. `ON DELETE SET NULL`
+      on the foreign key means deleting a saved search only forgets the
+      attribution, never deletes or orphans the listings it found.
+    - **Mobile multi-select needed a real backend capability, not a
+      client-side workaround.** The Listings screen's filter modal
+      supports selecting several marketplaces at once, but
+      `/api/v1/listings`'s existing `marketplace` filter only ever
+      accepted one value. Two options were considered: merge several
+      parallel paginated requests client-side (rejected - genuinely hard
+      to get pagination/sorting right across N independently-paginated
+      requests), or add a second, plural `marketplaces` filter
+      (`?marketplaces=ebay&marketplaces=etsy`, FastAPI's native
+      `list[str]` query param support) alongside the existing singular
+      one. Went with the latter: purely additive, the singular
+      `marketplace` filter is completely unchanged, and it's one `.in_()`
+      clause in `ListingRepository._apply_filters()` instead of a
+      fragile client-side merge.
+    - **Price sort's `NULL`-handling was a deliberate product decision,
+      not an implementation detail.** A `NULL` price sorts *last*
+      regardless of direction (`price_asc` and `price_desc` both put
+      unknown-price listings at the end) - a listing with no known price
+      is neither the cheapest nor the most expensive result, so
+      surfacing it at the *top* of either sort would be actively
+      misleading.
+    - **One consistent timestamp strategy, named explicitly because it
+      would have been easy to get subtly wrong.** Every "how recent"
+      filter/sort (`discovered_after`/`discovered_before`/`new_since`,
+      the default `newest`/`oldest` sort, the mobile "New" badge) all
+      operate on `first_discovered_at` - when *our* system found the
+      listing - never `source_created_at` - when the marketplace says
+      the listing was created. Mixing the two would make "new" ambiguous
+      (a listing old on the marketplace but freshly surfaced by a
+      brand-new saved search must still read as newly discovered).
+    - **A real UX bug caught and fixed before shipping, the same
+      empirical-testing discipline used elsewhere in this project.**
+      Giving `ListingCard` both a "New" *badge* (`isRecentlyDiscovered`,
+      a 30-minute window) and a relative-time *text* line
+      (`formatRelativeTime`) initially had both say "New" for the first
+      minute after discovery - two "New"s on the same card reads as a
+      bug, not emphasis. Fixed by having the text tier say "Just now"
+      instead, confirmed via a dedicated test
+      (`ListingCard.test.tsx`) that a just-discovered listing shows
+      *both* labels distinctly, never the same word twice.
+    - **Currency display is a code prefix, never a locale symbol, and
+      never invents cents.** "USD 1,250", not "$1,250.00" - deliberate,
+      since this app never converts currencies (decision unchanged from
+      before), so a bare "$" would misrepresent USD/CAD/AUD/etc.
+      identically. Implemented once in TypeScript (`utils/format.ts`)
+      and mirrored exactly in Python (`main.py`'s `_format_price()`, for
+      the web dashboard) - two implementations because the two runtimes
+      can't literally share one function, kept in sync by having the
+      exact same rule stated in both places' docstrings/comments.
+    - **A price index was considered and explicitly not added.** The
+      production `discovered_listings` table is still small (low
+      hundreds of rows); adding an index for `price_asc`/`price_desc`
+      sorting isn't justified by any observed query pattern yet - same
+      "don't optimize without evidence" discipline as the
+      `first_discovered_at` index (added only once it was the ORDER BY
+      column on every page load, decision #19). Revisit if the table
+      grows enough for this to matter.
+
 ## Things that have NOT yet been implemented
 
 - Any marketplace beyond mock/Etsy/eBay/Reverb/Bonanza. Nine additional
@@ -1029,10 +1134,9 @@ marketplace connector yet.
   check to be added later per endpoint - see "Important architectural
   decisions" #14 - but nothing enforces it today, and no user id is
   fabricated anywhere.
-- **Extending `DiscoveredListing` to persist price/currency/location/
-  condition/image_url**, and a `saved_search_id`/listing relationship -
-  both real gaps surfaced (not hidden) while building `GET
-  /api/v1/listings` - see "Important architectural decisions" #14.
+- ~~Extending `DiscoveredListing` to persist price/currency/location/
+  condition/image_url, and a `saved_search_id`/listing relationship~~ -
+  **done**, see decision #21 (the Listings product-experience pass).
 - Push notifications (beyond the existing Telegram alerting).
 - Payments / subscriptions.
 - ~~The production Render Web Service is not yet connected to

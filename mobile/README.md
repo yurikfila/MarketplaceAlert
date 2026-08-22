@@ -103,8 +103,10 @@ src/
     useAsyncData.ts              The one data-fetching hook every screen uses
     useAutoRefresh.ts             Interval polling + app-resume + screen-focus refresh, in one hook
   utils/
-    format.ts                    Display formatting (dates, intervals, prices) - pure, tested
+    format.ts                    Display formatting (dates, intervals, prices, relative time) - pure, tested
     validation.ts                 Create-search form validation - pure, tested
+    marketplaces.ts                displayNameForMarketplace() - the one place brand casing is defined
+    linking.ts                     openListingUrl() - safe external-link opening, never traps the user in-app
   theme/
     colors.ts                     Colors/spacing/radii/font sizes used throughout
   testUtils/
@@ -136,14 +138,17 @@ src/
 
 ## Screens
 
-1. **Home** - app title, live backend status (`GET /api/v1/status`),
-   count of active saved searches, a button to create one, and a preview
-   of recently discovered listings. Auto-refreshes (see "Automatic
-   refresh" below).
+1. **Home** - app title, live backend status (`GET /api/v1/status`,
+   marketplace names brand-cased via `utils/marketplaces.ts`), count of
+   active saved searches, the most recent scan activity across every
+   saved search (as relative time), a button to create one, and a
+   preview of recently discovered listings using the same `ListingCard`
+   the Listings screen uses. Auto-refreshes (see "Automatic refresh"
+   below).
 2. **Saved Searches** - `GET /api/v1/saved-searches`, pull-to-refresh,
-   query/marketplaces/active state/scan interval/last-scanned time per
-   card. Auto-refreshes, so ACTIVE/INACTIVE state and `last_scanned_at`
-   stay current on their own.
+   query/marketplaces (brand-cased)/active state/scan interval/last-
+   scanned time per card. Auto-refreshes, so ACTIVE/INACTIVE state and
+   `last_scanned_at` stay current on their own.
 3. **Create Search** - query text input, marketplace multi-select
    (`GET /api/v1/marketplaces`), scan-interval presets, active toggle,
    `POST /api/v1/saved-searches`. Client-side validation mirrors the
@@ -151,18 +156,32 @@ src/
    60-second minimum interval) so mistakes are caught immediately, with
    the backend's own error message shown if a submission still fails
    server-side.
-4. **Saved Search Detail** - full detail, **Run Now**
-   (`POST /api/v1/saved-searches/{id}/run`, with a loading state and the
-   per-marketplace result counts shown afterward), **Pause/Resume**
-   (`PATCH`), **Delete** (`DELETE`, behind an `Alert.alert` confirmation).
-   Auto-refreshes the saved search's own detail; automatically pauses
-   while Run Now/Pause-Resume/Delete is in flight, so a background
-   refetch can never race one of those.
-5. **Listings** - `GET /api/v1/listings`, a marketplace filter chip row
-   (from `GET /api/v1/marketplaces`), "Load more" pagination, pull-to-
-   refresh, opens the original listing in the browser on tap.
-   Auto-refreshes to pick up newly discovered listings without disturbing
-   scroll position.
+4. **Saved Search Detail** - full detail (marketplaces brand-cased), a
+   "Listings found" count and a "Latest listings" section (`GET
+   /api/v1/listings?saved_search_id=`, reusing the exact same
+   `ListingCard` the Listings screen uses - no duplicated card markup),
+   **Run Now** (`POST /api/v1/saved-searches/{id}/run`, with a loading
+   state and the per-marketplace result counts shown afterward, also
+   brand-cased), **Pause/Resume** (`PATCH`), **Delete** (`DELETE`,
+   behind an `Alert.alert` confirmation). Auto-refreshes the saved
+   search's own detail and its latest-listings preview; automatically
+   pauses both while Run Now/Pause-Resume/Delete is in flight, so a
+   background refetch can never race one of those.
+5. **Listings** - `GET /api/v1/listings` with real filtering and sorting
+   via `ListingFilterModal` (a full-screen modal: marketplace
+   multi-select, a saved-search selector, min/max price, condition, and
+   sort - `newest`/`oldest`/`price_asc`/`price_desc`, default `newest`).
+   A "Filters" button shows an active-filter-count badge (sort doesn't
+   count - it reorders, it doesn't narrow); a "Sort: ..." label is
+   always visible. Filters/sort persist for the life of the screen and
+   survive pull-to-refresh, the background auto-refresh, and a failed
+   request - editing them in the modal never refetches until "Apply
+   filters" is pressed, and "Clear all" resets and applies immediately.
+   "Load more" pagination, pull-to-refresh, opens the original listing
+   safely in the browser on tap (`utils/linking.ts` - never traps the
+   user in-app; an invalid/missing URL simply does nothing). Auto-
+   refreshes to pick up newly discovered listings without disturbing
+   scroll position or the current filters.
 
 ## Automatic refresh
 
@@ -237,16 +256,20 @@ position for items that were already on screen.
 - **No payments, no push notifications.** Alerts still only go out via the
   backend's existing Telegram integration; this app doesn't send or
   receive its own notifications yet.
-- **Several listing fields are always empty.** `price`, `currency`,
-  `location`, `condition`, and `image_url` on a listing are always `null`
-  today - the backend doesn't persist them yet (see the backend's
-  `ARCHITECTURE.md` "Mobile API" for exactly why). This app renders them
-  conditionally and never fakes a value - if the backend starts returning
-  them, they'll simply start appearing.
-- **Listings aren't filterable by saved search.** The backend has no
-  stored relationship between a discovered listing and the saved search
-  that found it (by design - see the backend's own docs) - `saved_search_id`
-  is not offered as a filter here for the same reason.
+- **Listing fields are captured once, at discovery time - never refreshed
+  afterwards.** `price`/`currency`/`location`/`seller`/`condition`/
+  `image_url` reflect whatever the connector returned when a listing was
+  first found (see the backend's `ARCHITECTURE.md` "Local persistence and
+  duplicate detection"); a price drop or condition change on the source
+  marketplace after that isn't picked up. Still genuinely absent (`null`,
+  never faked) for a marketplace/listing that didn't provide a given
+  field in the first place - rendered conditionally either way.
+- **A saved-search filter attribution, not a strict relationship.** A
+  listing's `saved_search_id` (used by the Listings screen's filter and
+  Saved Search Detail's "Latest listings") records whichever saved search
+  *first* discovered it - if a different saved search also matches the
+  same listing later, that isn't recorded. See the backend's
+  PROJECT_CONTEXT.md decision #21 for the full reasoning.
 - **No App Store / Play Store release yet** - this is a first version run
   through Expo Go / a dev build, not a store submission.
 - **No offline support** - every screen requires a live connection to the
@@ -271,11 +294,49 @@ What's covered:
   with a string or Pydantic-array-shaped `detail`, malformed JSON, a 204
   with no body), and the retryable/non-retryable classification.
 - `src/utils/format.test.ts` / `src/utils/validation.test.ts` - display
-  formatting (scan-interval labels, timestamps, prices) and the
-  create-search form validation rules. (A `formatMarketplacesDisplay`
-  helper and its tests were removed during a production-hardening pass -
-  it was dead code, unused by any screen; `SavedSearchCard` renders a
-  saved search's raw marketplace ids directly.)
+  formatting (scan-interval labels, timestamps, prices - including the
+  currency-code-prefix format and its whole-number-vs-fractional-cents
+  rule - and relative time: "Just now", minutes, hours, "Yesterday" by
+  calendar day, older dates, invalid timestamps, and clock-skew safety)
+  and the create-search form validation rules.
+- `src/utils/marketplaces.test.ts` - `displayNameForMarketplace()`
+  mirrors the backend's brand casing for every known marketplace id, and
+  title-cases an unrecognized one rather than showing it raw. Every
+  screen showing a marketplace name (`ListingCard`, `SavedSearchCard`,
+  `SavedSearchDetailScreen`, `HomeScreen`) goes through this now - no
+  raw ids or ad-hoc casing left in any of them.
+- `src/utils/linking.test.ts` - a valid `http(s)` URL opens via
+  `Linking.openURL`; a missing/malformed/non-http(s) URL never calls
+  `Linking` at all; a device that can't open the URL, or `Linking`
+  itself rejecting, both resolve to `false` and show an `Alert` rather
+  than throwing.
+- `src/components/ListingCard.test.tsx` - every field present, every
+  optional field absent (individually and all at once - never crashes),
+  the "New" badge's threshold, a very large price, a non-USD currency,
+  and that tapping the card calls the safe linking helper with the
+  listing's URL.
+- `src/components/ListingFilterModal.test.tsx` - every control (sort,
+  marketplace multi-select toggle on/off, saved-search selection, price
+  text inputs), Apply/Clear/Done each doing exactly what they claim, and
+  `activeFilterCount()`'s rules (sort never counts; whitespace-only text
+  doesn't count).
+- `src/screens/ListingsScreen.test.tsx` - loading/error/empty states
+  (including a filtered-specific empty message), applying a marketplace
+  filter and a sort mode each refetching with the right request params
+  and updating the visible badge/label, clearing filters, "Load more"
+  requesting the next page, pull-to-refresh preserving the currently
+  applied filters, and a failed background auto-refresh leaving the
+  currently-shown listings untouched.
+- `src/screens/SavedSearchDetailScreen.test.tsx` (new) - the listings-
+  found count and latest-listings section (proving the real
+  `ListingCard` is reused, not a second rendering), Run Now refreshing
+  both the detail and the listings preview, Pause/Resume, Delete behind
+  its confirmation, and brand-cased marketplace chips/run-result rows.
+- `src/screens/HomeScreen.test.tsx` (new) - brand-cased marketplace
+  names, the "Last scan activity" line (computing the most recent
+  `last_scanned_at` across every saved search, and "None yet" when none
+  has ever run), the active-search count, and the recent-listings
+  preview using the real `ListingCard`.
 - `src/screens/SavedSearchesScreen.test.tsx` /
   `src/screens/CreateSearchScreen.test.tsx` - loading → data, empty state,
   error state with a working retry button, client-side validation

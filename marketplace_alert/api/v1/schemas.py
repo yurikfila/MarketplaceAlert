@@ -103,13 +103,18 @@ class SavedSearchRunResult(BaseModel):
 class ListingOut(BaseModel):
     """One row from `GET /api/v1/listings`.
 
-    `price`/`currency`/`location`/`condition`/`image_url` are always
-    `null` today - `DiscoveredListing` (`core/persistence/models.py`) does
-    not persist them yet (only `marketplace`, `external_listing_id`,
-    `title`, `listing_url`, and the two timestamps are stored). Documented,
-    not hidden - see `api/v1/listings.py`'s module docstring and
-    PROJECT_CONTEXT.md/ARCHITECTURE.md "Mobile API" for the full
-    explanation of this limitation.
+    `price`/`currency`/`location`/`seller`/`condition`/`image_url`/
+    `source_created_at` reflect whatever the connector that discovered
+    this listing actually returned at discovery time - genuinely `null`
+    when a marketplace/connector didn't provide that field for this
+    listing (never invented), and never refreshed afterwards even if the
+    source listing changes (see `DiscoveredListing`'s docstring in
+    `core/persistence/models.py`). `saved_search_id` is the saved search
+    whose scan *first* discovered this row - `null` for a listing
+    discovered via the legacy `/scan` endpoint, or before this column
+    existed - and is a "first discovered by" attribution, not an
+    exclusive-ownership relationship (see
+    `DiscoveredListing.discovered_by_saved_search_id`'s docstring).
     """
 
     id: int
@@ -119,20 +124,23 @@ class ListingOut(BaseModel):
     price: float | None = None
     currency: str | None = None
     location: str | None = None
+    seller: str | None = None
     condition: str | None = None
     listing_url: str
     image_url: str | None = None
+    source_created_at: datetime | None = None
     first_discovered_at: datetime
     last_seen_at: datetime
+    saved_search_id: int | None = None
 
-    @field_validator("first_discovered_at", "last_seen_at")
+    @field_validator("source_created_at", "first_discovered_at", "last_seen_at")
     @classmethod
-    def ensure_utc(cls, value: datetime) -> datetime:
+    def ensure_utc(cls, value: datetime | None) -> datetime | None:
         # SQLite drops tzinfo on round-trip even for DateTime(timezone=True)
         # columns; every value written is UTC, so reattach it here rather
         # than returning an ambiguous naive datetime in API responses -
         # same rule as SavedSearchRead.
-        if value.tzinfo is None:
+        if value is not None and value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
         return value
 

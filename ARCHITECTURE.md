@@ -982,11 +982,12 @@ operation; nothing in this path ever writes to them.
 
 ## Database selection and PostgreSQL support
 
-The system is live on Render; a Render PostgreSQL database
-(`marketplacealert-db`) already exists, though the deployed Web Service
-isn't connected to it yet - this section covers the *capability* now in
-the codebase, not a production cutover (no Render config was touched, and
-nothing was deployed as part of this).
+The system is live on Render, and the deployed Web Service's
+`DATABASE_URL` is set - production runs on Render's managed PostgreSQL
+(`marketplacealert-db`), not local SQLite. See "Automatic migrations on
+Render Free" below for how schema changes actually reach it, since
+Render's Free plan (which this project runs on) doesn't offer the
+Pre-Deploy Command mechanism this section originally assumed.
 
 ```
 DATABASE_URL unset  -> resolve_database_url() -> sqlite:///./marketplace_alert.db  (unchanged default)
@@ -1091,16 +1092,15 @@ any backend).
   README.md "Database" for the exact commands, and
   `tests/test_alembic_migrations.py` for both scenarios verified against
   real (temp-file) SQLite databases.
-- **Migrations are not run automatically inside the app's own startup**
-  (`main.py`'s `lifespan`) - deliberately. Render can run more than one
-  instance/worker process; several of them independently attempting
-  `alembic upgrade head` at the same moment as the app boots is a real
-  race with no benefit over running it once, separately, before any new
-  instance starts serving traffic (e.g. a Render Pre-Deploy Command, or a
-  manual `alembic upgrade head` before a deploy). `init_db()` still runs
-  in `lifespan` unconditionally, same as before - it's simply a no-op for
-  PostgreSQL now (see above), so this required no change to `main.py`'s
-  startup sequence itself, only to what `init_db()` does once it's there.
+- **Migrations now run automatically inside the app's own startup
+  (`main.py`'s `lifespan`), for PostgreSQL only - see "Automatic
+  migrations on Render Free" immediately below for why this reverses
+  what this project originally planned, and how the obvious risk (more
+  than one process racing to migrate at once) is guarded against.**
+  `init_db()` still runs in `lifespan` unconditionally, same as before -
+  it remains a no-op for PostgreSQL (see above), now running immediately
+  *after* the automatic migration rather than being the only PostgreSQL-
+  relevant step in that part of startup.
 - **Tests never require a real PostgreSQL server.** `create_engine()`
   builds an `Engine` object lazily - it only actually opens a connection
   when one is checked out of the pool - so `tests/test_database_config.py`
@@ -1108,6 +1108,80 @@ any backend).
   and `tests/test_alembic_migrations.py` runs the real baseline migration
   (upgrade, downgrade, re-upgrade, the `stamp`-vs-`upgrade` distinction)
   against throwaway temp-file SQLite databases only.
+
+### Automatic migrations on Render Free
+
+**Render's Free plan - what this project actually runs on - has no
+Pre-Deploy Command.** The paragraph above originally assumed migrations
+would be applied "before any new instance starts serving traffic (e.g. a
+Render Pre-Deploy Command, or a manual `alembic upgrade head` before a
+deploy)" - Pre-Deploy Command is a paid-plan-only feature, and requiring
+a manual `alembic upgrade head` before every single deploy isn't a
+realistic, sustainable process. Discovered only after confirming
+`DATABASE_URL` really is set in production (see above) - the
+`first_discovered_at` index added in the previous hardening pass had no
+automatic path to ever actually reach the live database. See
+PROJECT_CONTEXT.md decision #20 for the full reasoning; this section is
+the mechanism itself.
+
+```
+main.py's lifespan():
+    run_pending_migrations(engine)        # PostgreSQL only - see below
+    init_db()                              # SQLite only (unchanged)
+    migrate_legacy_marketplace_column(engine)
+    _background_scanner.start()
+```
+
+`core/persistence/migrations.py:run_pending_migrations(bind)`:
+
+- **No-ops immediately for any non-PostgreSQL dialect** (`bind.dialect.name
+  != "postgresql"`) - SQLite's existing `create_all()` bootstrap in
+  `init_db()` is completely untouched; this function adds a PostgreSQL-only
+  path, it doesn't change local dev/test behavior at all.
+- **Runs via FastAPI's ASGI `lifespan` protocol, not a wrapper/entrypoint
+  script.** Uvicorn (and any ASGI server) blocks accepting connections
+  until the `lifespan` startup phase completes - this alone already means
+  "runs before the app begins serving requests," with no new entrypoint
+  script, no change to Render's Start Command, and none of the
+  process-signal-handling/`exec` concerns a wrapper script would
+  introduce. A wrapper script was the documented fallback option if this
+  couldn't be made safe and deterministic - it could, so it wasn't
+  needed.
+- **A Postgres session-level advisory lock guards the actual migration
+  run**, acquired via the *non-blocking* `pg_try_advisory_lock`, polled
+  from Python with a bounded wait (`settings.migration_lock_timeout_seconds`,
+  default 30s) rather than the blocking `pg_advisory_lock` (whose
+  interaction with Postgres's `lock_timeout` setting isn't consistently
+  documented enough across versions to depend on for this). Render Free
+  only ever runs a single instance of this service, so true concurrent
+  *instances* racing to migrate isn't realistically possible - the lock
+  is defense-in-depth for a brief overlap during a deploy transition or
+  two close-together manual restarts, not a response to horizontal
+  scaling this plan doesn't have. **Released on the exact same
+  connection/session that acquired it** - PostgreSQL's session-level
+  advisory locks are tied to the session that took them, so releasing
+  from a different connection would silently do nothing, not actually
+  free the lock.
+- **Fails fast.** Any failure - a bad migration, a lock-acquire timeout,
+  a connectivity problem - propagates out of `run_pending_migrations()`,
+  out of `lifespan()`, and fails FastAPI/uvicorn startup outright. Render
+  then keeps serving the previous successful deploy rather than ever
+  letting a broken migration or a schema/code mismatch go live - a failed
+  startup is the intended, safe outcome here.
+- **Idempotent, additive-only, never destructive** - identical guarantees
+  to every other Alembic usage in this project: `alembic upgrade head`
+  against an already-current database is a documented no-op, so restarts
+  and redeploys are safe to run this on repeatedly; only `command.upgrade`
+  is ever called, never `command.downgrade`.
+- **Never logs `DATABASE_URL` or any credential** - only the dialect name
+  and generic progress/failure messages; the advisory-lock key is a fixed,
+  arbitrary constant unrelated to the connection string.
+- **Tested without a real PostgreSQL server** (`tests/test_startup_migrations.py`),
+  using the same lazy-`Engine`/mocked-connection approach
+  `tests/test_database_config.py` already established, plus two tests
+  that invoke `main.py`'s real `lifespan()` directly (bypassing
+  `tests/conftest.py`'s autouse no-op-lifespan safety net on purpose) to
+  prove the actual startup ordering and fail-fast behavior end to end.
 
 ## Notifications
 

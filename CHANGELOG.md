@@ -5,6 +5,97 @@ All notable changes to this project are recorded here. Format is roughly
 
 ## [Unreleased]
 
+## 2026-08-22 — Automatic PostgreSQL migrations for Render Free
+
+**Discovered while following up on the previous hardening pass's one
+open item ("confirm whether Render's `DATABASE_URL` is set and apply the
+new index migration accordingly"): `DATABASE_URL` is set - production
+has been running on Render's managed PostgreSQL the whole time, not
+local SQLite - and Render's Free plan (what this project runs on) has no
+Pre-Deploy Command.** That meant there was no automatic mechanism left
+to actually apply a migration (like the previous pass's
+`first_discovered_at` index) to the live database at all - only a
+manual `alembic upgrade head` run by a human before each deploy, which
+isn't a sustainable process and was never actually done. Solved without
+requiring a paid Render plan and without needing manual shell access for
+routine deploys.
+
+### Added
+- `marketplace_alert/core/persistence/migrations.py`
+  (`run_pending_migrations()`) - runs `alembic upgrade head`
+  automatically at FastAPI startup, PostgreSQL only (a no-op for SQLite,
+  local dev/tests unaffected). Uses FastAPI's own ASGI `lifespan`
+  protocol rather than a wrapper/entrypoint script - uvicorn already
+  blocks serving any request until startup completes, so this alone
+  satisfies "before the app begins serving requests" with no change to
+  Render's Start Command. Guarded by a Postgres session-level advisory
+  lock (`pg_try_advisory_lock`, polled with a bounded wait - new
+  `settings.migration_lock_timeout_seconds`, default 30s) so a brief
+  overlap during a deploy transition or two close-together manual
+  restarts can't run migrations concurrently; released on the same
+  connection that acquired it (required for correctness - PostgreSQL
+  advisory locks are session-scoped). Fails fast on any error - a bad
+  migration, a lock timeout, a connectivity problem - which fails
+  FastAPI/uvicorn startup outright, so Render keeps serving the previous
+  successful deploy rather than ever going live with a schema/code
+  mismatch. Idempotent (an already-current database is a documented
+  no-op) and never runs a downgrade. Never logs `DATABASE_URL` or any
+  credential. Wired into `main.py`'s `lifespan()` first, before
+  `init_db()`, the legacy marketplace-column migration, and the
+  background scanner start.
+- `settings.migration_lock_timeout_seconds` (default 30.0) in
+  `config.py`.
+- `tests/test_startup_migrations.py` (16 new tests) - dialect gating
+  (SQLite skipped entirely), the PostgreSQL path (lock acquired before
+  upgrade runs, lock released and connection closed on both success and
+  failure, credentials never logged on either path), a simulated
+  already-held lock timing out without ever calling upgrade or
+  incorrectly unlocking, the `alembic.ini` path resolving correctly, and
+  two lifespan-ordering integration tests that invoke `main.py`'s real
+  `lifespan()` directly (bypassing `tests/conftest.py`'s autouse
+  no-op-lifespan safety net on purpose, every internal call
+  individually monkeypatched) proving migrations run before
+  `init_db`/the legacy migration/the scanner start, and that a migration
+  failure prevents all of them from running at all. None of this
+  connects to a real PostgreSQL server - same lazy-`Engine`/
+  mocked-connection approach `tests/test_database_config.py` already
+  established. Separately (not part of the automated suite, a one-off
+  manual check), `_upgrade_to_head()`'s `Config`/`alembic.ini` path
+  resolution was verified for real against a throwaway SQLite database
+  from a temp working directory, confirming it's genuinely
+  CWD-independent.
+- `tests/test_lifespan_isolation.py` - extended the existing
+  "TestClient never runs real startup side effects" regression test to
+  also cover `run_pending_migrations`, so it's proven (not just assumed)
+  that the test suite can never accidentally attempt a real migration
+  against the real database.
+
+### Changed
+- `marketplace_alert/main.py` - `lifespan()` now calls
+  `run_pending_migrations(engine)` before `init_db()`.
+- PROJECT_CONTEXT.md - corrected a now-stale claim ("the production
+  Render Web Service is not yet connected to PostgreSQL") and added
+  decision #20 (the full reasoning above, plus why this reverses part of
+  decision #13's original "never migrate at app startup" stance
+  specifically for Render Free's constraints).
+- ARCHITECTURE.md - corrected the same stale claim in "Database
+  selection and PostgreSQL support"'s intro, replaced the now-outdated
+  "migrations are not run automatically" bullet, and added a new
+  "Automatic migrations on Render Free" section with the full mechanism.
+- README.md - "Migrations (Alembic)" now documents the automatic
+  startup behavior (including that it also applies if a local `.env`
+  points at a real PostgreSQL server) alongside the still-available
+  manual commands.
+- ROADMAP.md - Phase 8/8.5 updated to reflect that the PostgreSQL
+  cutover is done (`DATABASE_URL` is set in production) and that
+  migrations now apply automatically.
+
+### Not changed
+- The migration files themselves, `alembic/env.py`'s URL resolution,
+  the local SQLite bootstrap (`init_db()`), the legacy marketplace-
+  column migration, the scheduler, every marketplace connector, the
+  relevance engine, and the mobile app - none of this was touched.
+
 ## 2026-08-22 — Production hardening and release-readiness pass
 
 A full-repository audit for reliability and correctness, not new

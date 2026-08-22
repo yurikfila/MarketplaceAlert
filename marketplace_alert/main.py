@@ -30,6 +30,7 @@ from marketplace_alert.core.logging_config import configure_logging
 from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.notifications.service import NotificationService
 from marketplace_alert.core.persistence.database import SessionLocal, engine, get_db_session, init_db
+from marketplace_alert.core.persistence.migrations import run_pending_migrations
 from marketplace_alert.core.persistence.service import ListingDiscoveryService
 from marketplace_alert.core.relevance import filter_relevant_listings
 from marketplace_alert.core.saved_searches.migration import migrate_legacy_marketplace_column
@@ -103,10 +104,18 @@ _background_scanner = BackgroundScanner(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("marketplace_alert starting up", extra={"environment": settings.environment})
+    # Applies any pending Alembic migrations - PostgreSQL only, a no-op
+    # for local SQLite (see run_pending_migrations()'s own docstring).
+    # Runs first, before init_db()/the legacy marketplace-column
+    # migration/the scanner: the app must never start serving requests,
+    # or begin background scanning, against a database whose schema
+    # might not match what the running code expects. See
+    # PROJECT_CONTEXT.md decision #20 (Render Free has no Pre-Deploy
+    # Command, so this replaces what that would have done).
+    run_pending_migrations(engine)
     # init_db() only actually does anything for SQLite (local dev/tests) -
-    # it no-ops for PostgreSQL, whose schema is managed by Alembic
-    # migrations instead, applied separately/deliberately (see
-    # `alembic/`, README.md "Database"). See database.py's docstring.
+    # it no-ops for PostgreSQL, whose schema is managed by the Alembic
+    # migration above instead. See database.py's docstring.
     init_db()
     migrate_legacy_marketplace_column(engine)
     _background_scanner.start()

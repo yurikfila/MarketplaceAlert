@@ -44,6 +44,16 @@ class Settings(BaseSettings):
     # core/saved_searches/schemas.py for the per-search minimum).
     scheduler_tick_seconds: float = 5.0
 
+    # Automatic PostgreSQL migrations at app startup
+    # (core/persistence/migrations.py) - added because Render's Free plan
+    # has no Pre-Deploy Command to run `alembic upgrade head` as a
+    # separate step. How long to wait to acquire the Postgres advisory
+    # lock that guards a migration run before giving up and failing
+    # startup, rather than waiting forever for a stuck/crashed prior
+    # instance to release it. Irrelevant for local SQLite - that backend
+    # never takes this lock at all.
+    migration_lock_timeout_seconds: float = 30.0
+
     # Etsy Open API v3 credentials (Phase 2 - first real connector).
     # Optional - if either is unset, the Etsy connector reports a clear
     # configuration error when actually used, but the app still starts

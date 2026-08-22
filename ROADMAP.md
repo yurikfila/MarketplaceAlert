@@ -159,28 +159,26 @@ exposed beyond localhost (see Phase 6).
 
 ## Phase 8 — Cloud deployment
 Move off local-only development; real hosting, real database, secrets
-management. **Partially done, ahead of schedule:** the system is live on
-Render (real hosting, GitHub-triggered deploys, secrets via Render's env
-vars - not committed). A Render PostgreSQL database (`marketplacealert-db`)
-has been created, and the codebase now *supports* PostgreSQL alongside
-SQLite - `DATABASE_URL` selects it, normalized centrally for Render's URL
-forms and the `psycopg` driver, with Alembic managing its schema instead of
-the local-only `create_all()` bootstrap (see `ARCHITECTURE.md` "Database
-selection and PostgreSQL support"). **Still open, and still this phase's
-job**: the deployed Web Service is not yet connected to `DATABASE_URL`
-(still running on its local SQLite file on Render, which is not
-persistent-storage-safe long-term); no local data has been copied to
-PostgreSQL; no Render configuration was changed and nothing was deployed
-as part of adding this support - the actual production cutover is a
-separate, later step, not implied or started by this one.
+management. **Done, ahead of schedule:** the system is live on Render
+(real hosting, GitHub-triggered deploys, secrets via Render's env vars -
+not committed) on the Free plan, with `DATABASE_URL` set - production
+runs on Render's managed PostgreSQL (`marketplacealert-db`), not local
+SQLite. Schema changes reach it automatically at app startup
+(`core/persistence/migrations.py`, added 2026-08-22 specifically because
+Render Free has no Pre-Deploy Command - see ARCHITECTURE.md "Automatic
+migrations on Render Free" and PROJECT_CONTEXT.md decision #20), fail-fast
+and lock-guarded so a bad migration or a deploy-transition race can't
+silently leave the database in a broken or mismatched state. Still open:
+whether any pre-cutover local SQLite data was ever carried over to
+PostgreSQL was not part of this work and isn't tracked here - production's
+data has been accumulating in PostgreSQL independently since the cutover.
 
 ## Phase 8.5 — (informal) Local SQLite -> production PostgreSQL cutover
-Not a numbered phase of its own, listed here for continuity: connecting
-the already-live Render Web Service's `DATABASE_URL` to the already-created
-`marketplacealert-db`, running the baseline Alembic migration against it,
-and deciding whether/how to carry over existing local SQLite data. Blocked
-on nothing technical - the schema/code support is in place - just not yet
-done, and explicitly out of scope for the change that added that support.
+**Done.** The already-live Render Web Service's `DATABASE_URL` is
+connected to `marketplacealert-db`, and the baseline (plus every
+subsequent) Alembic migration reaches it automatically at startup - see
+Phase 8. Superseded the original plan of a manual Pre-Deploy Command
+step, since Render's Free plan doesn't offer one.
 
 ## Phase 9 — Android/iOS application
 Mobile clients on top of the existing API. **Not started - API groundwork

@@ -78,15 +78,19 @@ def test_context_manager_test_client_never_runs_startup_side_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Even more directly than the above: main.py's own startup calls
-    (init_db, migrate_legacy_marketplace_column, and starting the
-    scanner) must never execute - proving the real lifespan body truly
-    never runs at all, not just that its effects happen to be harmless
-    this time. init_db()/migrate_legacy_marketplace_column() run against
-    the real, production-bound `engine` (see main.py), so "never called"
-    is also the "never mutates the real database" guarantee."""
+    (run_pending_migrations, init_db, migrate_legacy_marketplace_column,
+    and starting the scanner) must never execute - proving the real
+    lifespan body truly never runs at all, not just that its effects
+    happen to be harmless this time. All of these run against the real,
+    production-bound `engine` (see main.py), so "never called" is also
+    the "never mutates the real database" guarantee - including never
+    attempting a real Alembic migration against it."""
     import marketplace_alert.main as main_module
 
     calls: list[str] = []
+    monkeypatch.setattr(
+        main_module, "run_pending_migrations", lambda *a, **k: calls.append("run_pending_migrations")
+    )
     monkeypatch.setattr(main_module, "init_db", lambda *a, **k: calls.append("init_db"))
     monkeypatch.setattr(
         main_module, "migrate_legacy_marketplace_column", lambda *a, **k: calls.append("migrate")

@@ -94,11 +94,27 @@ below needs to be done to just run the app locally.
 SQLite (local dev/tests) keeps auto-creating any missing tables on startup,
 same as before - safe, since that only ever adds tables, never drops or
 alters one. **PostgreSQL does not** - its schema is managed by
-[Alembic](https://alembic.sqlalchemy.org/) migrations instead, applied
-deliberately, not implicitly at every app startup.
+[Alembic](https://alembic.sqlalchemy.org/) migrations instead.
 
-Run migrations locally (against whatever `DATABASE_URL` resolves to - unset
-means the local SQLite file):
+**In production, this now happens automatically at app startup** -
+`run_pending_migrations()` (`core/persistence/migrations.py`) runs
+`alembic upgrade head` itself, before the app begins serving requests,
+whenever it detects a PostgreSQL `DATABASE_URL` (a no-op for SQLite).
+This exists because Render's Free plan - what this project runs on - has
+no Pre-Deploy Command to run migrations as a separate step; see
+PROJECT_CONTEXT.md decision #20 and ARCHITECTURE.md "Automatic
+migrations on Render Free" for the full mechanism (fail-fast on error,
+a bounded-wait advisory lock, idempotent, never a downgrade). **This
+also applies if you point your own local `.env`'s `DATABASE_URL` at a
+real PostgreSQL server** - starting the app (`uvicorn
+marketplace_alert.main:app`) will run pending migrations against it
+automatically too, the same way production does; only a SQLite
+`DATABASE_URL` (or none at all) skips this.
+
+You can still run migrations manually any time (against whatever
+`DATABASE_URL` resolves to - unset means the local SQLite file), e.g. to
+check what a new migration would do before starting the app, or to apply
+one without starting the app at all:
 
 ```bash
 alembic upgrade head

@@ -848,6 +848,97 @@ marketplace connector yet.
       `.gitignore` hardening from the previous (Bonanza) task already
       covers `.claude/`/`*.apk`. No git history rewrite was needed.
 
+20. **Render Free has no Pre-Deploy Command, so decision #13's original
+    plan for applying PostgreSQL migrations ("a single, separate,
+    explicit step... a Render Pre-Deploy Command, or a manual `alembic
+    upgrade head`") had no automatic mechanism left on the plan this
+    project actually runs on.** Discovered only after confirming
+    `DATABASE_URL` is in fact set on the production Web Service (see the
+    now-corrected "Things that have NOT yet been implemented" entry
+    above) - production has been running on PostgreSQL, not SQLite, this
+    whole time, which means the index migration added in the previous
+    hardening pass had no automatic path to actually reach it either.
+    Solved without requiring a paid Render plan, and without needing
+    routine manual shell access for every deploy:
+    - **Migrations now run automatically at FastAPI startup
+      (`core/persistence/migrations.py:run_pending_migrations()`),
+      PostgreSQL only - not a wrapper/entrypoint script.** FastAPI's
+      ASGI `lifespan` protocol already blocks the server from accepting
+      any connection until startup completes, which is exactly "before
+      the app begins serving requests" with zero extra moving parts - no
+      new entrypoint script, no change to Render's Start Command, no
+      process-signal-handling/`exec` concerns a wrapper script would
+      introduce. Called first thing in `main.py`'s `lifespan()`, before
+      `init_db()`, the legacy marketplace-column migration, and the
+      background scanner start - see ARCHITECTURE.md "Automatic
+      migrations on Render Free" for the exact ordering and why each
+      step needs the one before it.
+    - **Scoped to PostgreSQL only, by dialect - SQLite is completely
+      untouched.** `init_db()`'s existing `create_all()` bootstrap for
+      local dev/tests is unchanged; the local "stamp vs. upgrade"
+      workflow for an existing local SQLite file (README.md "Database")
+      still applies exactly as before. Nothing about this decision
+      changes local development at all.
+    - **Fails fast, deliberately.** Any failure - a bad migration, a
+      lock timeout, a connectivity problem - propagates out of
+      `lifespan()` and fails FastAPI/uvicorn startup outright. This is
+      the safe outcome on Render: a failed deploy just means Render
+      keeps serving the last successful one, never a live process
+      serving traffic against a database whose schema might not match
+      what the running code expects. The alternative (log the failure
+      and continue anyway) was explicitly rejected - it would silently
+      leave the app running against an outdated schema, which is exactly
+      what decision #13 was trying to avoid by not using SQLite's
+      implicit `create_all()` for PostgreSQL in the first place.
+    - **A Postgres session-level advisory lock
+      (`pg_try_advisory_lock`/`pg_advisory_unlock`, polled from Python
+      with a bounded wait - `settings.migration_lock_timeout_seconds`,
+      default 30s) guards the actual migration run.** Render Free only
+      ever runs a single instance of this service (no horizontal
+      scaling on that plan), so concurrent *instances* both racing to
+      migrate at once isn't realistically possible the way decision
+      #13 originally worried about - but a brief overlap during a
+      deploy's old-instance-shutting-down/new-instance-starting-up
+      window, or two manual restarts triggered close together, are both
+      real enough to guard against cheaply, so this was added rather
+      than relying solely on "Free tier is single-instance" as the whole
+      argument. Deliberately uses the *non-blocking*
+      `pg_try_advisory_lock`, polled in a Python loop with an explicit
+      deadline, rather than the blocking `pg_advisory_lock` combined
+      with Postgres's `lock_timeout` setting - the latter's exact
+      interaction with advisory-lock functions isn't consistent/
+      documented clearly enough across Postgres versions to depend on
+      for a safety mechanism.
+    - **Idempotent and non-destructive**, same guarantees as every other
+      Alembic usage in this project: `alembic upgrade head` against an
+      already-current database is a documented no-op (see
+      `tests/test_alembic_migrations.py`), so redeploys/restarts on
+      Render are safe to run this on repeatedly; only `command.upgrade`
+      is ever called, never `command.downgrade`.
+    - **Never logs `DATABASE_URL` or any credential** - same rule as
+      `core/persistence/database.py`/`alembic/env.py`. Only the dialect
+      name and generic progress/failure messages are logged; the
+      advisory-lock key itself is an arbitrary constant, not derived
+      from or related to the connection string.
+    - **Tested without a real PostgreSQL server**, same approach as
+      `tests/test_database_config.py` already established: a
+      `postgresql`-dialected `Engine` is built (lazily, never actually
+      connecting) via the exact same `create_db_engine`/
+      `resolve_database_url` functions, and every real database
+      interaction is a small fake connection object recording what was
+      executed - proves this module's own lock/ordering/fail-fast logic
+      without needing Postgres infrastructure in CI. Two additional
+      tests invoke `main.py`'s real `lifespan()` directly (bypassing
+      `tests/conftest.py`'s autouse no-op-lifespan safety net on
+      purpose, with every internal call individually monkeypatched) to
+      prove the actual startup ordering and the fail-fast-halts-
+      everything-else behavior end to end, not just by code inspection.
+      Separately, `_upgrade_to_head()`'s `Config`/`alembic.ini` path
+      resolution was manually verified for real (not mocked) against a
+      throwaway SQLite database from a temp working directory, proving
+      it's genuinely CWD-independent and that the resulting schema
+      matches what `tests/test_alembic_migrations.py` already expects.
+
 ## Things that have NOT yet been implemented
 
 - Any marketplace beyond mock/Etsy/eBay/Reverb/Bonanza. Nine additional
@@ -944,15 +1035,14 @@ marketplace connector yet.
   /api/v1/listings` - see "Important architectural decisions" #14.
 - Push notifications (beyond the existing Telegram alerting).
 - Payments / subscriptions.
-- **The production Render Web Service is not yet connected to PostgreSQL.**
-  PostgreSQL *support* now exists in the codebase (`DATABASE_URL` selection,
-  normalization, the `psycopg` driver, Alembic migrations - see "Important
-  architectural decisions" #13) and a Render PostgreSQL database
-  (`marketplacealert-db`) already exists, but wiring the two together -
-  setting `DATABASE_URL` on the Web Service, running the baseline migration
-  against it - is a deliberate, separate, not-yet-done step (no Render
-  configuration was touched as part of adding this support, and nothing
-  was deployed).
+- ~~The production Render Web Service is not yet connected to
+  PostgreSQL.~~ **Superseded**: `DATABASE_URL` is now set on the
+  production Render Web Service - it runs on PostgreSQL
+  (`marketplacealert-db`), not local SQLite. Discovered while solving
+  decision #20 (Render Free has no Pre-Deploy Command, so migrations
+  needed an automatic-at-startup mechanism) - see that decision for the
+  full story, and ARCHITECTURE.md "Automatic migrations on Render Free"
+  for how schema changes now actually reach production.
 - **Existing local SQLite data has not been copied to PostgreSQL.** Not
   needed for the support added here (schema compatibility + selection
   only) - production data initialization/migration is explicitly separate,

@@ -85,6 +85,14 @@ def test_marketplaces_display_names_use_brand_casing(client) -> None:
     assert body["ebay"] == "eBay"
     assert body["etsy"] == "Etsy"
     assert body["mock"] == "Mock"
+    assert body["reverb"] == "Reverb"
+
+
+def test_marketplaces_includes_reverb(client) -> None:
+    """Requirement: Reverb must appear here automatically through the
+    connector registry - never a separately hard-coded entry for it."""
+    body = client.get("/api/v1/marketplaces").json()
+    assert any(item["id"] == "reverb" for item in body)
 
 
 def test_marketplaces_reflect_credential_configuration(client, monkeypatch) -> None:
@@ -92,6 +100,7 @@ def test_marketplaces_reflect_credential_configuration(client, monkeypatch) -> N
     monkeypatch.setattr(settings, "etsy_shared_secret", "test-secret")
     monkeypatch.setattr(settings, "ebay_app_id", None)
     monkeypatch.setattr(settings, "ebay_cert_id", None)
+    monkeypatch.setattr(settings, "reverb_api_token", None)
 
     body = {item["id"]: item for item in client.get("/api/v1/marketplaces").json()}
 
@@ -99,18 +108,31 @@ def test_marketplaces_reflect_credential_configuration(client, monkeypatch) -> N
     assert body["etsy"]["available"] is True
     assert body["ebay"]["configured"] is False
     assert body["ebay"]["available"] is False
+    assert body["reverb"]["configured"] is False
+    assert body["reverb"]["available"] is False
     # mock has nothing to configure - always both true.
     assert body["mock"]["configured"] is True
     assert body["mock"]["available"] is True
 
 
+def test_marketplaces_reflect_reverb_token_present(client, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "reverb_api_token", "test-reverb-token")
+
+    body = {item["id"]: item for item in client.get("/api/v1/marketplaces").json()}
+
+    assert body["reverb"]["configured"] is True
+    assert body["reverb"]["available"] is True
+
+
 def test_marketplaces_never_exposes_secrets(client, monkeypatch) -> None:
     monkeypatch.setattr(settings, "etsy_api_key", "super-secret-etsy-key")
     monkeypatch.setattr(settings, "ebay_app_id", "super-secret-ebay-app-id")
+    monkeypatch.setattr(settings, "reverb_api_token", "super-secret-reverb-token")
 
     response = client.get("/api/v1/marketplaces")
     assert "super-secret-etsy-key" not in response.text
     assert "super-secret-ebay-app-id" not in response.text
+    assert "super-secret-reverb-token" not in response.text
 
 
 # --- saved searches: create / list / get / update / delete -----------------

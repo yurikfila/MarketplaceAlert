@@ -63,27 +63,35 @@ Rules for connectors:
   engine, the `Listing` model, or other connectors.
 
 **Resolving a connector by name**: `marketplace_alert/connectors/registry.py`
-maps a marketplace name (e.g. `"mock"`, `"etsy"`, `"ebay"`) to a connector
-instance - `get_connector(name)` - and answers `is_marketplace_supported(name)`.
-It is the *only* place outside a connector's own module allowed to import a
-concrete connector class. Anything in `core/` that needs to resolve a
-connector (currently: `SavedSearchRunner`, via `SavedSearchService`'s
-marketplace validation) takes a resolver function / predicate injected by
-`main.py` instead of importing the registry - `core/` stays free of any
-concrete-connector import, including the registry itself. Adding a
-marketplace means adding one line to the registry's factory dict; nothing
-in `core/` changes - proved in practice twice now: when Etsy was added, and
-again when eBay was added (nothing outside `connectors/registry.py` and
-`connectors/ebay/` had to change the second time either). Each registry
-entry is a zero-arg callable rather than strictly a bare class, since a
-real connector (Etsy, eBay) needs credentials wired in from `settings` that
-a plain class reference can't supply; `MockMarketplaceConnector` still
-works unchanged as an entry since a class is itself a valid zero-arg
-callable. `list_supported_marketplaces()` returns every registered name,
-sorted - the single source of truth anything listing marketplaces should
-use (currently: the dashboard's marketplace dropdown - see "The management
-dashboard" below) rather than hard-coding `["mock", "etsy", "ebay"]` a
-second time somewhere else.
+maps a marketplace name (e.g. `"mock"`, `"etsy"`, `"ebay"`, `"reverb"`) to a
+connector instance - `get_connector(name)` - and answers
+`is_marketplace_supported(name)`. It is the *only* place outside a
+connector's own module allowed to import a concrete connector class.
+Anything in `core/` that needs to resolve a connector (currently:
+`SavedSearchRunner`, via `SavedSearchService`'s marketplace validation)
+takes a resolver function / predicate injected by `main.py` instead of
+importing the registry - `core/` stays free of any concrete-connector
+import, including the registry itself. Adding a marketplace means adding
+one line to the registry's factory dict; nothing in `core/` changes -
+proved in practice three times now: when Etsy was added, again when eBay
+was added, and again when Reverb was added (nothing outside
+`connectors/registry.py` and `connectors/reverb/` had to change the third
+time either). Each registry entry is a zero-arg callable rather than
+strictly a bare class, since a real connector (Etsy, eBay, Reverb) needs
+credentials wired in from `settings` that a plain class reference can't
+supply; `MockMarketplaceConnector` still works unchanged as an entry
+since a class is itself a valid zero-arg callable. `list_supported_marketplaces()`
+returns every registered name, sorted - the single source of truth
+anything listing marketplaces should use (the dashboard's marketplace
+checkboxes/status panel and the mobile API's `GET /api/v1/marketplaces` -
+see "The management dashboard" and "Mobile API" below) rather than
+hard-coding the marketplace list a second time somewhere else.
+`display_name_for(name)` is the same idea for a marketplace's
+presentational name (e.g. `"ebay"` → `"eBay"`) - one small mapping,
+defined once in the registry, that both the dashboard and the mobile API
+call rather than each keeping an independent copy (see "Why these
+choices" below for why this was worth generalizing when Reverb was
+added, rather than adding a third hard-coded copy).
 
 ## The normalized `Listing` model
 
@@ -141,6 +149,16 @@ marketplace_alert/
             models.py           DiscoveredListing table (SQLAlchemy)
             repository.py       Raw DB access (ListingRepository)
             service.py          Duplicate detection (ListingDiscoveryService)
+            cleanup.py           Historical relevance re-evaluation/removal (maintenance-only)
+        relevance/
+            text.py              Normalization + n-gram phrase matching (shared primitive)
+            brands.py             Extensible brand vocabulary + conflict detection
+            families.py            Configurable product-family synonym mapping
+            accessories.py          Accessory-term vocabulary
+            query.py                 Query parsing (brand extraction, core tokens)
+            models.py                 RelevanceEvaluation / RelevanceFilterResult
+            evaluator.py               The scoring engine (evaluate_relevance)
+            service.py                  Shared entrypoint (filter_relevant_listings)
         notifications/
             base.py            NotificationProvider interface, NotificationError
             service.py          Alert dispatch (NotificationService)
@@ -155,7 +173,7 @@ marketplace_alert/
             guard.py              Overlap prevention (SavedSearchRunGuard)
             scanner.py             The background loop (BackgroundScanner)
     connectors/
-        registry.py             get_connector / is_marketplace_supported
+        registry.py             get_connector / is_marketplace_supported / display_name_for
         mock/
             connector.py        MockMarketplaceConnector (fake, in-memory)
         etsy/
@@ -163,6 +181,8 @@ marketplace_alert/
         ebay/
             connector.py          EbayMarketplaceConnector (eBay Buy Browse API)
             token_manager.py      EbayTokenManager (OAuth client_credentials)
+        reverb/
+            connector.py          ReverbMarketplaceConnector (Reverb API v3)
     notifications/
         telegram/
             provider.py          TelegramNotificationProvider
@@ -170,6 +190,8 @@ alembic/
     env.py                       Resolves DATABASE_URL the same way the app does
     versions/                    One migration per schema change (baseline so far)
 alembic.ini                     Alembic config (sqlalchemy.url deliberately left blank)
+scripts/
+    cleanup_historical_listings.py   Manual, explicit-only historical relevance cleanup (see "Historical listing cleanup")
 tests/                          Mirrors the package layout
 ```
 
@@ -357,6 +379,125 @@ written.
   fails on a saved search that also targets Etsy (or vice versa), the other
   marketplace still runs and the saved search still completes.
 
+## The Reverb connector
+
+`marketplace_alert/connectors/reverb/connector.py`
+(`ReverbMarketplaceConnector`) is the third *real* connector - musical
+instruments/gear marketplace Reverb, via its public **API v3**, never HTML
+scraping. Registered in the connector registry alongside
+`"mock"`/`"etsy"`/`"ebay"`, so a saved search targeting `"reverb"` (alone,
+or alongside any other marketplace) flows through the exact same
+duplicate-detection, scheduler, relevance-filtering, and notification
+pipeline every other connector already proved out - no changes were
+needed anywhere else to add it, a third proof of the connector
+interface's claim.
+
+**Verified before writing any code, from three independent sources** (see
+`connector.py`'s module docstring for the full citations): the
+developer's own manually-verified request (a real personal access token,
+`GET https://api.reverb.com/api/listings?query=Fender&per_page=1` with
+`Authorization: Bearer <token>`, `Accept: application/hal+json`,
+`Accept-Version: 3.0`, returning a real listing) - the source of truth
+for the auth headers and the `query`/`per_page` parameter names; Reverb's
+own official API docs, confirming the response is a HAL+JSON document
+with listings under a top-level `"listings"` array and pagination via
+`_links.next`/`_links.prev` (a full `href` to follow verbatim - Reverb's
+own stated design principle is "never construct your own URLs... follow
+`_links`"); and a real, working third-party Reverb API client, whose
+JSON-property constants confirm `_links.web.href` is a listing's
+canonical web page URL and that `photos` is the correct top-level image
+key.
+
+**One honest gap, handled deliberately, not glossed over**: Reverb's own
+published docs do not include a complete example listing object, so the
+exact nesting of `price`/`condition`/`shop`/`photos` is inferred (from
+Reverb's own listing-*creation* payload shape, cross-referenced against
+real Reverb listing fields independently documented by a third-party
+tool built against this same public API) rather than independently
+confirmed the way eBay's/Etsy's field mappings were. `normalize_listing`
+is written defensively as a direct consequence: every optional field
+tries its most likely shape first, then one or two reasonable structural
+fallbacks, landing on `None` - never an invented value - if nothing
+matches. A wrong guess about one field's exact nesting only ever means
+that field is `null` for a listing, never fabricated data.
+
+- **Auth**: a single, static personal access token
+  (`REVERB_API_TOKEN`, created with only the `public` scope for this
+  integration) sent as `Authorization: Bearer <token>` on every request,
+  alongside `Accept: application/hal+json` and `Accept-Version: 3.0`.
+  Unlike eBay's OAuth client-credentials flow, there is no token
+  refresh/expiry to manage - a 401/403 means the token is missing, wrong,
+  or revoked, surfaced as a clear, safe error and never retried
+  automatically (see "Failure handling" below).
+- **Endpoint**: `GET https://api.reverb.com/api/listings` - free-text
+  keyword search (`query`), a safe configurable page size (`per_page`,
+  `reverb_result_limit` setting, default 25). Unlike Etsy/eBay (which
+  fetch a single page today), this connector *does* paginate: it follows
+  `_links.next.href` verbatim (never hand-reconstructing query params for
+  it, per Reverb's own HAL convention) until it has `result_limit`
+  listings, there's no further `next` link, or a hard `MAX_PAGES` safety
+  cap (5) is reached - whichever comes first. The cap exists specifically
+  so a pathological response (every page reporting a `next` link while
+  returning almost nothing) can never turn into unbounded polling for a
+  single saved-search scan.
+- **Field mapping**: `id` → `external_listing_id`, `title`, `description`,
+  `price.amount`/`price.currency` (falling back to a `price_cents`
+  field, divided by 100, if no structured `amount` is present - never
+  parsing a human-readable display string like `"$1,419.30"` when no
+  safe numeric field exists), `condition.display_name` (or a plain
+  string `condition`) → `condition`, `shop.name` (falling back to a
+  top-level `shop_name`) → `seller`, `photos[0]._links.full.href` (with
+  `large`/a plain string/`link`/`url` fallbacks) → `image_url`,
+  `_links.web.href` → `listing_url` (the canonical web page, not
+  `_links.self`, the API resource URL), `published_at` (falling back to
+  `created_at`) → `created_at`. `location` is only ever populated from a
+  plausible `shop.location`/top-level `location` field if one is actually
+  present - Reverb's docs don't confirm a location field for a listing at
+  all, so this is never invented from unrelated data. Any field not
+  present for a given listing is left `null`, never guessed - same rule
+  as Etsy/eBay.
+- **Character encoding**: `httpx`'s own JSON decoding (`response.json()`)
+  correctly handles UTF-8 per RFC 8259 - titles/descriptions with
+  accents, symbols, or emoji round-trip intact. A dedicated test
+  (`tests/test_reverb_connector.py`) proves this through the full request
+  pipeline, not just the normalizer in isolation - any mojibake seen in a
+  terminal is that terminal's own display encoding, never a corruption of
+  the underlying response data.
+- **Configuration**: `ReverbMarketplaceConnector.__init__` takes
+  `api_token` explicitly (the registry wires this from
+  `settings.reverb_api_token`) - it never reads settings itself, same
+  rule as Etsy/eBay. If it's missing, `is_configured` is False and
+  `search()` raises `MarketplaceConnectorError` *before* attempting any
+  request - construction itself never fails, so a missing Reverb
+  credential can't crash app startup, and every other connector is
+  completely unaffected.
+- **Failure handling**: network errors, timeouts, non-200 responses
+  (401/403, 404, 429 each logged and reported distinctly; any other
+  non-200 reported generically), and non-JSON or malformed bodies all
+  raise `MarketplaceConnectorError` after logging a sanitized message -
+  never the raw exception, response body, or token. A single malformed
+  *listing*, or one missing its `_links.web.href`, inside an otherwise-
+  valid response is logged and skipped rather than failing the whole
+  search - same as Etsy/eBay. A malformed/missing `listings` collection
+  on the *first* page is a hard error (nothing to return); the same
+  problem on a *later* page during pagination just stops paginating and
+  returns whatever was already collected, rather than discarding good
+  results over a later page's issue. Because `SavedSearchRunner`/
+  `BackgroundScanner` already catch and log any exception from
+  `connector.search()` per marketplace, a failing Reverb search never
+  needed special-casing there: if Reverb fails on a saved search that
+  also targets Etsy/eBay, the other marketplace(s) still run and the
+  saved search still completes.
+- **Rate-limit visibility, not enforcement**: Reverb doesn't publish
+  exact rate-limit header names, so `_log_rate_limit_metadata` checks a
+  few common conventions (`X-RateLimit-Remaining`/`RateLimit-Remaining`,
+  etc.) and logs them at INFO if present - a no-op, never an error, if
+  none are. `Retry-After` is logged the same way on a 429. This connector
+  doesn't poll any faster than a saved search's own configured interval
+  in the first place (same as every other connector - see "Saved
+  searches and background scanning" below), so this is visibility for a
+  human reading logs, not a rate-limiting mechanism of its own.
+
 ## Local persistence and duplicate detection
 
 `marketplace_alert/core/persistence/` remembers which listings have already
@@ -406,6 +547,263 @@ listings plus a count of how many were already seen. Unlike `/search`,
 zero) new listings the second time. Route handlers only orchestrate
 (connector search -> service call -> shape the response) and never contain
 raw persistence logic themselves.
+
+## Relevance filtering
+
+`marketplace_alert/core/relevance/` decides whether a listing a connector
+returned actually matches what the saved search's query asked for, before
+it's ever treated as discovered — persisted, counted, or notified about.
+It sits directly between the connector and the persistence layer:
+
+```
+connector.search(query) -> list[Listing]  (raw results, keyword-matched only)
+    -> filter_relevant_listings(query, listings, marketplace, saved_search_id)
+        -> evaluate_relevance(query, listing) for each listing
+    -> RelevanceFilterResult(relevant_listings, raw_count, relevant_count, rejected_count)
+        -> ListingDiscoveryService.process_listings(relevant_listings)
+```
+
+**Why this exists**: real mobile testing showed a "Makita drill" saved
+search returning Etsy listings for DeWalt/Milwaukee battery holders and
+generic tool organizers. Every marketplace connector does its own keyword
+matching (or none at all, for the mock connector — a plain substring
+check), which is precise enough to find candidates but not precise enough
+to guarantee they're what the user actually meant. Rather than asking each
+connector to get smarter independently (three different keyword-matching
+implementations to keep in sync), one shared, connector-agnostic layer
+sits after every connector and before persistence/notification.
+
+**Deliberately deterministic and dependency-free** — no LLM/AI API, no
+embeddings, no vector database, nothing that isn't reproducible from the
+same (query, listing) pair every time. Every module here is either a plain
+function over strings/tokens or a small in-memory registry (`dict`),
+because the actual task ("does this listing match this query well enough
+to bother someone about it") doesn't need more than that, and a rule-based
+approach is fully explainable — every rejection has one of a small,
+enumerated set of reasons, not an opaque score from a model.
+
+### The building blocks
+
+- **`text.py`** — `normalize_text()` (lowercase, strip punctuation/
+  separators, collapse whitespace) and `tokenize()` (the above, split on
+  whitespace, plus a conservative trailing-s/-ies singularization —
+  "batteries" -> "battery", "holders" -> "holder"). `find_phrase_matches()`
+  is the one generic n-gram matcher every vocabulary lookup in this
+  package uses: given a list of tokens and a `{phrase tuple: value}`
+  vocabulary, it returns every vocabulary phrase present as a *contiguous
+  token sequence* — never a raw substring check, so "drill" can never
+  accidentally match inside an unrelated longer word.
+- **`brands.py`** — the brand vocabulary. `register_brand(canonical,
+  aliases=[...])` is the extension point; the default catalog (Makita,
+  Bosch, DeWalt, Milwaukee, Ryobi, Black+Decker, and about a dozen more
+  common power-tool brands) is just what's registered at import time, not
+  a hard-coded architectural limit. `reset_to_defaults()` exists mainly
+  for test isolation.
+- **`families.py`** — product-family synonyms. A `ProductFamily` has a
+  `core_term`, a tuple of `strong_synonyms` (genuinely the same product —
+  e.g. the "drill" family's `hammer drill`, `cordless drill`, `driver
+  drill`), and a tuple of `related_synonyms` (adjacent but not identical —
+  `impact driver`). `register_family()` is how a new category gets added;
+  only "drill" is registered today (see PROJECT_CONTEXT.md "Things that
+  have NOT yet been implemented" for what that means for other
+  categories).
+- **`accessories.py`** — a flat vocabulary of accessory-only terms
+  (holder, mount, organizer, case, clip, rack, adapter, bit holder,
+  battery holder, wall mount). Registered the same way as brands/families
+  (`register_accessory_term()`), deliberately domain-general rather than
+  tool-specific, since "holder"/"case"/"mount" apply far beyond power
+  tools.
+- **`query.py`** — `parse_query(query)` tokenizes the query, finds any
+  recognized brand phrase (via `find_phrase_matches` against
+  `brands.brand_vocabulary()`), and splits the tokens into `brand_tokens`
+  (removed) and `core_tokens` (everything else) — what's left to actually
+  score the listing's core product match against.
+
+### The scoring engine (`evaluator.py`)
+
+`evaluate_relevance(query, listing) -> RelevanceEvaluation` (`is_relevant:
+bool`, `score: int` 0–100, `matched_terms: list[str]`, `rejected_reason:
+str | None`) runs four independently-checked signals against the
+listing's title + description:
+
+1. **Brand conflict (checked first, overrides everything else).** If the
+   query names a recognized brand and the listing mentions a *different*
+   recognized brand, reject immediately (`rejected_reason="brand_conflict"`,
+   `score=15`) — no amount of core-term matching rescues a wrong-brand
+   listing.
+2. **Brand match bonus (+30).** A listing whose brand matches the query's
+   gets a bonus. A **brand-neutral** listing (mentions no recognized brand
+   at all) is not penalized — plenty of real titles just don't include
+   the brand.
+3. **Core-term match**, scored against the query's core tokens (the query
+   with any brand removed):
+   - If a registered product family applies: a strong synonym present in
+     the listing scores **+55**; only a related synonym present scores
+     **+35**; neither present scores **0** and the listing fails the core
+     match entirely.
+   - Else if the query's core phrase is itself a registered accessory
+     term (e.g. "battery holder"): the listing must contain that same
+     phrase to count as a core match (**+55** if it does, **0** and fails
+     otherwise).
+   - Else (no registered family or accessory phrase applies — an
+     unregistered product category): **any single shared token** between
+     the query's core tokens and the listing counts as a full **+55**
+     match. This fallback is deliberately lenient, not proportional to
+     how many words overlap — see "Why these choices" below for why a
+     stricter fallback was rejected.
+   - A query that, after brand removal, has **no core tokens left** (a
+     brand-only query, e.g. just "Makita") is relevant only if the
+     listing actually mentions that brand (`brand_score > 0`) — a
+     brand-*neutral* listing is rejected (`brand_only_query_not_mentioned`),
+     since with no core term left there's no other positive signal tying
+     it to the query. (Earlier versions of this engine treated "doesn't
+     conflict with a different brand" as sufficient here, which made a
+     bare brand query match almost anything brand-neutral — a real bug
+     found by re-evaluating production data via
+     `core/persistence/cleanup.py`; see CHANGELOG.md.)
+4. **Accessory penalty (−45).** If the listing itself contains an
+   accessory term (from `accessories.py`) and the **query's own core
+   phrase did not ask for one**, the listing is penalized. This is what
+   rejects "Makita battery holder" for a "Makita drill" search while
+   still allowing it for a "Makita battery holder" search (step 3 already
+   confirmed the query's core phrase is the exact accessory in question,
+   so `query_is_accessory_seeking` is true and the penalty never applies).
+
+The final score is `brand_score + core_score - accessory_penalty`,
+clamped to `[0, 100]`. `is_relevant` requires **both** a core-term match
+**and** `score >= 50` — a listing can match a brand perfectly and still be
+rejected if it fails every core-term check (e.g. "Makita battery holder"
+against a "Makita drill" search: brand matches, but "battery holder" is
+not a drill-family synonym, so the core match fails outright).
+
+`rejected_reason` is always one of exactly five values, so every
+rejection is explainable: `"brand_conflict"`,
+`"accessory_without_core_product_match"`, `"no_core_product_match"`,
+`"low_relevance_score"`, or `"brand_only_query_not_mentioned"` (a
+brand-only query, e.g. just "Makita", against a listing that doesn't
+mention that brand at all).
+
+### Worked examples
+
+| Query | Listing | Verdict | Score | Reason |
+|---|---|---|---|---|
+| Makita drill | Makita Cordless Drill 18V | relevant | 85 | — |
+| Makita drill | Makita Hammer Drill XPH12Z | relevant | 85 | — |
+| Makita drill | Makita Impact Driver XDT131 | relevant (related, lower score) | 65 | — |
+| Makita drill | Cordless Drill Generic Brand | relevant (brand-neutral) | 55 | — |
+| Makita drill | Makita Battery Holder Wall Mount | **rejected** | 0 | accessory_without_core_product_match |
+| Makita drill | DeWalt 20V Drill DCD771C2 | **rejected** | 15 | brand_conflict |
+| Makita drill | Milwaukee Battery Holder Rack | **rejected** | 15 | brand_conflict |
+| Bosch drill | Bosch Rotary Hammer Drill GBH | relevant | 85 | — |
+| Bosch drill | Bosch Drill Bit Holder Organizer | **rejected** | 40 | accessory_without_core_product_match |
+| Bosch drill | Makita Cordless Drill 18V | **rejected** | 15 | brand_conflict |
+| Makita battery holder | Makita Battery Holder Wall Mount | relevant | 85 | — |
+| Makita battery holder | DeWalt Battery Holder Rack | **rejected** | 15 | brand_conflict |
+| Makita battery holder | Makita Cordless Drill 18V | **rejected** | 30 | no_core_product_match |
+| drill (no brand) | Bosch / Makita / DeWalt drill | relevant (any brand) | 55 | — |
+| drill (no brand) | Generic Battery Holder Organizer | **rejected** | 0 | accessory_without_core_product_match |
+| Makita (brand only) | Makita Plunge Base Adaptor | relevant | 85 | — |
+| Makita (brand only) | Pokemon Charizard Holo Card | **rejected** | 0 | brand_only_query_not_mentioned |
+
+See `tests/test_relevance.py` for every one of these as an executable
+test, plus punctuation/case/whitespace-normalization robustness checks
+(`"  MAKITA,, drill!!  "` scores identically to `"Makita drill"`).
+
+### The shared entrypoint (`service.py`)
+
+`filter_relevant_listings(*, query, listings, marketplace,
+saved_search_id=None) -> RelevanceFilterResult` runs `evaluate_relevance`
+over every listing and splits them into `relevant_listings` plus
+`raw_count`/`relevant_count`/`rejected_count`. This is the **only**
+function application code calls — never `evaluate_relevance` directly —
+and it's called from exactly two places, which between them cover every
+way a scan can run:
+
+- **`SavedSearchRunner._run_one_marketplace()`** (`core/saved_searches/
+  runner.py`) — used by the background scheduler (`BackgroundScanner`),
+  the legacy `POST /saved-searches/{id}/run`, and the mobile
+  `POST /api/v1/saved-searches/{id}/run` (all three ultimately call
+  `SavedSearchRunner.run()`/`run_by_id()` — there is only one runner
+  implementation for all of them to share).
+- **`main.py`'s legacy `GET /scan`** — the other place a connector's raw
+  results turn into persisted/notified listings.
+
+`GET /search` is deliberately **not** filtered — it's stateless (no
+persistence, no notification; see "Local persistence and duplicate
+detection" above), so it was never one of the paths this exists to
+protect, and filtering a raw exploratory-search endpoint would just be
+surprising for a caller inspecting what a marketplace actually returned.
+
+Each rejection is logged once, at `INFO` level (not `WARNING`/`ERROR` —
+an irrelevant result is routine, not a fault), with exactly the saved
+search id, query, marketplace, external listing id, score, and rejection
+reason — never the listing's full title/description/URL, and never a
+credential. Accepted listings are not logged at all, to keep this from
+becoming spam on a normally-behaving scan.
+
+`SavedSearchRunner`'s `MarketplaceRunResult` (and the mobile/legacy
+Pydantic equivalents, `MarketplaceRunOutcome`/`MarketplaceRunResult` in
+`api/v1/schemas.py`/`core/saved_searches/schemas.py`) gained two optional
+fields, additive only: `raw_count` (what the connector returned) and
+`rejected_count` (how many of those were filtered out) sit alongside the
+existing `new_count`/`already_seen_count`, which now reflect **post-filter**
+results — a saved search that gets 25 raw eBay results but only 10
+relevant ones operates on those 10 from that point on (persistence,
+dedup, and notification never see the other 15).
+
+### Historical listing cleanup
+
+Relevance filtering only applies going forward — `discovered_listings`
+rows persisted *before* it existed were never filtered, so a listing like
+"Makita Battery Holder Wall Mount" could still sit in the table and show
+up in `GET /api/v1/listings` even though a fresh scan would now reject
+it. `marketplace_alert/core/persistence/cleanup.py` is a one-off,
+explicitly-invoked (never automatic) maintenance operation that
+re-evaluates every existing row against the current relevance engine and
+removes the ones it would now reject.
+
+**The schema limitation, and how this works around it honestly.**
+`DiscoveredListing` has no relationship to `SavedSearch` (see "Local
+persistence and duplicate detection" above) — there is no stored query
+and no foreign key, so there is no way to know which specific saved
+search originally discovered a given row. Rather than guess, each row is
+re-evaluated against **every saved search currently targeting that row's
+marketplace** (active or paused — pausing isn't the same as deleting, and
+a deleted saved search naturally drops out since it no longer exists to
+query) and is kept if it's relevant to **at least one** of them. A row
+whose marketplace has **no** saved search left at all to evaluate it
+against is left untouched — there's nothing to compare it to, and
+deleting it would be guessing, not concluding
+(`HistoricalCleanupResult.skipped_no_saved_search_count`). A second, minor
+limitation: `DiscoveredListing` never stored a listing's description
+(only its title), so historical re-evaluation runs on title text alone —
+this can only make a re-evaluation *more* conservative than the original
+live one would have been (a description could only add matching signal,
+never remove it), so it never risks removing something that's actually
+relevant.
+
+**Two functions, one shared evaluation core.**
+`preview_historical_cleanup(session)` computes exactly what would be
+removed without deleting anything; `run_historical_cleanup(session)`
+deletes those same rows (via two small `ListingRepository` additions,
+`list_all()`/`delete()`, used only by this maintenance path — the normal
+scan/dedup path never deletes a row) and returns the identical
+`HistoricalCleanupResult` accounting (`total_rows`, `evaluated_count`,
+`skipped_no_saved_search_count`, `kept_count`, `removed_count`, plus the
+list of what was removed). Both call the same private `_evaluate()`, so a
+preview and a real run can never disagree about what qualifies.
+
+**Invocation: a manual script, never wired into the app.**
+`scripts/cleanup_historical_listings.py` opens a session against
+whichever database `settings.database_url` already resolves to (the
+exact same one the app uses — nothing here points anywhere else),
+defaults to a dry-run report, and only deletes/commits with an explicit
+`--apply` flag. It is not called from `main.py`'s lifespan, the
+scheduler, or any API endpoint — deleting data is a deliberate action a
+developer takes on purpose, not something that happens as a side effect
+of the app starting or a scan running. `SavedSearch`/
+`SavedSearchMarketplace` rows are read-only inputs to this whole
+operation; nothing in this path ever writes to them.
 
 ## Database selection and PostgreSQL support
 
@@ -794,10 +1192,9 @@ touching code. It is deliberately thin:
 ```
 GET /  (main.py: dashboard())
     -> SavedSearchService.list_all()          (same service the JSON API uses)
-    -> list_supported_marketplaces()           (registry - checkbox source)
+    -> list_supported_marketplaces()           (registry - checkbox + status-panel source)
     -> NotificationService.is_enabled           (status: Telegram configured?)
-    -> EtsyMarketplaceConnector.is_configured    (status: Etsy configured?)
-    -> EbayMarketplaceConnector.is_configured    (status: eBay configured?)
+    -> get_connector(name).is_configured, per marketplace  (status: configured?)
     -> templates/dashboard.html (Jinja2, autoescaped)
 
 Browser (dashboard.js, vanilla JS, no framework)
@@ -840,15 +1237,25 @@ Browser (dashboard.js, vanilla JS, no framework)
   as many marketplaces as are checked, one logical `SavedSearch`, never
   one record per marketplace. The saved-searches table shows each search's
   selected marketplaces joined into one cell (e.g. "Etsy, Mock").
-- **Status is booleans only, never credential values.** "Telegram
-  configured" reads `NotificationService.is_enabled`; "Etsy configured" and
-  "eBay configured" read `EtsyMarketplaceConnector.is_configured` /
-  `EbayMarketplaceConnector.is_configured` (via `get_connector("etsy")` /
-  `get_connector("ebay")`) - all already-existing properties, reused rather
-  than re-derived, and none capable of returning anything but `True`/`False`.
-  No route, template, or JS file ever touches `settings.telegram_bot_token`,
-  `settings.etsy_api_key`, `settings.ebay_app_id`/`settings.ebay_cert_id`,
-  or any other credential value.
+- **Status is booleans only, never credential values - and, like the
+  marketplace checkboxes, driven by the registry rather than one
+  hard-coded line per marketplace.** "Telegram configured" reads
+  `NotificationService.is_enabled`; every marketplace's configured state
+  comes from one loop over `list_supported_marketplaces()`, each calling
+  `getattr(get_connector(name), "is_configured", True)` (the same
+  fallback `api/v1/marketplaces.py` uses, since a connector like the mock
+  one has no credentials concept at all) - a `{name, display_name,
+  configured}` entry per marketplace, rendered by the template with one
+  `{% for %}` loop instead of one hand-written `<li>` per marketplace.
+  This replaced an earlier version of this panel that hard-coded an
+  "Etsy" and an "eBay" row individually - it worked, but would have meant
+  writing a *third* hard-coded row for Reverb, exactly the kind of
+  per-marketplace UI duplication this project's own rules rule out (see
+  "Why these choices" below). No route, template, or JS file ever
+  touches `settings.telegram_bot_token`, `settings.etsy_api_key`,
+  `settings.ebay_app_id`/`settings.ebay_cert_id`,
+  `settings.reverb_api_token`, or any other credential value - only each
+  connector's already-boolean `is_configured`.
 - **Errors shown to the user are always the API's own sanitized messages.**
   `dashboard.js` displays whatever `detail` string a failed `fetch()`
   response carries (e.g. "Saved search not found", "query cannot be
@@ -1037,6 +1444,36 @@ GET  /api/v1/listings          -> ListingRepository.list_recent/count(...)
   obtained, only that `get_token()` returns a currently-valid one. Endpoint
   and auth were verified against eBay's own official Browse API references
   before implementation, not guessed - see "The eBay connector" above.
+- **Reverb API v3 over httpx, no SDK, no scraping, following `_links`
+  rather than hand-building pagination URLs**: same reasoning as Etsy/
+  eBay for the "no SDK, no scraping" half. The pagination choice is
+  Reverb-specific: its HAL+JSON API explicitly documents "never construct
+  your own URLs... follow `_links`" as its design principle, so
+  `ReverbMarketplaceConnector` follows `_links.next.href` verbatim rather
+  than reconstructing `page`/`per_page` query params itself - the more
+  correct approach for a HATEOAS API, and the one Reverb's own docs
+  actually ask integrators to use. Endpoint and auth were verified
+  against the developer's own manually-confirmed request plus Reverb's
+  official docs before implementation; the exact nesting of a few
+  optional fields (price/condition/shop/photos) wasn't independently
+  confirmable from Reverb's public docs as of this implementation, so
+  those are coded defensively (multiple plausible shapes, `None` if none
+  match) rather than guessed with false confidence - see "The Reverb
+  connector" above for the full citation list and what's confirmed vs.
+  inferred.
+- **One shared `display_name_for()` in the connector registry, not a
+  per-UI display-name dict**: adding Reverb was the second time a
+  marketplace needed proper brand casing (e.g. "eBay", "Reverb") in more
+  than one place (the dashboard's status panel and the mobile API's `GET
+  /api/v1/marketplaces`) - keeping two independent copies in sync by hand
+  is exactly the kind of "hard-code it in multiple UIs" this project
+  otherwise avoids for the marketplace *list* itself
+  (`list_supported_marketplaces()`). Moving the mapping into
+  `connectors/registry.py` (the one place already allowed to know about
+  concrete connectors) and having both call sites import it fixes that
+  for good, not just for Reverb - the dashboard's status panel also
+  stopped hard-coding one `<li>` per marketplace in the same change (see
+  "The management dashboard" above), for the same reason.
 - **A stdlib `threading` loop for the scheduler, not APScheduler or asyncio**:
   the rest of the app (routes, SQLAlchemy sessions) is already synchronous,
   so a plain background thread ticking on an interval needed no new
@@ -1108,6 +1545,40 @@ GET  /api/v1/listings          -> ListingRepository.list_recent/count(...)
   keeps the API honest about its own current limits; extending
   `DiscoveredListing`'s schema is real, separate future work, not
   something to fake around in an API-shape task.
+- **A deterministic rule-based scorer for relevance filtering, not an
+  LLM/embeddings call**: explicitly out of scope for this feature, and
+  unnecessary for it - a small set of legible rules (brand conflict,
+  product-family synonym, accessory penalty) already explains every
+  required scenario (see "Relevance filtering" above) without adding a
+  network call, an API cost, or a source of nondeterminism to something
+  that runs on every scheduled scan tick.
+- **A lenient "any shared token counts" fallback for unregistered product
+  categories, not a stricter proportional-overlap score**: an earlier
+  design scaled the core-match score by the fraction of query tokens
+  found in the listing, which technically implements "don't accept a
+  result on one weak token match" more strictly - but it also silently
+  rejected many existing saved searches using generic, non-tool queries
+  (single collectible/fashion/watch terms with no registered family) that
+  had nothing to do with the brand-conflict/accessory problem this
+  feature exists to fix. Since the brand-conflict and accessory-penalty
+  checks apply independently of which core-scoring branch fires, the
+  lenient fallback doesn't reopen the original problem for the one
+  registered category (drills) or for accessory terms - it only affects
+  categories this vocabulary has no opinion about yet.
+- **A brand-only query (no core terms left after removing the brand)
+  requires the listing to actually mention that brand, not merely avoid
+  conflicting with a different one.** An earlier version of this rule
+  treated "no core terms left" the same as "brand-neutral listings aren't
+  penalized" (the rule one layer up, which only makes sense when there's
+  still a core term supplying independent evidence the listing is
+  on-topic) and made a bare "Makita" query relevant to *any* listing that
+  simply didn't mention a different recognized brand - including a
+  Pokemon card, confirmed while re-evaluating real production data via
+  `core/persistence/cleanup.py` (see CHANGELOG.md's historical-cleanup
+  entry). Fixed to require an actual brand mention (`brand_score > 0`) for
+  this specific case - a targeted fix, not a change to the brand-neutral
+  rule itself, which still applies normally whenever a core term is
+  present.
 
 ## Non-goals (for now)
 

@@ -5,6 +5,7 @@ import pytest
 
 from marketplace_alert.connectors.ebay.connector import EbayMarketplaceConnector
 from marketplace_alert.connectors.etsy.connector import EtsyMarketplaceConnector
+from marketplace_alert.connectors.reverb.connector import ReverbMarketplaceConnector
 from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.notifications.base import NotificationError, NotificationProvider
 from marketplace_alert.core.notifications.service import NotificationService
@@ -219,7 +220,7 @@ def test_run_guard_reset_clears_all_tracked_runs() -> None:
 def test_scheduler_searches_every_marketplace_on_one_saved_search(session_factory) -> None:
     setup_session = session_factory()
     SavedSearchRepository(setup_session).create(
-        query="Makita", marketplaces=["good", "also-good"], scan_interval_seconds=60, is_active=True
+        query="Charizard", marketplaces=["good", "also-good"], scan_interval_seconds=60, is_active=True
     )
     setup_session.commit()
     setup_session.close()
@@ -248,7 +249,7 @@ def test_one_failing_marketplace_does_not_stop_another_in_the_same_search(sessio
     notified, and the saved search still completing (marked scanned)."""
     setup_session = session_factory()
     created = SavedSearchRepository(setup_session).create(
-        query="Makita", marketplaces=["good", "broken"], scan_interval_seconds=60, is_active=True
+        query="Charizard", marketplaces=["good", "broken"], scan_interval_seconds=60, is_active=True
     )
     setup_session.commit()
     saved_search_id = created.id
@@ -735,3 +736,291 @@ def test_listing_already_marked_seen_is_not_renotified_after_a_prior_notificatio
     assert second.new_count == 0
     assert second.already_seen_count == 1
     assert working_provider.sent == []
+
+
+# --- against a real ReverbMarketplaceConnector (httpx mocked, no network) --
+
+
+def _reverb_connector() -> ReverbMarketplaceConnector:
+    return ReverbMarketplaceConnector(api_token="fake-reverb-token")
+
+
+def _reverb_listings_response(*raw_listings: dict) -> dict:
+    return {"listings": list(raw_listings), "_links": {}}
+
+
+def _raw_reverb_listing(listing_id: int, title: str) -> dict:
+    return {
+        "id": listing_id,
+        "title": title,
+        "price": {"amount": "999.00", "currency": "USD"},
+        "_links": {"web": {"href": f"https://reverb.com/item/{listing_id}"}},
+    }
+
+
+def test_scheduler_survives_a_real_reverb_connector_failure(
+    session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved search using the real ReverbMarketplaceConnector (not a
+    fake) whose HTTP call fails must not stop a healthy saved search's
+    scan - same resilience guarantee already proven for Etsy/eBay."""
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(500))
+
+    setup_session = session_factory()
+    repository = SavedSearchRepository(setup_session)
+    good = repository.create(
+        query="Charizard", marketplaces=["good"], scan_interval_seconds=60, is_active=True
+    )
+    reverb = repository.create(
+        query="Fender Stratocaster", marketplaces=["reverb"], scan_interval_seconds=60, is_active=True
+    )
+    setup_session.commit()
+    setup_session.close()
+
+    provider = RecordingProvider()
+
+    def resolve_connector(marketplace: str):
+        if marketplace == "good":
+            return FakeConnector([_listing()])
+        return _reverb_connector()
+
+    runner = SavedSearchRunner(
+        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+    )
+    scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
+
+    # Must not raise, even though the real Reverb connector's HTTP call fails.
+    scanner.run_due_searches()
+
+    assert len(provider.sent) == 1
+
+    verify_session = session_factory()
+    verify_repository = SavedSearchRepository(verify_session)
+    assert verify_repository.get(good.id).last_scanned_at is not None
+    assert verify_repository.get(reverb.id).last_scanned_at is not None
+    verify_session.close()
+
+
+def test_etsy_and_ebay_still_run_if_reverb_fails_in_same_saved_search(
+    session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One saved search targeting Etsy, eBay, and Reverb: Reverb's HTTP
+    call failing must not prevent Etsy or eBay from being searched and
+    notified."""
+    etsy_response = {
+        "count": 1,
+        "results": [
+            {
+                "listing_id": 111,
+                "title": "Fender Stratocaster",
+                "url": "https://www.etsy.com/listing/111/fender-strat",
+                "price": {"amount": 100000, "divisor": 100, "currency_code": "USD"},
+            }
+        ],
+    }
+    ebay_response = {
+        "itemSummaries": [
+            {
+                "itemId": "v1|222|0",
+                "title": "Fender Stratocaster",
+                "price": {"value": "1000.00", "currency": "USD"},
+                "itemWebUrl": "https://www.ebay.com/itm/222",
+            }
+        ]
+    }
+
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(200, json=_EBAY_TOKEN_BODY))
+
+    def fake_get(url, *args, **kwargs):
+        if "etsy.com" in url:
+            return httpx.Response(200, json=etsy_response)
+        if "ebay.com" in url:
+            return httpx.Response(200, json=ebay_response)
+        return httpx.Response(500)  # Reverb
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    setup_session = session_factory()
+    created = SavedSearchRepository(setup_session).create(
+        query="Fender Stratocaster",
+        marketplaces=["etsy", "ebay", "reverb"],
+        scan_interval_seconds=60,
+        is_active=True,
+    )
+    setup_session.commit()
+    saved_search_id = created.id
+    setup_session.close()
+
+    provider = RecordingProvider()
+
+    def resolve_connector(marketplace: str):
+        if marketplace == "etsy":
+            return EtsyMarketplaceConnector(api_key="fake-key", shared_secret="fake-secret")
+        if marketplace == "ebay":
+            return EbayMarketplaceConnector(app_id="fake-app-id", cert_id="fake-cert-id")
+        return _reverb_connector()
+
+    runner = SavedSearchRunner(
+        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+    )
+
+    run_session = session_factory()
+    result = runner.run_by_id(run_session, saved_search_id)
+    run_session.commit()
+    run_session.close()
+
+    assert {listing.marketplace for listing in provider.sent} == {"etsy", "ebay"}
+
+    by_marketplace = {r.marketplace: r for r in result.results}
+    assert by_marketplace["etsy"].new_count == 1
+    assert by_marketplace["etsy"].error is None
+    assert by_marketplace["ebay"].new_count == 1
+    assert by_marketplace["ebay"].error is None
+    assert by_marketplace["reverb"].new_count == 0
+    assert by_marketplace["reverb"].error is not None
+
+
+def test_reverb_listing_duplicate_is_not_notified_twice(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running the same saved search twice against the real Reverb
+    connector, with the API returning the same listing both times, must
+    only notify once - identical dedup guarantee already proven for
+    Etsy/eBay, now also for Reverb (marketplace + external_listing_id)."""
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *a, **k: httpx.Response(
+            200, json=_reverb_listings_response(_raw_reverb_listing(555, "Fender Stratocaster"))
+        ),
+    )
+
+    repository = SavedSearchRepository(db_session)
+    saved_search = repository.create(
+        query="Fender Stratocaster", marketplaces=["reverb"], scan_interval_seconds=60, is_active=True
+    )
+    db_session.commit()
+
+    provider = RecordingProvider()
+    runner = SavedSearchRunner(
+        notification_service=NotificationService(provider), resolve_connector=lambda name: _reverb_connector()
+    )
+
+    first = runner.run(db_session, saved_search)
+    second = runner.run(db_session, saved_search)
+
+    assert first.new_count == 1
+    assert second.new_count == 0
+    assert second.already_seen_count == 1
+    assert len(provider.sent) == 1
+
+
+def test_reverb_and_ebay_ids_are_independent_even_with_the_same_external_id(
+    session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Identity is marketplace + external_listing_id, never the id alone -
+    a Reverb listing "444" and an eBay listing "444" are independent, both
+    new. Same guarantee already proven for Etsy vs eBay, extended to
+    Reverb."""
+    ebay_response = {
+        "itemSummaries": [
+            {
+                "itemId": "444",
+                "title": "Fender Stratocaster",
+                "price": {"value": "1000.00", "currency": "USD"},
+                "itemWebUrl": "https://www.ebay.com/itm/444",
+            }
+        ]
+    }
+
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(200, json=_EBAY_TOKEN_BODY))
+
+    def fake_get(url, *args, **kwargs):
+        if "ebay.com" in url:
+            return httpx.Response(200, json=ebay_response)
+        return httpx.Response(200, json=_reverb_listings_response(_raw_reverb_listing(444, "Fender Stratocaster")))
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    setup_session = session_factory()
+    SavedSearchRepository(setup_session).create(
+        query="Fender Stratocaster", marketplaces=["reverb", "ebay"], scan_interval_seconds=60, is_active=True
+    )
+    setup_session.commit()
+    setup_session.close()
+
+    provider = RecordingProvider()
+
+    def resolve_connector(marketplace: str):
+        if marketplace == "ebay":
+            return EbayMarketplaceConnector(app_id="fake-app-id", cert_id="fake-cert-id")
+        return _reverb_connector()
+
+    runner = SavedSearchRunner(notification_service=NotificationService(provider), resolve_connector=resolve_connector)
+    scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
+
+    scanner.run_due_searches()
+
+    assert len(provider.sent) == 2
+    assert {listing.marketplace for listing in provider.sent} == {"reverb", "ebay"}
+    assert {listing.external_listing_id for listing in provider.sent} == {"444"}
+
+
+# --- Reverb results go through the same relevance engine as every other
+# marketplace ------------------------------------------------------------
+
+
+def test_reverb_results_pass_through_the_relevance_engine(db_session) -> None:
+    """A Reverb saved search returning both a relevant and an irrelevant
+    listing must persist/notify only the relevant one - proves relevance
+    filtering is applied to Reverb results via the shared runner path,
+    not something ReverbMarketplaceConnector itself would need to do."""
+    repository = SavedSearchRepository(db_session)
+    saved_search = repository.create(
+        query="Makita drill", marketplaces=["reverb"], scan_interval_seconds=60, is_active=True
+    )
+    db_session.commit()
+
+    relevant = Listing(
+        marketplace="reverb",
+        external_listing_id="rel-1",
+        title="Makita Cordless Drill 18V",
+        listing_url="https://reverb.com/item/rel-1",
+    )
+    irrelevant = Listing(
+        marketplace="reverb",
+        external_listing_id="irrel-1",
+        title="Makita Battery Holder Wall Mount",
+        listing_url="https://reverb.com/item/irrel-1",
+    )
+
+    provider = RecordingProvider()
+    runner = SavedSearchRunner(
+        notification_service=NotificationService(provider),
+        resolve_connector=lambda name: FakeConnector([relevant, irrelevant]),
+    )
+
+    result = runner.run(db_session, saved_search)
+
+    assert result.results[0].marketplace == "reverb"
+    assert result.results[0].new_count == 1
+    assert result.results[0].rejected_count == 1
+    assert len(provider.sent) == 1
+    assert provider.sent[0].external_listing_id == "rel-1"
+
+    # The irrelevant listing was never persisted as discovered either -
+    # relevance filtering happens before duplicate detection, not after.
+    from marketplace_alert.core.persistence.models import DiscoveredListing
+
+    assert (
+        db_session.query(DiscoveredListing)
+        .filter_by(marketplace="reverb", external_listing_id="irrel-1")
+        .first()
+        is None
+    )
+    assert (
+        db_session.query(DiscoveredListing)
+        .filter_by(marketplace="reverb", external_listing_id="rel-1")
+        .first()
+        is not None
+    )

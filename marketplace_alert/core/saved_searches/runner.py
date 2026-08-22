@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from marketplace_alert.core.connectors.base import MarketplaceConnector, MarketplaceConnectorError
 from marketplace_alert.core.notifications.service import NotificationService
 from marketplace_alert.core.persistence.service import ListingDiscoveryService
+from marketplace_alert.core.relevance import filter_relevant_listings
 from marketplace_alert.core.saved_searches.models import SavedSearch
 from marketplace_alert.core.saved_searches.repository import SavedSearchRepository
 
@@ -38,12 +39,22 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class MarketplaceRunResult:
-    """One marketplace's outcome from a single saved-search run."""
+    """One marketplace's outcome from a single saved-search run.
+
+    `new_count`/`already_seen_count` reflect listings *after* relevance
+    filtering (see `core/relevance/`) - a listing the connector returned
+    but relevance filtering rejected is never counted as new or already
+    seen. `raw_count`/`rejected_count` are optional extra visibility into
+    how many results the connector actually returned and how many of
+    those were filtered out as irrelevant.
+    """
 
     marketplace: str
     new_count: int = 0
     already_seen_count: int = 0
     error: str | None = None
+    raw_count: int = 0
+    rejected_count: int = 0
 
 
 @dataclass
@@ -110,20 +121,31 @@ class SavedSearchRunner:
             )
             return MarketplaceRunResult(marketplace=marketplace, error="An unexpected error occurred")
 
-        discovery_result = ListingDiscoveryService(session).process_listings(listings)
+        filter_result = filter_relevant_listings(
+            query=saved_search.query,
+            listings=listings,
+            marketplace=marketplace,
+            saved_search_id=saved_search.id,
+        )
+
+        discovery_result = ListingDiscoveryService(session).process_listings(filter_result.relevant_listings)
         self._notification_service.notify_new_listings(discovery_result.new_listings)
 
         logger.info(
-            "Saved search %s / %s: %d new, %d already seen",
+            "Saved search %s / %s: %d new, %d already seen (%d raw, %d rejected as not relevant)",
             saved_search.id,
             marketplace,
             len(discovery_result.new_listings),
             discovery_result.already_seen_count,
+            filter_result.raw_count,
+            filter_result.rejected_count,
         )
         return MarketplaceRunResult(
             marketplace=marketplace,
             new_count=len(discovery_result.new_listings),
             already_seen_count=discovery_result.already_seen_count,
+            raw_count=filter_result.raw_count,
+            rejected_count=filter_result.rejected_count,
         )
 
     def run_by_id(self, session: Session, saved_search_id: int) -> SavedSearchRunResult | None:

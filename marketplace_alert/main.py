@@ -22,8 +22,8 @@ from marketplace_alert.api.v1 import router as api_v1_router
 from marketplace_alert.config import settings
 from marketplace_alert.connectors.mock.connector import MockMarketplaceConnector
 from marketplace_alert.connectors.registry import (
+    display_name_for,
     get_connector,
-    is_marketplace_supported,
     list_supported_marketplaces,
 )
 from marketplace_alert.core.logging_config import configure_logging
@@ -31,6 +31,7 @@ from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.notifications.service import NotificationService
 from marketplace_alert.core.persistence.database import SessionLocal, engine, get_db_session, init_db
 from marketplace_alert.core.persistence.service import ListingDiscoveryService
+from marketplace_alert.core.relevance import filter_relevant_listings
 from marketplace_alert.core.saved_searches.migration import migrate_legacy_marketplace_column
 from marketplace_alert.core.saved_searches.repository import SavedSearchRepository
 from marketplace_alert.core.saved_searches.runner import SavedSearchRunner
@@ -186,8 +187,23 @@ def dashboard(
         for s in saved_search_rows
     ]
     marketplaces = list_supported_marketplaces()
-    etsy_configured = is_marketplace_supported("etsy") and get_connector("etsy").is_configured
-    ebay_configured = is_marketplace_supported("ebay") and get_connector("ebay").is_configured
+    # One entry per registered connector, driven entirely by the registry -
+    # never hard-code a marketplace's name here (see
+    # `api/v1/marketplaces.py`, which the mobile client uses the same way,
+    # and ARCHITECTURE.md "The connector interface"). Adding a marketplace
+    # to the registry is enough for it to show up here automatically.
+    marketplace_status = [
+        {
+            "name": name,
+            "display_name": display_name_for(name),
+            # Not every connector has a credentials concept (mock has
+            # nothing to configure) - default to True rather than
+            # assuming every connector defines is_configured, same
+            # fallback `api/v1/marketplaces.py` uses.
+            "configured": getattr(get_connector(name), "is_configured", True),
+        }
+        for name in marketplaces
+    ]
 
     context = {
         "app_name": settings.app_name,
@@ -198,8 +214,7 @@ def dashboard(
         "status": {
             "backend_running": True,
             "telegram_configured": notification_service.is_enabled,
-            "etsy_configured": etsy_configured,
-            "ebay_configured": ebay_configured,
+            "marketplace_status": marketplace_status,
             "active_saved_search_count": sum(1 for s in saved_search_rows if s.is_active),
             "marketplace_count": len(marketplaces),
         },
@@ -231,6 +246,8 @@ class ScanResult(BaseModel):
     new_listings: list[Listing]
     new_count: int
     already_seen_count: int
+    raw_count: int = 0
+    rejected_count: int = 0
 
 
 @app.get("/scan")
@@ -245,16 +262,22 @@ def scan(
     the ones that are new since the last scan. Running the same query
     again immediately should return no new listings. A Telegram alert is
     sent for each new listing (never for already-seen ones); a failure to
-    notify never fails the scan itself.
+    notify never fails the scan itself. Results are filtered for
+    relevance (see `core/relevance/`) before duplicate detection, so an
+    irrelevant listing is never persisted, counted, or notified about -
+    the same shared filtering path saved searches use.
     """
     listings = _mock_connector.search(q)
-    result = ListingDiscoveryService(session).process_listings(listings)
+    filter_result = filter_relevant_listings(query=q, listings=listings, marketplace="mock")
+    result = ListingDiscoveryService(session).process_listings(filter_result.relevant_listings)
     notification_service.notify_new_listings(result.new_listings)
     return ScanResult(
         query=q,
         new_listings=result.new_listings,
         new_count=len(result.new_listings),
         already_seen_count=result.already_seen_count,
+        raw_count=filter_result.raw_count,
+        rejected_count=filter_result.rejected_count,
     )
 
 
@@ -341,6 +364,8 @@ def run_saved_search_now(
                 new_count=r.new_count,
                 already_seen_count=r.already_seen_count,
                 error=r.error,
+                raw_count=r.raw_count,
+                rejected_count=r.rejected_count,
             )
             for r in result.results
         ],

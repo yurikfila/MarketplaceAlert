@@ -531,10 +531,156 @@ marketplace connector yet.
       endpoint's signature later without restructuring anything. No
       placeholder/no-op auth check and no fabricated user id were added
       now - see "Things that have NOT yet been implemented".
+15. **Relevance filtering (`marketplace_alert/core/relevance/`) was added
+    because keyword matching alone was letting through results nobody
+    wanted.** Real mobile testing surfaced the trigger case: a "Makita
+    drill" saved search returned Etsy listings for DeWalt/Milwaukee
+    battery holders and generic tool organizers - each a legitimate
+    keyword hit, none of them what anyone searching "Makita drill" wants.
+    - **Deterministic, rule-based, dependency-free - no LLM/embeddings/
+      vector database, as explicitly required.** A transparent 0-100
+      score built from four independently-checked signals: a required
+      brand's *conflicting* competing brand rejects outright; a matching
+      or brand-neutral listing is not penalized; the query's core product
+      terms are checked against a small configurable product-family
+      synonym table (`families.py` - e.g. "hammer drill"/"cordless
+      drill" score as strong drill matches, "impact driver" as a lower-
+      scored related one); and an accessory-only listing (holder, mount,
+      case, ...) is penalized *unless the query itself asked for that
+      accessory* ("Makita battery holder" must still return battery
+      holders). See `ARCHITECTURE.md` "Relevance filtering" for the full
+      scoring table and every named test scenario's outcome.
+    - **The brand vocabulary is a registry, not a hard-coded four-brand
+      list.** `brands.register_brand(canonical, aliases=[...])` is the
+      one extension point; the default catalog (Makita, Bosch, DeWalt,
+      Milwaukee, and a dozen more common power-tool brands) is just what
+      gets registered at import time, not special-cased architecture.
+      Same pattern for product families (`families.py`) and accessory
+      terms (`accessories.py`).
+    - **One shared entrypoint, not four copies of the same logic.**
+      `filter_relevant_listings()` (`core/relevance/service.py`) is
+      called from exactly two places in application code -
+      `SavedSearchRunner._run_one_marketplace()` and `main.py`'s legacy
+      `/scan` route - which between them cover all four ways a scan can
+      run (the background scheduler and both the legacy and mobile Run
+      Now endpoints all go through the same `SavedSearchRunner`, proven
+      by `tests/test_relevance.py`'s integration tests hitting each entry
+      point independently). Filtering happens *before*
+      `ListingDiscoveryService.process_listings()`, so a rejected listing
+      is never persisted, never marked "already seen", and never
+      notified about - only ever logged, once, at INFO level, with the
+      saved search id, query, marketplace, external listing id, score,
+      and rejection reason (never a secret, never the full listing body).
+    - **`/search` was deliberately left unfiltered.** It's stateless (no
+      persistence, no notification - see decision above on `/scan` vs
+      `/search`), so it isn't one of the four paths this task named, and
+      filtering a raw exploratory-search endpoint would just be
+      surprising.
+    - **Counts are post-filter, with pre-filter visibility added
+      additively.** `MarketplaceRunResult.new_count`/`already_seen_count`
+      (and the mobile/legacy schema equivalents) now reflect listings
+      *after* relevance filtering; a new optional `raw_count`/
+      `rejected_count` pair on the same result types exposes how many
+      results the connector actually returned and how many were dropped
+      - additive fields only, no existing field changed shape or meaning
+      for a client that ignores them.
+16. **Historical listing cleanup (`core/persistence/cleanup.py`,
+    `scripts/cleanup_historical_listings.py`) re-evaluates pre-existing
+    `discovered_listings` rows against the current relevance engine,
+    instead of leaving relevance filtering as forward-only.** Mobile
+    testing confirmed the relevance engine works correctly for new scans,
+    but the mobile Listings screen still showed old irrelevant listings
+    (battery holders, wrong-brand items) persisted *before* relevance
+    filtering existed.
+    - **`DiscoveredListing` has no relationship to `SavedSearch` (see
+      decision #14) - there is no stored query and no foreign key to
+      reliably determine "which saved search found this specific row."**
+      Rather than invent that relationship or guess, each row is
+      re-evaluated against every saved search **currently** targeting its
+      marketplace (active or paused) and kept if relevant to at least one
+      - the closest honest proxy available. A row whose marketplace has
+      no current saved search at all is left untouched rather than
+      deleted on a guess. In the real local database this task ran
+      against, every marketplace with listings also had at least one
+      matching saved search, so this case didn't arise in practice - but
+      the code path (and a dedicated test) exists for when it does.
+    - **A real bug in the relevance engine was found and fixed as part of
+      this work, not a hypothetical one.** Re-evaluating real historical
+      data (not synthetic test fixtures) showed a bare brand-only saved
+      search (e.g. the literal query "Makita", which two of the real
+      saved searches in this database actually use) was being treated as
+      relevant to almost anything that didn't explicitly mention a
+      *different* brand - including listings that didn't mention Makita
+      at all. Fixed so a brand-only query requires the listing to
+      actually mention that brand. This is scoped narrowly to the
+      brand-only-query case; every other scoring rule (brand conflict,
+      product-family match, accessory penalty) is unchanged. Two existing
+      scheduler tests that paired `query="Makita"` with an unrelated
+      "Pokemon Charizard" fixture (arbitrary placeholder text, not an
+      actual relevance test) were updated to use a matching query
+      ("Charizard"), consistent with how sibling tests in the same file
+      already do it.
+    - **A manual script, not automatic.** `scripts/cleanup_historical_listings.py`
+      defaults to a dry-run report and only deletes with an explicit
+      `--apply` flag; it is never invoked from app startup, the
+      scheduler, or an API endpoint - deleting persisted data is a
+      deliberate, explicit developer action, not a side effect of running
+      the app. `SavedSearch` rows are read-only inputs; nothing in this
+      path modifies or deletes a saved search.
+17. **Reverb (`marketplace_alert/connectors/reverb/`) is the third real
+    marketplace connector, added after manually verifying real API
+    access - `GET https://api.reverb.com/api/listings?query=Fender&per_page=1`
+    with a real personal access token (`public` scope only) returned a
+    real listing.** Reverb flows through the exact same duplicate-
+    detection/scheduler/relevance/notification/mobile-API/dashboard
+    pipeline every other connector does - the connector interface's claim
+    proven a third time, with zero changes needed outside
+    `connectors/registry.py` and `connectors/reverb/`.
+    - **Auth is a single static personal access token
+      (`REVERB_API_TOKEN`), not a client id/secret pair or OAuth flow** -
+      simpler than eBay's `EbayTokenManager`, since there's no token to
+      refresh: a 401/403 just means the token is missing, wrong, or
+      revoked, reported as a clear error. Missing entirely -> `search()`
+      raises before any request; app startup, and every other connector,
+      is completely unaffected.
+    - **Reverb's own published API docs don't include a complete example
+      listing object**, unlike Etsy's/eBay's fully-documented schemas.
+      Extensive research (Reverb's official docs, the developer's own
+      verified request, and a real third-party Reverb API client's source
+      code) confirmed the load-bearing facts with high confidence (auth
+      headers, the `listings`/`_links.next`/`_links.prev` response shape,
+      `_links.web.href` for the listing URL, `photos` as the image key) -
+      but the exact nesting of `price`/`condition`/`shop`/`photos` entries
+      is inferred, not independently confirmed. `normalize_listing` is
+      written defensively as a direct result: every optional field tries
+      its most likely shape, then a reasonable fallback or two, and lands
+      on `null` - never invented data - if nothing matches. See
+      `connector.py`'s module docstring for the full citation list and an
+      honest accounting of what's confirmed vs. inferred.
+    - **This connector paginates - Etsy/eBay still don't.** Reverb's API
+      is HATEOAS/HAL and explicitly documents "follow `_links`, never
+      construct your own URLs" as its design principle, so
+      `ReverbMarketplaceConnector` follows `_links.next.href` verbatim
+      until it has enough results, there's no next link, or a hard
+      `MAX_PAGES` safety cap (5) is hit - never unbounded polling for one
+      search.
+    - **Adding Reverb surfaced (and fixed) a small pre-existing
+      duplication**: the dashboard's system-status panel used to
+      hard-code one row each for "Etsy configured?"/"eBay configured?" -
+      adding a third hard-coded "Reverb configured?" row would have
+      repeated the exact "don't hard-code a marketplace in multiple UIs"
+      mistake this project otherwise avoids for the marketplace list
+      itself. Generalized instead: the status panel now loops over the
+      registry's marketplace list the same way the checkboxes already
+      did, and a new `display_name_for()` in `connectors/registry.py` is
+      the one place a marketplace's brand-cased display name (e.g.
+      "eBay") is defined, used by both the dashboard and
+      `GET /api/v1/marketplaces` - see ARCHITECTURE.md "Why these
+      choices."
 
 ## Things that have NOT yet been implemented
 
-- Any marketplace beyond mock/Etsy/eBay (Vinted, Yad2, Facebook
+- Any marketplace beyond mock/Etsy/eBay/Reverb (Vinted, Yad2, Facebook
   Marketplace, Mercari, etc.).
 - Etsy pagination beyond the first page — `EtsyMarketplaceConnector`
   fetches one page (a safe, configurable `etsy_result_limit`, default 25,
@@ -543,6 +689,9 @@ marketplace connector yet.
   request/response handling (see `_fetch_results_page`'s `offset` param).
   `EbayMarketplaceConnector` fetches one page the same way (`ebay_result_limit`,
   default 25, eBay's own max 200) - same structure, same reasoning.
+  `ReverbMarketplaceConnector` is the one exception - it *does* paginate
+  (via `_links.next`), bounded by `reverb_result_limit` and a hard
+  `MAX_PAGES` safety cap - see `ARCHITECTURE.md` "The Reverb connector".
 - Etsy `location`/`seller`/`condition` on normalized listings — left `null`
   rather than guessed; Etsy's shop-location and shop-name fields would need
   an `includes=Shop` request and schema verification not yet done (Etsy has
@@ -550,13 +699,21 @@ marketplace connector yet.
   marketplace, not general resale). eBay's connector *does* map
   `location`/`seller`/`condition` where the Browse API actually returns
   them - see `ARCHITECTURE.md`.
-- A live eBay search has not been run as part of adding the connector
-  (deliberately, per scope for that task) - only mocked-HTTP tests, plus a
-  dashboard-only smoke check confirming `EBAY_APP_ID`/`EBAY_CERT_ID` are
-  recognized as configured. The developer had already manually verified the
-  real OAuth token request and a real Browse API search both return HTTP
-  200 in production before this connector was written, but this codebase
-  has not yet issued that request itself.
+- Reverb `location` on normalized listings — left `null` unless a
+  plausible `shop.location`/top-level `location` field happens to be
+  present; Reverb's public docs don't confirm a location field for a
+  listing at all, so this was never guessed at with false confidence -
+  see decision #17 and `ARCHITECTURE.md` "The Reverb connector".
+- A live eBay or Reverb search has not been run as part of adding either
+  connector (deliberately, per scope for those tasks) - only mocked-HTTP
+  tests, plus a dashboard-only smoke check confirming credentials are
+  recognized as configured. For eBay, the developer had already manually
+  verified the real OAuth token request and a real Browse API search both
+  return HTTP 200 in production before that connector was written. For
+  Reverb, the developer had already manually verified a real
+  `GET /api/listings?query=Fender&per_page=1` request (with a real
+  personal access token) returns a real listing - but this codebase has
+  not yet issued either request itself.
 - Schema migrations (Alembic or similar) — the current schema is simple
   enough that `Base.metadata.create_all()` is sufficient for now.
 - Alerting beyond Telegram (email, push, webhook, etc.) — the
@@ -567,8 +724,8 @@ marketplace connector yet.
 - `vinted` (and other future marketplace names) selectable in saved
   searches — recognized as future connector names conceptually, but
   `is_marketplace_supported` (and therefore saved-search creation/editing)
-  only accepts `"mock"`, `"etsy"`, and `"ebay"` until each has a registered
-  connector.
+  only accepts `"mock"`, `"etsy"`, `"ebay"`, and `"reverb"` until each has
+  a registered connector.
 - User accounts, auth, or multi-user support — including on the new
   dashboard, which is unauthenticated by design for now (local MVP only;
   do not expose this outside localhost as-is).
@@ -618,6 +775,38 @@ marketplace connector yet.
   see "Important architectural decisions" below and `ARCHITECTURE.md`),
   not for the marketplace connectors, which is a different, not-yet-done
   piece of work.
+- **Relevance filtering's product-family/accessory vocabulary only covers
+  power tools today.** `families.py` registers one family ("drill");
+  `accessories.py` registers common accessory *words* (holder, mount,
+  case, organizer, ...) that are domain-general enough to apply outside
+  tools, but there's no "impact driver"-style related-product mapping for
+  any category besides drills yet. A query for an unregistered product
+  category (say, a specific watch model) falls back to lenient token-
+  overlap scoring rather than family-aware scoring - see `ARCHITECTURE.md`
+  "Relevance filtering" for exactly what that fallback does and why it's
+  deliberately lenient, not stricter.
+- **Relevance filtering runs per-listing with no cross-listing context or
+  per-user feedback loop.** There's no mechanism yet for a user to mark a
+  specific rejection as wrong (or a specific acceptance as unwanted) and
+  have that adjust future scoring - every evaluation is a pure function of
+  (query, listing) against the shared static vocabulary.
+- **Historical relevance cleanup is manual, not automatic or scheduled.**
+  `scripts/cleanup_historical_listings.py` (see decision #16) has to be
+  run explicitly by a developer; nothing re-evaluates old
+  `discovered_listings` rows on its own after a future relevance-engine
+  change (e.g. adding a new product family or brand) - the same script
+  can be re-run any time to pick up a new set of rules, but there's no
+  mechanism that reminds anyone to do so or does it for them.
+- **Historical cleanup's row-marketplace-to-saved-search matching is a
+  proxy, not a certainty.** Because `DiscoveredListing` doesn't record
+  which saved search found it (decision #14), "relevant to at least one
+  saved search currently targeting this marketplace" is the closest
+  available approximation - if two saved searches target the same
+  marketplace with very different queries, a row could be kept because it
+  satisfies one of them even though it was actually discovered by (and is
+  irrelevant to) the other. This can only ever make cleanup more
+  conservative (keep something that arguably should go), never remove
+  something that's still wanted by an existing saved search.
 
 ## How to keep this file useful
 

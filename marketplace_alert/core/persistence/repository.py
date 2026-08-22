@@ -72,3 +72,18 @@ class ListingRepository:
         if marketplace is not None:
             stmt = stmt.where(DiscoveredListing.marketplace == marketplace)
         return self._session.execute(stmt).scalar_one()
+
+    def list_all(self) -> list[DiscoveredListing]:
+        """Every discovered listing, unpaginated - for maintenance operations
+        that need to inspect every row (e.g. `core/persistence/cleanup.py`'s
+        historical relevance re-evaluation). Never for a normal request
+        path - see `list_recent` for the paginated version those use."""
+        stmt = select(DiscoveredListing).order_by(DiscoveredListing.id)
+        return list(self._session.execute(stmt).scalars().all())
+
+    def delete(self, row: DiscoveredListing) -> None:
+        """Remove one discovered listing row. Used only by maintenance
+        operations (e.g. historical relevance cleanup) - the normal scan/
+        dedup path (`ListingDiscoveryService`) only ever adds or touches
+        rows, never deletes one."""
+        self._session.delete(row)

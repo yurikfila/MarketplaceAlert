@@ -3,25 +3,18 @@
 Every marketplace listed comes from the connector registry
 (`list_supported_marketplaces()`) - never a separately hard-coded list,
 the same rule the dashboard's marketplace checkboxes already follow (see
-ARCHITECTURE.md "The connector interface").
+ARCHITECTURE.md "The connector interface"). Display names come from the
+same registry too (`display_name_for()`), so a brand's proper casing
+(e.g. "eBay") is defined once, not duplicated between this route and the
+dashboard.
 """
 
 from fastapi import APIRouter
 
 from marketplace_alert.api.v1.schemas import MarketplaceInfo
-from marketplace_alert.connectors.registry import get_connector, list_supported_marketplaces
+from marketplace_alert.connectors.registry import display_name_for, get_connector, list_supported_marketplaces
 
 router = APIRouter(tags=["Mobile API - Marketplaces"])
-
-# Cosmetic display names only, for known ids - purely presentational and
-# does NOT decide which marketplaces exist or are supported (that's
-# entirely list_supported_marketplaces(), below). A marketplace with no
-# entry here still appears, just title-cased instead of brand-cased.
-_DISPLAY_NAMES: dict[str, str] = {
-    "ebay": "eBay",
-    "etsy": "Etsy",
-    "mock": "Mock",
-}
 
 
 @router.get(
@@ -43,7 +36,7 @@ def list_marketplaces() -> list[MarketplaceInfo]:
         infos.append(
             MarketplaceInfo(
                 id=marketplace_id,
-                name=_DISPLAY_NAMES.get(marketplace_id, marketplace_id.title()),
+                name=display_name_for(marketplace_id),
                 # Not every connector has a credentials concept (mock has
                 # nothing to configure) - default to True rather than
                 # assuming every connector defines is_configured.

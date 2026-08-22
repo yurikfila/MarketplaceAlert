@@ -116,12 +116,20 @@ class SavedSearchRead(BaseModel):
 
 
 class MarketplaceRunResult(BaseModel):
-    """One marketplace's outcome from a single saved-search run."""
+    """One marketplace's outcome from a single saved-search run.
+
+    `new_count`/`already_seen_count` are post relevance-filtering (see
+    `core/relevance/`); `raw_count`/`rejected_count` optionally expose how
+    many results the connector returned before filtering and how many of
+    those were dropped as not relevant.
+    """
 
     marketplace: str
     new_count: int
     already_seen_count: int
     error: str | None = None
+    raw_count: int = 0
+    rejected_count: int = 0
 
 
 class SavedSearchRunResponse(BaseModel):

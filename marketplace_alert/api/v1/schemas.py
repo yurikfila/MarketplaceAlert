@@ -66,11 +66,19 @@ class MarketplaceInfo(BaseModel):
 
 
 class MarketplaceRunOutcome(BaseModel):
-    """One marketplace's outcome within a mobile-shaped run response."""
+    """One marketplace's outcome within a mobile-shaped run response.
+
+    `new_count`/`already_seen_count` are post relevance-filtering (see
+    `core/relevance/`); `raw_count`/`rejected_count` optionally expose how
+    many results the connector returned before filtering and how many of
+    those were dropped as not relevant.
+    """
 
     new_count: int
     already_seen_count: int
     error: str | None = None
+    raw_count: int = 0
+    rejected_count: int = 0
 
 
 class SavedSearchRunResult(BaseModel):

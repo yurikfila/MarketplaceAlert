@@ -122,18 +122,14 @@
                         {{ 'Configured' if status.telegram_configured else 'Not configured' }}
                     </span>
                 </li>
+                {% for m in status.marketplace_status %}
                 <li>
-                    <span>Etsy</span>
-                    <span class="badge {{ 'badge-on' if status.etsy_configured else 'badge-off' }}">
-                        {{ 'Configured' if status.etsy_configured else 'Not configured' }}
+                    <span>{{ m.display_name }}</span>
+                    <span class="badge {{ 'badge-on' if m.configured else 'badge-off' }}">
+                        {{ 'Configured' if m.configured else 'Not configured' }}
                     </span>
                 </li>
-                <li>
-                    <span>eBay</span>
-                    <span class="badge {{ 'badge-on' if status.ebay_configured else 'badge-off' }}">
-                        {{ 'Configured' if status.ebay_configured else 'Not configured' }}
-                    </span>
-                </li>
+                {% endfor %}
                 <li>
                     <span>Active saved searches</span>
                     <span class="badge badge-neutral">{{ status.active_saved_search_count }}</span>

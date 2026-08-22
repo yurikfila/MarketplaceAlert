@@ -18,11 +18,34 @@ from marketplace_alert.config import settings
 from marketplace_alert.connectors.ebay.connector import EbayMarketplaceConnector
 from marketplace_alert.connectors.etsy.connector import EtsyMarketplaceConnector
 from marketplace_alert.connectors.mock.connector import MockMarketplaceConnector
+from marketplace_alert.connectors.reverb.connector import ReverbMarketplaceConnector
 from marketplace_alert.core.connectors.base import MarketplaceConnector
 
 
 class UnsupportedMarketplaceError(ValueError):
     """Raised when a marketplace name has no registered connector."""
+
+
+# Cosmetic display names only, for known ids - purely presentational and
+# does NOT decide which marketplaces exist or are supported (that's
+# entirely `_CONNECTOR_FACTORIES`/`list_supported_marketplaces()` below).
+# A marketplace with no entry here still appears wherever this is used,
+# just title-cased instead of brand-cased. The one place this mapping is
+# defined - both the dashboard (`main.py`) and the mobile API
+# (`api/v1/marketplaces.py`) call `display_name_for()` rather than each
+# keeping their own copy, so a brand name is never hard-coded in more
+# than one UI.
+_DISPLAY_NAMES: dict[str, str] = {
+    "ebay": "eBay",
+    "etsy": "Etsy",
+    "mock": "Mock",
+    "reverb": "Reverb",
+}
+
+
+def display_name_for(marketplace_name: str) -> str:
+    """The presentational name for a marketplace id, e.g. "ebay" -> "eBay"."""
+    return _DISPLAY_NAMES.get(marketplace_name, marketplace_name.title())
 
 
 # Each entry is a zero-arg callable returning a connector instance, not
@@ -39,6 +62,10 @@ _CONNECTOR_FACTORIES: dict[str, Callable[[], MarketplaceConnector]] = {
         app_id=settings.ebay_app_id,
         cert_id=settings.ebay_cert_id,
         result_limit=settings.ebay_result_limit,
+    ),
+    "reverb": lambda: ReverbMarketplaceConnector(
+        api_token=settings.reverb_api_token,
+        result_limit=settings.reverb_result_limit,
     ),
 }
 

@@ -200,6 +200,31 @@ def test_dashboard_shows_ebay_not_configured_when_credentials_missing(
     assert "Not configured" in ebay_section
 
 
+def test_dashboard_status_panel_includes_reverb(client) -> None:
+    """Requirement: Reverb must appear in the dashboard's system-status
+    panel automatically through the registry-driven marketplace list -
+    never a separately hard-coded entry."""
+    status_section = _status_section(client.get("/").text)
+    assert "Reverb" in status_section
+
+
+def test_dashboard_shows_reverb_configured_when_token_present(client, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "reverb_api_token", "test-reverb-token")
+
+    status_section = _status_section(client.get("/").text)
+    reverb_section = status_section.split("Reverb", 1)[1][:200]
+    assert "Configured" in reverb_section
+    assert "Not configured" not in reverb_section
+
+
+def test_dashboard_shows_reverb_not_configured_when_token_missing(client, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "reverb_api_token", None)
+
+    status_section = _status_section(client.get("/").text)
+    reverb_section = status_section.split("Reverb", 1)[1][:200]
+    assert "Not configured" in reverb_section
+
+
 def test_dashboard_escapes_query_to_prevent_xss(client) -> None:
     _create_saved_search(client, query="<script>alert(1)</script>")
 
@@ -209,7 +234,9 @@ def test_dashboard_escapes_query_to_prevent_xss(client) -> None:
     assert "&lt;script&gt;" in body
 
 
-def test_dashboard_never_exposes_credential_values(client) -> None:
+def test_dashboard_never_exposes_credential_values(client, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "reverb_api_token", "super-secret-reverb-token")
+
     response = client.get("/")
     body = response.text
 
@@ -222,6 +249,7 @@ def test_dashboard_never_exposes_credential_values(client) -> None:
             settings.telegram_chat_id,
             settings.ebay_app_id,
             settings.ebay_cert_id,
+            settings.reverb_api_token,
         ]
     )
     assert leaked is False
@@ -237,6 +265,7 @@ def test_dashboard_never_mentions_credential_field_names(client) -> None:
         "EBAY_APP_ID",
         "EBAY_CERT_ID",
         "EBAY_DEV_ID",
+        "REVERB_API_TOKEN",
     ]:
         assert forbidden not in body
 

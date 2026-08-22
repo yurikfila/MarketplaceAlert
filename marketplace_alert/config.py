@@ -70,6 +70,20 @@ class Settings(BaseSettings):
     # 200; this connector fetches one page, not all of them, for now).
     ebay_result_limit: int = 25
 
+    # Reverb API v3 (musical instruments/gear marketplace) - a single
+    # static personal access token (Authorization: Bearer <token>), not a
+    # client id/secret pair or OAuth flow. Optional - if unset, the
+    # Reverb connector reports a clear configuration error when actually
+    # used, but the app still starts normally and other connectors are
+    # unaffected. Never hard-code a real value here.
+    reverb_api_token: str | None = None
+
+    # Safe, configurable result limit for Reverb searches - unlike Etsy/
+    # eBay, this connector does paginate (via Reverb's own `_links.next`),
+    # bounded by both this limit and an internal max-pages safety cap
+    # (see connectors/reverb/connector.py).
+    reverb_result_limit: int = 25
+
     # CORS for future web/dev tooling (Phase 9 mobile-API prep). Native
     # mobile apps don't need browser CORS at all - this exists only in
     # case future web-based tooling (e.g. an Expo/React Native web

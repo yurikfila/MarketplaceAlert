@@ -148,7 +148,11 @@ def run_saved_search_now(
 
     marketplaces = {
         r.marketplace: MarketplaceRunOutcome(
-            new_count=r.new_count, already_seen_count=r.already_seen_count, error=r.error
+            new_count=r.new_count,
+            already_seen_count=r.already_seen_count,
+            error=r.error,
+            raw_count=r.raw_count,
+            rejected_count=r.rejected_count,
         )
         for r in result.results
     }

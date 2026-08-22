@@ -1,0 +1,100 @@
+/**
+ * TypeScript types mirroring the backend's `/api/v1` Pydantic schemas
+ * (marketplace_alert/api/v1/schemas.py) exactly - field names and
+ * optionality kept in sync by hand, since the two codebases don't share a
+ * schema generator (yet). Timestamps are ISO 8601 strings (as sent over
+ * JSON), not `Date` objects - format them for display with
+ * src/utils/format.ts rather than parsing at the API layer.
+ */
+
+export interface MobileStatus {
+  status: string;
+  backend: boolean;
+  database: boolean;
+  telegram_configured: boolean;
+  supported_marketplaces: string[];
+}
+
+export interface MarketplaceInfo {
+  id: string;
+  name: string;
+  configured: boolean;
+  available: boolean;
+}
+
+export interface SavedSearch {
+  id: number;
+  query: string;
+  marketplaces: string[];
+  is_active: boolean;
+  scan_interval_seconds: number;
+  created_at: string;
+  updated_at: string;
+  last_scanned_at: string | null;
+}
+
+/** POST /api/v1/saved-searches body. */
+export interface SavedSearchCreateInput {
+  query: string;
+  marketplaces: string[];
+  scan_interval_seconds: number;
+  is_active: boolean;
+}
+
+/** PATCH /api/v1/saved-searches/{id} body - only send fields you want changed. */
+export interface SavedSearchUpdateInput {
+  query?: string;
+  marketplaces?: string[];
+  scan_interval_seconds?: number;
+  is_active?: boolean;
+}
+
+export interface MarketplaceRunOutcome {
+  new_count: number;
+  already_seen_count: number;
+  error: string | null;
+}
+
+/** POST /api/v1/saved-searches/{id}/run response. */
+export interface SavedSearchRunResult {
+  saved_search_id: number;
+  query: string;
+  marketplaces: Record<string, MarketplaceRunOutcome>;
+  total_new_count: number;
+  total_already_seen_count: number;
+}
+
+/**
+ * One row from GET /api/v1/listings. `price`/`currency`/`location`/
+ * `condition`/`image_url` are currently always `null` - the backend does
+ * not persist them yet (see mobile/README.md "Current limitations" and
+ * the backend's own ARCHITECTURE.md "Mobile API"). Never invent values
+ * for these in the UI - render them only when actually present.
+ */
+export interface Listing {
+  id: number;
+  marketplace: string;
+  external_listing_id: string;
+  title: string;
+  price: number | null;
+  currency: string | null;
+  location: string | null;
+  condition: string | null;
+  listing_url: string;
+  image_url: string | null;
+  first_discovered_at: string;
+  last_seen_at: string;
+}
+
+export interface ListingListResponse {
+  items: Listing[];
+  limit: number;
+  offset: number;
+  total_count: number;
+}
+
+export interface ListListingsParams {
+  limit?: number;
+  offset?: number;
+  marketplace?: string;
+}

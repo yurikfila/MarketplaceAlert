@@ -86,13 +86,16 @@ def test_marketplaces_display_names_use_brand_casing(client) -> None:
     assert body["etsy"] == "Etsy"
     assert body["mock"] == "Mock"
     assert body["reverb"] == "Reverb"
+    assert body["bonanza"] == "Bonanza"
 
 
-def test_marketplaces_includes_reverb(client) -> None:
-    """Requirement: Reverb must appear here automatically through the
-    connector registry - never a separately hard-coded entry for it."""
+def test_marketplaces_includes_reverb_and_bonanza(client) -> None:
+    """Requirement: every new connector must appear here automatically
+    through the connector registry - never a separately hard-coded entry."""
     body = client.get("/api/v1/marketplaces").json()
-    assert any(item["id"] == "reverb" for item in body)
+    ids = {item["id"] for item in body}
+    assert "reverb" in ids
+    assert "bonanza" in ids
 
 
 def test_marketplaces_reflect_credential_configuration(client, monkeypatch) -> None:
@@ -101,6 +104,7 @@ def test_marketplaces_reflect_credential_configuration(client, monkeypatch) -> N
     monkeypatch.setattr(settings, "ebay_app_id", None)
     monkeypatch.setattr(settings, "ebay_cert_id", None)
     monkeypatch.setattr(settings, "reverb_api_token", None)
+    monkeypatch.setattr(settings, "bonanza_dev_name", None)
 
     body = {item["id"]: item for item in client.get("/api/v1/marketplaces").json()}
 
@@ -110,6 +114,8 @@ def test_marketplaces_reflect_credential_configuration(client, monkeypatch) -> N
     assert body["ebay"]["available"] is False
     assert body["reverb"]["configured"] is False
     assert body["reverb"]["available"] is False
+    assert body["bonanza"]["configured"] is False
+    assert body["bonanza"]["available"] is False
     # mock has nothing to configure - always both true.
     assert body["mock"]["configured"] is True
     assert body["mock"]["available"] is True
@@ -124,15 +130,26 @@ def test_marketplaces_reflect_reverb_token_present(client, monkeypatch) -> None:
     assert body["reverb"]["available"] is True
 
 
+def test_marketplaces_reflect_bonanza_dev_name_present(client, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "bonanza_dev_name", "test-bonanza-dev-name")
+
+    body = {item["id"]: item for item in client.get("/api/v1/marketplaces").json()}
+
+    assert body["bonanza"]["configured"] is True
+    assert body["bonanza"]["available"] is True
+
+
 def test_marketplaces_never_exposes_secrets(client, monkeypatch) -> None:
     monkeypatch.setattr(settings, "etsy_api_key", "super-secret-etsy-key")
     monkeypatch.setattr(settings, "ebay_app_id", "super-secret-ebay-app-id")
     monkeypatch.setattr(settings, "reverb_api_token", "super-secret-reverb-token")
+    monkeypatch.setattr(settings, "bonanza_dev_name", "super-secret-bonanza-dev-name")
 
     response = client.get("/api/v1/marketplaces")
     assert "super-secret-etsy-key" not in response.text
     assert "super-secret-ebay-app-id" not in response.text
     assert "super-secret-reverb-token" not in response.text
+    assert "super-secret-bonanza-dev-name" not in response.text
 
 
 # --- saved searches: create / list / get / update / delete -----------------

@@ -677,11 +677,91 @@ marketplace connector yet.
       "eBay") is defined, used by both the dashboard and
       `GET /api/v1/marketplaces` - see ARCHITECTURE.md "Why these
       choices."
+18. **A broad marketplace-expansion pass evaluated nine named candidates
+    (Craigslist, OfferUp, Gumtree, Kleinanzeigen, OLX, Vinted, Discogs,
+    Mercado Libre, Facebook Marketplace) before implementing exactly one
+    of them - Bonanza (`marketplace_alert/connectors/bonanza/`) - the
+    only one with both a genuinely self-serve credential and a real
+    marketplace-wide keyword-search endpoint returning actual for-sale
+    listings.** This is the full investigation and reasoning; the same
+    material, condensed into a table, was also given directly to the
+    user as this task's final report.
+    - **Why each of the other nine wasn't implemented** (every one
+      confirmed by checking the marketplace's own current documentation,
+      not assumed from general knowledge):
+      - **Craigslist** - no read/search API at all; its only official API
+        (Bulkpost) is for posting a *seller's own* listings, not
+        searching the marketplace.
+      - **OfferUp** - no public API of any kind.
+      - **Gumtree** - no official API; only unofficial scraping services
+        exist, which this project's connectors never use (see decision #3
+        and every existing connector's own "no HTML scraping" rule).
+      - **Kleinanzeigen** - same as Gumtree: no official API, scraping-only
+        alternatives.
+      - **Vinted** - the only official API ("Vinted Pro Integrations") is
+        manually allowlisted to approved Pro seller businesses for
+        managing *their own* inventory/orders - not a general search API
+        at all, approved or not.
+      - **Discogs** - has a real, well-documented, genuinely self-serve
+        API (a personal access token from account settings, exactly like
+        Reverb's) - but its Marketplace endpoints only support browsing a
+        *known* seller's inventory (`GET /users/{username}/inventory`) or
+        looking up a *known* listing/release ID - there is no
+        marketplace-wide keyword search across sellers that returns
+        for-sale items, which every connector in this system needs as its
+        core capability. Documented as a genuine, specific API limitation
+        found through research, not assumed.
+      - **OLX** - requires a formal partner application with manual
+        review ("Waiting for acceptance" in their own developer portal)
+        before any credentials are issued - an external human-approval
+        step, per this task's own blocker criteria.
+      - **Mercado Libre** - requires OAuth's `authorization_code` grant
+        for every access token (a real user completing a browser
+        consent redirect) - there is no `client_credentials`/app-only
+        grant for read-only search, unlike eBay's. Building a connector
+        for this would also need new infrastructure this project doesn't
+        have yet: somewhere to persist a rotating refresh token across
+        restarts (every existing connector's credential is either fully
+        static or refreshed transparently server-side, like eBay's
+        application token - nothing here has ever needed a
+        human-in-the-loop-then-token-persists model).
+      - **Facebook Marketplace** - Meta has never published a public
+        search API for Marketplace; the only API that exists at all is a
+        restricted, partner-approval-gated *commerce* API for sellers
+        managing their own catalog, structurally unable to support
+        general buyer-side search even with approval.
+    - **Bonanza's own API was deliberately modeled on eBay's
+      (deprecated) Finding API** - literally the same `findItemsByKeywords`
+      operation name and response shape, since Bonanza was founded by
+      former eBay/Amazon engineers to make an eBay integration easy to
+      port. That's real, independent evidence for the field-mapping
+      choices, not just convenient documentation.
+    - **Not live-validated - awaiting credentials.** Unlike eBay/Etsy/
+      Reverb, no real `BONANZA_DEV_NAME` was available while building
+      this connector. It's fully implemented and tested against mocked
+      HTTP responses (`tests/test_bonanza_connector.py`), following this
+      task's own explicit instruction for exactly this situation:
+      registering a free developer account at
+      `https://api.bonanza.com/accounts/new` is the one remaining human
+      action before this connector can be verified against production
+      Bonanza.
 
 ## Things that have NOT yet been implemented
 
-- Any marketplace beyond mock/Etsy/eBay/Reverb (Vinted, Yad2, Facebook
-  Marketplace, Mercari, etc.).
+- Any marketplace beyond mock/Etsy/eBay/Reverb/Bonanza. Nine additional
+  candidates (Craigslist, OfferUp, Gumtree, Kleinanzeigen, OLX, Vinted,
+  Discogs, Mercado Libre, Facebook Marketplace) were specifically
+  evaluated and ruled out - see decision #18 for the exact reason each
+  one wasn't implemented (no API, an API that can't do marketplace-wide
+  keyword search, or a credential that needs a manual approval/human
+  OAuth step). Two of those (OLX, Mercado Libre) are realistically
+  buildable *if* someone completes the required human step - see decision
+  #18's "next required human action" for each.
+- Bonanza has not been live-validated against production - no real
+  `BONANZA_DEV_NAME` was available while building it (see decision #18).
+  Registering a free developer account at
+  `https://api.bonanza.com/accounts/new` and setting the resulting dev
+  name is the one remaining step.
 - Etsy pagination beyond the first page — `EtsyMarketplaceConnector`
   fetches one page (a safe, configurable `etsy_result_limit`, default 25,
   Etsy's own max 100) per search; multi-page looping isn't implemented yet,
@@ -704,6 +784,12 @@ marketplace connector yet.
   present; Reverb's public docs don't confirm a location field for a
   listing at all, so this was never guessed at with false confidence -
   see decision #17 and `ARCHITECTURE.md` "The Reverb connector".
+- Bonanza `condition` on normalized listings — left `null` unless a
+  `condition` field actually happens to be present; Bonanza's own
+  documentation for `findItemsByKeywords` didn't confirm whether search
+  results include a condition field at all (only that item listings
+  generally can have one) - see decision #18 and `ARCHITECTURE.md` "The
+  Bonanza connector".
 - A live eBay or Reverb search has not been run as part of adding either
   connector (deliberately, per scope for those tasks) - only mocked-HTTP
   tests, plus a dashboard-only smoke check confirming credentials are
@@ -721,11 +807,12 @@ marketplace connector yet.
   is implemented.
 - Multiple Telegram recipients / per-user chat IDs — one chat ID, from
   config, for everyone.
-- `vinted` (and other future marketplace names) selectable in saved
-  searches — recognized as future connector names conceptually, but
-  `is_marketplace_supported` (and therefore saved-search creation/editing)
-  only accepts `"mock"`, `"etsy"`, `"ebay"`, and `"reverb"` until each has
-  a registered connector.
+- `vinted`/`olx`/`mercadolibre` (and other future marketplace names)
+  selectable in saved searches — recognized as future connector names
+  conceptually, but `is_marketplace_supported` (and therefore
+  saved-search creation/editing) only accepts `"mock"`, `"etsy"`,
+  `"ebay"`, `"reverb"`, and `"bonanza"` until each has a registered
+  connector.
 - User accounts, auth, or multi-user support — including on the new
   dashboard, which is unauthenticated by design for now (local MVP only;
   do not expose this outside localhost as-is).

@@ -225,6 +225,31 @@ def test_dashboard_shows_reverb_not_configured_when_token_missing(client, monkey
     assert "Not configured" in reverb_section
 
 
+def test_dashboard_status_panel_includes_bonanza(client) -> None:
+    """Requirement: Bonanza must appear in the dashboard's system-status
+    panel automatically through the registry-driven marketplace list -
+    never a separately hard-coded entry."""
+    status_section = _status_section(client.get("/").text)
+    assert "Bonanza" in status_section
+
+
+def test_dashboard_shows_bonanza_configured_when_dev_name_present(client, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "bonanza_dev_name", "test-bonanza-dev-name")
+
+    status_section = _status_section(client.get("/").text)
+    bonanza_section = status_section.split("Bonanza", 1)[1][:200]
+    assert "Configured" in bonanza_section
+    assert "Not configured" not in bonanza_section
+
+
+def test_dashboard_shows_bonanza_not_configured_when_dev_name_missing(client, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "bonanza_dev_name", None)
+
+    status_section = _status_section(client.get("/").text)
+    bonanza_section = status_section.split("Bonanza", 1)[1][:200]
+    assert "Not configured" in bonanza_section
+
+
 def test_dashboard_escapes_query_to_prevent_xss(client) -> None:
     _create_saved_search(client, query="<script>alert(1)</script>")
 
@@ -236,6 +261,7 @@ def test_dashboard_escapes_query_to_prevent_xss(client) -> None:
 
 def test_dashboard_never_exposes_credential_values(client, monkeypatch) -> None:
     monkeypatch.setattr(settings, "reverb_api_token", "super-secret-reverb-token")
+    monkeypatch.setattr(settings, "bonanza_dev_name", "super-secret-bonanza-dev-name")
 
     response = client.get("/")
     body = response.text
@@ -250,6 +276,7 @@ def test_dashboard_never_exposes_credential_values(client, monkeypatch) -> None:
             settings.ebay_app_id,
             settings.ebay_cert_id,
             settings.reverb_api_token,
+            settings.bonanza_dev_name,
         ]
     )
     assert leaked is False
@@ -266,6 +293,7 @@ def test_dashboard_never_mentions_credential_field_names(client) -> None:
         "EBAY_CERT_ID",
         "EBAY_DEV_ID",
         "REVERB_API_TOKEN",
+        "BONANZA_DEV_NAME",
     ]:
         assert forbidden not in body
 

@@ -2,7 +2,10 @@
 
 The one place allowed to import concrete connector implementations
 (``MockMarketplaceConnector``, ``EtsyMarketplaceConnector``,
-``EbayMarketplaceConnector`` now; a real ``VintedConnector``, etc. later).
+``EbayMarketplaceConnector``, ``ReverbMarketplaceConnector``,
+``BonanzaMarketplaceConnector`` now; more later as they become
+feasible - see PROJECT_CONTEXT.md's marketplace feasibility notes for
+which other marketplaces were evaluated and why they aren't here yet).
 Everything else - the background scanner, saved-search validation, API
 routes - calls ``get_connector(name)`` / ``is_marketplace_supported(name)``
 and never imports a connector class directly (see
@@ -15,6 +18,7 @@ module). Adding a marketplace means adding one line to
 from collections.abc import Callable
 
 from marketplace_alert.config import settings
+from marketplace_alert.connectors.bonanza.connector import BonanzaMarketplaceConnector
 from marketplace_alert.connectors.ebay.connector import EbayMarketplaceConnector
 from marketplace_alert.connectors.etsy.connector import EtsyMarketplaceConnector
 from marketplace_alert.connectors.mock.connector import MockMarketplaceConnector
@@ -40,6 +44,7 @@ _DISPLAY_NAMES: dict[str, str] = {
     "etsy": "Etsy",
     "mock": "Mock",
     "reverb": "Reverb",
+    "bonanza": "Bonanza",
 }
 
 
@@ -66,6 +71,10 @@ _CONNECTOR_FACTORIES: dict[str, Callable[[], MarketplaceConnector]] = {
     "reverb": lambda: ReverbMarketplaceConnector(
         api_token=settings.reverb_api_token,
         result_limit=settings.reverb_result_limit,
+    ),
+    "bonanza": lambda: BonanzaMarketplaceConnector(
+        dev_name=settings.bonanza_dev_name,
+        result_limit=settings.bonanza_result_limit,
     ),
 }
 

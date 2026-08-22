@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
+from marketplace_alert.connectors.bonanza.connector import BonanzaMarketplaceConnector
 from marketplace_alert.connectors.ebay.connector import EbayMarketplaceConnector
 from marketplace_alert.connectors.etsy.connector import EtsyMarketplaceConnector
 from marketplace_alert.connectors.reverb.connector import ReverbMarketplaceConnector
@@ -1021,6 +1022,220 @@ def test_reverb_results_pass_through_the_relevance_engine(db_session) -> None:
     assert (
         db_session.query(DiscoveredListing)
         .filter_by(marketplace="reverb", external_listing_id="rel-1")
+        .first()
+        is not None
+    )
+
+
+# --- against a real BonanzaMarketplaceConnector (httpx mocked, no network) -
+
+
+def _bonanza_connector() -> BonanzaMarketplaceConnector:
+    return BonanzaMarketplaceConnector(dev_name="fake-bonanza-dev-name")
+
+
+def _bonanza_listings_response(*raw_listings: dict) -> dict:
+    return {"findItemsByKeywordsResponse": {"ack": "Success", "searchResult": {"item": list(raw_listings)}}}
+
+
+def _raw_bonanza_listing(item_id: str, title: str) -> dict:
+    return {
+        "itemId": item_id,
+        "title": title,
+        "viewItemURL": f"https://www.bonanza.com/listings/{item_id}",
+        "sellingStatus": {"currentPrice": {"__value__": "899.99", "@currencyId": "USD"}},
+    }
+
+
+def test_scheduler_survives_a_real_bonanza_connector_failure(
+    session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved search using the real BonanzaMarketplaceConnector (not a
+    fake) whose HTTP call fails must not stop a healthy saved search's
+    scan - same resilience guarantee already proven for Etsy/eBay/Reverb."""
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(500))
+
+    setup_session = session_factory()
+    repository = SavedSearchRepository(setup_session)
+    good = repository.create(
+        query="Charizard", marketplaces=["good"], scan_interval_seconds=60, is_active=True
+    )
+    bonanza = repository.create(
+        query="Fender Stratocaster", marketplaces=["bonanza"], scan_interval_seconds=60, is_active=True
+    )
+    setup_session.commit()
+    setup_session.close()
+
+    provider = RecordingProvider()
+
+    def resolve_connector(marketplace: str):
+        if marketplace == "good":
+            return FakeConnector([_listing()])
+        return _bonanza_connector()
+
+    runner = SavedSearchRunner(
+        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+    )
+    scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
+
+    # Must not raise, even though the real Bonanza connector's HTTP call fails.
+    scanner.run_due_searches()
+
+    assert len(provider.sent) == 1
+
+    verify_session = session_factory()
+    verify_repository = SavedSearchRepository(verify_session)
+    assert verify_repository.get(good.id).last_scanned_at is not None
+    assert verify_repository.get(bonanza.id).last_scanned_at is not None
+    verify_session.close()
+
+
+def test_other_marketplaces_still_run_if_bonanza_fails_in_the_same_saved_search(
+    session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One saved search targeting Reverb and Bonanza: Bonanza's HTTP call
+    failing must not prevent Reverb from being searched and notified."""
+
+    def fake_get(url, *args, **kwargs):
+        # Reverb's connector uses httpx.get.
+        return httpx.Response(
+            200,
+            json={
+                "listings": [
+                    {
+                        "id": 111,
+                        "title": "Fender Stratocaster",
+                        "_links": {"web": {"href": "https://reverb.com/item/111"}},
+                    }
+                ],
+                "_links": {},
+            },
+        )
+
+    def fake_post(url, *args, **kwargs):
+        # Bonanza's connector uses httpx.post - always fails.
+        return httpx.Response(500)
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    setup_session = session_factory()
+    created = SavedSearchRepository(setup_session).create(
+        query="Fender Stratocaster", marketplaces=["reverb", "bonanza"], scan_interval_seconds=60, is_active=True
+    )
+    setup_session.commit()
+    saved_search_id = created.id
+    setup_session.close()
+
+    provider = RecordingProvider()
+
+    def resolve_connector(marketplace: str):
+        if marketplace == "reverb":
+            return ReverbMarketplaceConnector(api_token="fake-reverb-token")
+        return _bonanza_connector()
+
+    runner = SavedSearchRunner(
+        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+    )
+
+    run_session = session_factory()
+    result = runner.run_by_id(run_session, saved_search_id)
+    run_session.commit()
+    run_session.close()
+
+    assert {listing.marketplace for listing in provider.sent} == {"reverb"}
+
+    by_marketplace = {r.marketplace: r for r in result.results}
+    assert by_marketplace["reverb"].new_count == 1
+    assert by_marketplace["reverb"].error is None
+    assert by_marketplace["bonanza"].new_count == 0
+    assert by_marketplace["bonanza"].error is not None
+
+
+def test_bonanza_listing_duplicate_is_not_notified_twice(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running the same saved search twice against the real Bonanza
+    connector, with the API returning the same listing both times, must
+    only notify once - identical dedup guarantee already proven for
+    Etsy/eBay/Reverb, now also for Bonanza (marketplace + external_listing_id)."""
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda *a, **k: httpx.Response(
+            200, json=_bonanza_listings_response(_raw_bonanza_listing("555", "Fender Stratocaster"))
+        ),
+    )
+
+    repository = SavedSearchRepository(db_session)
+    saved_search = repository.create(
+        query="Fender Stratocaster", marketplaces=["bonanza"], scan_interval_seconds=60, is_active=True
+    )
+    db_session.commit()
+
+    provider = RecordingProvider()
+    runner = SavedSearchRunner(
+        notification_service=NotificationService(provider), resolve_connector=lambda name: _bonanza_connector()
+    )
+
+    first = runner.run(db_session, saved_search)
+    second = runner.run(db_session, saved_search)
+
+    assert first.new_count == 1
+    assert second.new_count == 0
+    assert second.already_seen_count == 1
+    assert len(provider.sent) == 1
+
+
+def test_bonanza_results_pass_through_the_relevance_engine(db_session) -> None:
+    """A Bonanza saved search returning both a relevant and an irrelevant
+    listing must persist/notify only the relevant one - proves relevance
+    filtering is applied to Bonanza results via the shared runner path,
+    not something BonanzaMarketplaceConnector itself would need to do."""
+    repository = SavedSearchRepository(db_session)
+    saved_search = repository.create(
+        query="Makita drill", marketplaces=["bonanza"], scan_interval_seconds=60, is_active=True
+    )
+    db_session.commit()
+
+    relevant = Listing(
+        marketplace="bonanza",
+        external_listing_id="rel-1",
+        title="Makita Cordless Drill 18V",
+        listing_url="https://www.bonanza.com/listings/rel-1",
+    )
+    irrelevant = Listing(
+        marketplace="bonanza",
+        external_listing_id="irrel-1",
+        title="Makita Battery Holder Wall Mount",
+        listing_url="https://www.bonanza.com/listings/irrel-1",
+    )
+
+    provider = RecordingProvider()
+    runner = SavedSearchRunner(
+        notification_service=NotificationService(provider),
+        resolve_connector=lambda name: FakeConnector([relevant, irrelevant]),
+    )
+
+    result = runner.run(db_session, saved_search)
+
+    assert result.results[0].marketplace == "bonanza"
+    assert result.results[0].new_count == 1
+    assert result.results[0].rejected_count == 1
+    assert len(provider.sent) == 1
+    assert provider.sent[0].external_listing_id == "rel-1"
+
+    from marketplace_alert.core.persistence.models import DiscoveredListing
+
+    assert (
+        db_session.query(DiscoveredListing)
+        .filter_by(marketplace="bonanza", external_listing_id="irrel-1")
+        .first()
+        is None
+    )
+    assert (
+        db_session.query(DiscoveredListing)
+        .filter_by(marketplace="bonanza", external_listing_id="rel-1")
         .first()
         is not None
     )

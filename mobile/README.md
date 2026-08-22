@@ -262,8 +262,8 @@ npm run typecheck # tsc --noEmit
 
 Both are safe to run repeatedly and never touch the network - every test
 mocks `fetch`/the API layer directly, so nothing here ever calls the real
-backend (and, transitively, never the real Etsy/eBay/Reverb/Telegram
-behind it).
+backend (and, transitively, never the real Etsy/eBay/Reverb/Bonanza/
+Telegram behind it).
 
 What's covered:
 - `src/api/client.test.ts` - URL/query-string construction, JSON request
@@ -283,12 +283,13 @@ What's covered:
   manual action, and a refetch on genuine refocus (navigating away and
   back) that doesn't double-fetch on the initial mount.
   `CreateSearchScreen.test.tsx` also proves the marketplace selector is
-  purely driven by whatever `GET /api/v1/marketplaces` returns: a test
-  adds a "reverb" entry only to the *mocked API response* (never to
-  `CreateSearchScreen.tsx` itself) and confirms it renders as a
-  selectable chip, respects its `configured` flag, and reaches a
-  submitted saved search - concrete proof this screen needs no code
-  change to support a new backend marketplace.
+  purely driven by whatever `GET /api/v1/marketplaces` returns: two tests
+  each add a new marketplace entry ("reverb", then "bonanza") only to the
+  *mocked API response* (never to `CreateSearchScreen.tsx` itself) and
+  confirm it renders as a selectable chip, respects its `configured`
+  flag, and reaches a submitted saved search - concrete proof this screen
+  needs no code change to support a new backend marketplace, proven
+  twice, not just once.
 - `src/hooks/useAutoRefresh.test.tsx` - interval polling (default and
   custom interval), an `AppState` transition to `active` triggering an
   immediate refresh (and other transitions not doing so), refetch on

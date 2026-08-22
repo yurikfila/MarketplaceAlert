@@ -1,6 +1,12 @@
 # Environment / secrets
 .env
 *.db.backup-*
+
+# Local Claude Code settings - never committed, machine/session-specific
+.claude/
+
+# Downloaded APKs (e.g. Expo Go) used for manual device testing - not project source
+*.apk
 # Python
 __pycache__/
 *.py[cod]

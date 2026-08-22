@@ -40,3 +40,9 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# local Claude Code settings - never committed, machine/session-specific
+.claude/
+
+# downloaded APKs (e.g. Expo Go) used for manual device testing - not project source
+*.apk

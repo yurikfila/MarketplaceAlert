@@ -1,5 +1,6 @@
 import pytest
 
+from marketplace_alert.connectors.bonanza.connector import BonanzaMarketplaceConnector
 from marketplace_alert.connectors.ebay.connector import EbayMarketplaceConnector
 from marketplace_alert.connectors.etsy.connector import EtsyMarketplaceConnector
 from marketplace_alert.connectors.mock.connector import MockMarketplaceConnector
@@ -36,16 +37,23 @@ def test_get_connector_returns_reverb_connector_for_reverb() -> None:
     assert connector.marketplace_name == "reverb"
 
 
+def test_get_connector_returns_bonanza_connector_for_bonanza() -> None:
+    connector = get_connector("bonanza")
+    assert isinstance(connector, BonanzaMarketplaceConnector)
+    assert connector.marketplace_name == "bonanza"
+
+
 def test_get_connector_raises_for_unregistered_marketplace() -> None:
     with pytest.raises(UnsupportedMarketplaceError):
         get_connector("vinted")
 
 
-def test_is_marketplace_supported_true_for_mock_etsy_ebay_and_reverb() -> None:
+def test_is_marketplace_supported_true_for_all_registered_marketplaces() -> None:
     assert is_marketplace_supported("mock") is True
     assert is_marketplace_supported("etsy") is True
     assert is_marketplace_supported("ebay") is True
     assert is_marketplace_supported("reverb") is True
+    assert is_marketplace_supported("bonanza") is True
 
 
 def test_is_marketplace_supported_false_for_not_yet_implemented_marketplaces() -> None:
@@ -53,12 +61,17 @@ def test_is_marketplace_supported_false_for_not_yet_implemented_marketplaces() -
     assert is_marketplace_supported("nonsense") is False
 
 
-def test_list_supported_marketplaces_includes_reverb() -> None:
+def test_list_supported_marketplaces_includes_reverb_and_bonanza() -> None:
     assert "reverb" in list_supported_marketplaces()
+    assert "bonanza" in list_supported_marketplaces()
 
 
 def test_display_name_for_reverb_is_brand_cased() -> None:
     assert display_name_for("reverb") == "Reverb"
+
+
+def test_display_name_for_bonanza_is_brand_cased() -> None:
+    assert display_name_for("bonanza") == "Bonanza"
 
 
 def test_display_name_for_unknown_marketplace_falls_back_to_title_case() -> None:

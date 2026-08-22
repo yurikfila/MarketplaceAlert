@@ -63,8 +63,8 @@ Rules for connectors:
   engine, the `Listing` model, or other connectors.
 
 **Resolving a connector by name**: `marketplace_alert/connectors/registry.py`
-maps a marketplace name (e.g. `"mock"`, `"etsy"`, `"ebay"`, `"reverb"`) to a
-connector instance - `get_connector(name)` - and answers
+maps a marketplace name (e.g. `"mock"`, `"etsy"`, `"ebay"`, `"reverb"`,
+`"bonanza"`) to a connector instance - `get_connector(name)` - and answers
 `is_marketplace_supported(name)`. It is the *only* place outside a
 connector's own module allowed to import a concrete connector class.
 Anything in `core/` that needs to resolve a connector (currently:
@@ -73,14 +73,15 @@ takes a resolver function / predicate injected by `main.py` instead of
 importing the registry - `core/` stays free of any concrete-connector
 import, including the registry itself. Adding a marketplace means adding
 one line to the registry's factory dict; nothing in `core/` changes -
-proved in practice three times now: when Etsy was added, again when eBay
-was added, and again when Reverb was added (nothing outside
-`connectors/registry.py` and `connectors/reverb/` had to change the third
-time either). Each registry entry is a zero-arg callable rather than
-strictly a bare class, since a real connector (Etsy, eBay, Reverb) needs
-credentials wired in from `settings` that a plain class reference can't
-supply; `MockMarketplaceConnector` still works unchanged as an entry
-since a class is itself a valid zero-arg callable. `list_supported_marketplaces()`
+proved in practice four times now: when Etsy was added, again when eBay
+was added, again when Reverb was added, and again when Bonanza was added
+(nothing outside `connectors/registry.py` and `connectors/bonanza/` had to
+change the fourth time either). Each registry entry is a zero-arg
+callable rather than strictly a bare class, since a real connector (Etsy,
+eBay, Reverb, Bonanza) needs credentials wired in from `settings` that a
+plain class reference can't supply; `MockMarketplaceConnector` still
+works unchanged as an entry since a class is itself a valid zero-arg
+callable. `list_supported_marketplaces()`
 returns every registered name, sorted - the single source of truth
 anything listing marketplaces should use (the dashboard's marketplace
 checkboxes/status panel and the mobile API's `GET /api/v1/marketplaces` -
@@ -183,6 +184,8 @@ marketplace_alert/
             token_manager.py      EbayTokenManager (OAuth client_credentials)
         reverb/
             connector.py          ReverbMarketplaceConnector (Reverb API v3)
+        bonanza/
+            connector.py          BonanzaMarketplaceConnector (Bonanza "Bonapitit" API)
     notifications/
         telegram/
             provider.py          TelegramNotificationProvider
@@ -497,6 +500,117 @@ that field is `null` for a listing, never fabricated data.
   in the first place (same as every other connector - see "Saved
   searches and background scanning" below), so this is visibility for a
   human reading logs, not a rate-limiting mechanism of its own.
+
+## The Bonanza connector
+
+`marketplace_alert/connectors/bonanza/connector.py`
+(`BonanzaMarketplaceConnector`) is the fourth *real* connector - Bonanza,
+a general (eBay-like) US marketplace, via its own "Bonapitit" API, never
+HTML scraping. Added as part of a broader marketplace-expansion effort
+that evaluated nine other named candidates first (Craigslist, OfferUp,
+Gumtree, Kleinanzeigen, OLX, Vinted, Discogs, Mercado Libre, Facebook
+Marketplace) - Bonanza was the only one found with both a genuinely
+self-serve credential and a real marketplace-wide keyword-search endpoint
+returning actual for-sale listings; see PROJECT_CONTEXT.md's marketplace
+feasibility notes for the full write-up on every candidate, including
+*why* each one that isn't implemented was ruled out.
+
+**Bonanza's API was deliberately modeled on eBay's own (now-deprecated)
+Finding API** - literally the same operation name
+(`findItemsByKeywords`) and response shape - since Bonanza was founded by
+former eBay/Amazon engineers specifically to make migrating an eBay
+integration easy. That parallel is a genuine advantage here: this
+project already had an eBay connector to reference for field-mapping
+conventions, and it's independent evidence the field names below are
+likely correct even though (see next paragraph) they couldn't all be
+pinned down with Reverb-level confidence.
+
+**Two-source verification, same honest-uncertainty approach as
+Reverb**: the exact *wire protocol* - `POST
+https://api.bonanza.com/api_requests/standard_request`, the call name and
+JSON parameters combined into a single form-encoded body field (an
+unusual convention, confirmed rather than guessed), and the
+`X-BONANZLE-API-DEV-NAME` header - was confirmed directly from a real,
+working third-party PHP SDK's HTTP client source
+(github.com/Shoplo/bonapitit-bonanza-php-sdk). `findItemsByKeywords`'s
+own parameters and response shape came from Bonanza's official API
+reference docs, but - unlike Reverb's docs, which still had a literal
+JSON pagination example to quote - the auto-converted documentation
+didn't preserve a byte-exact example response for this specific call.
+`normalize_listing` is written defensively as a direct result (same
+philosophy as Reverb's connector): the price field in particular tries
+the eBay-Finding-API-typical `{"__value__": ..., "@currencyId": ...}`
+value/attribute shape first (a well-known quirk of that XML-derived API,
+which Bonanza explicitly copied), then a plain-number fallback, landing
+on `None` - never invented - if neither matches. A `condition` field
+isn't confirmed to exist on search results at all, so it's `None` unless
+one is actually present.
+
+- **Auth**: a single developer name (`BONANZA_DEV_NAME`, sent as
+  Bonanza's own `X-BONANZLE-API-DEV-NAME` header), obtained by
+  registering a free developer account at
+  `https://api.bonanza.com/accounts/new`. This connector only ever makes
+  Bonanza's "non-secure" class of call (read-only search) - it never
+  sends a Certificate ID, which Bonanza only requires for calls that act
+  on a specific user's own account (managing their own listings/orders),
+  something this connector never does.
+- **Endpoint**: `findItemsByKeywords` via the shared `standard_request`
+  endpoint - free-text keyword search (`keywords`), a safe configurable
+  page size (`paginationInput.entriesPerPage`, `bonanza_result_limit`
+  setting, default 25, Bonanza's own documented max 100). Like Reverb
+  (and unlike Etsy/eBay, which fetch a single page today), this connector
+  paginates - by incrementing `paginationInput.pageNumber` (Bonanza's API
+  isn't HAL/`_links`-based like Reverb's, so there's no link to follow)
+  until it has `result_limit` listings, a page comes back shorter than
+  the requested page size (Bonanza's own signal there's nothing more), or
+  a hard `MAX_PAGES` safety cap (5) is reached - the same bounded-pages
+  reasoning as Reverb's connector, so a single saved-search scan can
+  never turn into unbounded polling.
+- **Field mapping**: `itemId` → `external_listing_id`, `title`,
+  `sellingStatus.currentPrice` (value/attribute object or plain number,
+  see above) → `price`/`currency`, `condition`/`condition.conditionDisplayName`
+  (if present at all) → `condition`, `sellerInfo.sellerUserName` →
+  `seller`, `location` + `country` (joined) → `location`, `galleryURL` →
+  `image_url`, `viewItemURL` → `listing_url`, `listingInfo.startTime` →
+  `created_at`. `description` is always `null` - Bonanza's search results
+  don't include one (only a single-item fetch would, and this connector
+  never makes that call). Any field not present for a given listing is
+  left `null`, never guessed - same rule as every other connector.
+- **Zero results vs. malformed response**: like eBay's Finding API (which
+  Bonanza's mirrors), a zero-match search may omit the `item` key
+  entirely rather than returning an empty array - treated as "0 results",
+  not an error; a *present*, non-list `item` (or a missing
+  `findItemsByKeywordsResponse` envelope, or an `ack` of `"Failure"`) on
+  the *first* page is malformed and raises; the same problem on a later
+  page during pagination just stops paginating and keeps whatever was
+  already collected.
+- **Configuration**: `BonanzaMarketplaceConnector.__init__` takes
+  `dev_name` explicitly (the registry wires this from
+  `settings.bonanza_dev_name`) - it never reads settings itself, same
+  rule as every other connector. If it's missing, `is_configured` is
+  False and `search()` raises `MarketplaceConnectorError` *before*
+  attempting any request - construction itself never fails, so a missing
+  Bonanza credential can't crash app startup, and every other connector
+  is completely unaffected.
+- **Failure handling**: network errors, timeouts, non-200 responses
+  (401/403, 429 logged and reported distinctly; any other non-200
+  reported generically), non-JSON bodies, and an `ack` of `"Failure"` all
+  raise `MarketplaceConnectorError` after logging a sanitized message -
+  never the raw exception, response body, or dev name. A single malformed
+  listing inside an otherwise-valid response is logged and skipped rather
+  than failing the whole search. Because `SavedSearchRunner`/
+  `BackgroundScanner` already catch and log any exception from
+  `connector.search()` per marketplace, a failing Bonanza search never
+  needed special-casing there: if Bonanza fails on a saved search that
+  also targets any other marketplace, the others still run and the saved
+  search still completes.
+- **Not yet live-validated**: unlike eBay/Etsy/Reverb, no real
+  `BONANZA_DEV_NAME` was available while building this connector - it's
+  fully implemented and tested against mocked HTTP responses only (see
+  `tests/test_bonanza_connector.py`), and is explicitly marked
+  "awaiting credentials" until someone registers a developer account and
+  confirms a real search against production Bonanza. See
+  PROJECT_CONTEXT.md's marketplace feasibility notes.
 
 ## Local persistence and duplicate detection
 
@@ -1461,6 +1575,26 @@ GET  /api/v1/listings          -> ListingRepository.list_recent/count(...)
   match) rather than guessed with false confidence - see "The Reverb
   connector" above for the full citation list and what's confirmed vs.
   inferred.
+- **Bonanza's own eBay-Finding-API-shaped `findItemsByKeywords`, verified
+  from a real third-party SDK's HTTP client rather than guessed at**: the
+  official docs' auto-converted pages didn't preserve a literal example
+  response for this call the way Reverb's did, so the actual wire
+  protocol (a `POST` with the operation name and JSON parameters combined
+  into one form-encoded field - not a plain JSON body, and not something
+  that would have been guessable) was confirmed against
+  github.com/Shoplo/bonapitit-bonanza-php-sdk's real client code instead
+  of assumed from the docs' schema-only description. Page-number
+  pagination (not a HAL `_links.next`, since Bonanza's API doesn't use
+  HAL) stops on a short page, `result_limit`, or a hard page cap -
+  whichever comes first, the same three-way stop condition as Reverb's
+  pagination, just adapted to Bonanza's page-number-based paging instead
+  of link-following. Nine other named marketplace candidates were
+  evaluated before settling on Bonanza as the one worth implementing next
+  - see PROJECT_CONTEXT.md's marketplace feasibility notes for the full
+  investigation and why each of the others was ruled out (no API, an API
+  that doesn't support marketplace-wide keyword search, or a credential
+  that requires a manual approval/human OAuth step this connector
+  architecture doesn't yet have a mechanism for).
 - **One shared `display_name_for()` in the connector registry, not a
   per-UI display-name dict**: adding Reverb was the second time a
   marketplace needed proper brand casing (e.g. "eBay", "Reverb") in more

@@ -126,6 +126,44 @@ describe('CreateSearchScreen', () => {
     });
   });
 
+  it('renders and can submit a second new marketplace (Bonanza) added only to mocked API data, alongside Reverb', async () => {
+    // Same proof as the Reverb test above, for the next connector added -
+    // confirms this isn't a one-off coincidence tied to a single
+    // marketplace id, but the general "driven entirely by the API"
+    // behavior this screen is built on.
+    mockedGetMarketplaces.mockResolvedValue([
+      ...MARKETPLACES,
+      { id: 'reverb', name: 'Reverb', configured: true, available: true },
+      { id: 'bonanza', name: 'Bonanza', configured: true, available: true },
+    ]);
+    mockedCreateSavedSearch.mockResolvedValue({
+      id: 3,
+      query: 'Fender Stratocaster',
+      marketplaces: ['bonanza'],
+      is_active: true,
+      scan_interval_seconds: 60,
+      created_at: '2026-08-22T00:00:00Z',
+      updated_at: '2026-08-22T00:00:00Z',
+      last_scanned_at: null,
+    });
+
+    const { findByText, getByText, getByLabelText } = await renderWithNavigation(CreateSearchScreen);
+
+    expect(await findByText('Bonanza')).toBeTruthy();
+    await fireEvent.changeText(getByLabelText('Search keyword or phrase'), 'Fender Stratocaster');
+    await fireEvent.press(getByText('Bonanza'));
+    await fireEvent.press(getByText('Create search'));
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(mockedCreateSavedSearch).toHaveBeenCalledWith({
+      query: 'Fender Stratocaster',
+      marketplaces: ['bonanza'],
+      scan_interval_seconds: 60,
+      is_active: true,
+    });
+  });
+
   it('labels an unconfigured marketplace (e.g. Reverb with no token set) distinctly, still from API data alone', async () => {
     mockedGetMarketplaces.mockResolvedValue([
       ...MARKETPLACES,

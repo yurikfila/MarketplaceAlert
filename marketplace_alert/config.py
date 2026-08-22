@@ -84,6 +84,19 @@ class Settings(BaseSettings):
     # (see connectors/reverb/connector.py).
     reverb_result_limit: int = 25
 
+    # Bonanza's "Bonapitit" API - a single developer name (Bonanza's own
+    # X-BONANZLE-API-DEV-NAME header), not a secret token or client
+    # id/secret pair. Optional - if unset, the Bonanza connector reports a
+    # clear configuration error when actually used, but the app still
+    # starts normally and other connectors are unaffected. Never
+    # hard-code a real value here.
+    bonanza_dev_name: str | None = None
+
+    # Safe, configurable result limit for Bonanza searches - paginates via
+    # pageNumber (bounded by both this limit and an internal max-pages
+    # safety cap - see connectors/bonanza/connector.py).
+    bonanza_result_limit: int = 25
+
     # CORS for future web/dev tooling (Phase 9 mobile-API prep). Native
     # mobile apps don't need browser CORS at all - this exists only in
     # case future web-based tooling (e.g. an Expo/React Native web

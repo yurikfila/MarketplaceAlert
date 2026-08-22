@@ -5,6 +5,108 @@ All notable changes to this project are recorded here. Format is roughly
 
 ## [Unreleased]
 
+## 2026-08-22 — Marketplace expansion: nine candidates evaluated, Bonanza added
+
+A broad feasibility pass across nine named marketplace candidates
+(Craigslist, OfferUp, Gumtree, Kleinanzeigen, OLX, Vinted, Discogs,
+Mercado Libre, Facebook Marketplace) - each checked against its own
+current documentation (never assumed) for a real, legitimate, self-serve
+API with marketplace-wide keyword search. Exactly one qualified: Bonanza.
+The rest are documented, not silently dropped - see PROJECT_CONTEXT.md
+decision #18 for the specific reason each one wasn't implemented. No
+change to eBay/Etsy/Reverb behavior, no PostgreSQL schema change, no
+scraping anywhere, no auth/payments/push-notification work.
+
+### Added
+- `marketplace_alert/connectors/bonanza/connector.py`
+  (`BonanzaMarketplaceConnector`) - Bonanza's own "Bonapitit" API,
+  deliberately modeled on eBay's (deprecated) Finding API
+  (`findItemsByKeywords`, confirmed against a real third-party SDK's HTTP
+  client since Bonanza's own docs didn't preserve a literal example
+  response). `POST` to a single shared endpoint, with the operation name
+  and JSON parameters combined into one form-encoded body field (Bonanza's
+  own wire format) and `X-BONANZLE-API-DEV-NAME: <BONANZA_DEV_NAME>`.
+  Paginates via `pageNumber` (bounded by `bonanza_result_limit` and a
+  hard `MAX_PAGES` safety cap - Bonanza's API isn't HAL-based like
+  Reverb's, so there's no `_links` to follow). Handles missing dev name,
+  401/403/429/5xx, timeout, connection error, malformed JSON, a missing/
+  malformed response envelope, and an `ack` of `"Failure"` - matching
+  every other connector's failure-handling conventions. Never logs or
+  exposes the dev name. See the module's docstring for the full citation
+  list and an explicit accounting of what's confirmed vs. defensively
+  inferred (the price field's exact shape, and whether `condition` is
+  present at all, weren't independently confirmable from Bonanza's public
+  docs).
+- `settings.bonanza_dev_name` / `BONANZA_DEV_NAME` (a single developer
+  name, not a secret token) and `settings.bonanza_result_limit` (default
+  25) in `config.py`/`.env.example`. Missing dev name -> `is_configured`
+  is False, `search()` raises a clear configuration error, app startup
+  and every other connector are completely unaffected.
+- `"bonanza": lambda: BonanzaMarketplaceConnector(...)` in
+  `connectors/registry.py` - `get_connector("bonanza")` now resolves it,
+  `list_supported_marketplaces()` includes it, and the dashboard,
+  `GET /api/v1/marketplaces`, and the mobile Create Search screen all
+  pick it up automatically with no marketplace-specific code of their
+  own (same registry-driven guarantee proven for Reverb, now proven a
+  fourth time).
+- `tests/test_bonanza_connector.py` (30 new tests) - request construction
+  (URL, the dev-name header, the form-encoded body shape), pagination
+  (advancing page numbers, stopping on a short page, stopping once
+  `result_limit` is reached, the `MAX_PAGES` safety cap), normalization
+  of every mapped field (including the price value/attribute-object vs.
+  plain-number fallback, condition as an object or plain string), missing
+  optional fields left `null`, Unicode content, credentials missing/401/
+  403/429/500/timeout/connection error/malformed JSON/missing response
+  envelope/`ack: Failure`, a missing `item` key treated as zero results
+  (not malformed), one malformed listing skipped rather than failing the
+  whole search, and the dev name never appearing in an error message or a
+  log line.
+- Bonanza-specific additions to `tests/test_connector_registry.py`
+  (resolution, support, display name), `tests/test_dashboard.py` /
+  `tests/test_api_v1.py` (Bonanza appears in the dashboard status panel
+  and `GET /api/v1/marketplaces`, reflects its dev name's configured
+  state, never leaks the dev name), `tests/test_saved_search_scheduler.py`
+  (scheduler survives a real Bonanza connector failure; other
+  marketplaces still run if Bonanza fails in the same saved search; a
+  Bonanza duplicate is not notified twice; Bonanza results pass through
+  the same relevance engine, with an irrelevant Bonanza listing neither
+  persisted nor notified), and
+  `mobile/src/screens/CreateSearchScreen.test.tsx` (a second new
+  marketplace, added only to mocked API data, still renders/selects/
+  submits correctly alongside the first).
+
+### Not implemented, with reasons (PROJECT_CONTEXT.md decision #18 has
+the full write-up for each)
+- **Craigslist** - no read/search API (only a seller bulk-post API).
+- **OfferUp** - no public API.
+- **Gumtree** / **Kleinanzeigen** - no official API; scraping-only
+  alternatives exist and were not used.
+- **Vinted** - the only official API is manually-allowlisted to approved
+  Pro sellers for their own inventory, not general search.
+- **Discogs** - has a real, self-serve personal-access-token API, but its
+  Marketplace endpoints only support browsing a *known* seller's
+  inventory or a *known* listing ID - no marketplace-wide keyword search
+  across sellers exists.
+- **OLX** - requires a formal partner application with manual review
+  before any credentials are issued. **BLOCKED BY EXTERNAL APPROVAL.**
+- **Mercado Libre** - requires OAuth's `authorization_code` grant (a real
+  user completing a browser consent flow) for every access token; no
+  app-only grant for read-only search exists. **BLOCKED BY USER AUTH.**
+- **Facebook Marketplace** - Meta has never published a public search
+  API; the only API that exists is a restricted, partner-approval-gated
+  seller commerce API, structurally unable to support general search.
+
+### Changed
+- PROJECT_CONTEXT.md - new architectural decision #18 (the full
+  nine-candidate investigation and why each wasn't implemented, Bonanza's
+  eBay-Finding-API lineage, and the "awaiting credentials" status) and
+  updated "Things that have NOT yet been implemented" entries.
+- ARCHITECTURE.md - new "The Bonanza connector" section (mirroring "The
+  Reverb connector"'s structure), updated "The connector interface" for
+  the fourth proof of zero-core-changes, and a new "Why these choices"
+  entry.
+- `.env.example` - added `BONANZA_DEV_NAME=` (no real value).
+
 ## 2026-08-22 — Reverb: the third real marketplace connector
 
 Reverb API access was manually verified before this task

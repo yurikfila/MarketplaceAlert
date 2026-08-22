@@ -12,22 +12,31 @@ below; saved searches/scheduling wasn't a separately numbered phase but
 belongs here for the same reason). **Done.**
 
 ## Phase 2 — First marketplace connector
-**Done, via Etsy, then proven again via eBay, then again via Reverb.**
-`EtsyMarketplaceConnector` (`marketplace_alert/connectors/etsy/`) uses Etsy
-Open API v3 (no scraping) and proves `search()` → `normalize_listing()`
-end-to-end against a live marketplace, exactly as this phase asked —
-nothing outside the connector's own module and the registry's factory dict
-had to change to add it. `EbayMarketplaceConnector`
+**Done, via Etsy, then proven again via eBay, again via Reverb, and again
+via Bonanza.** `EtsyMarketplaceConnector` (`marketplace_alert/connectors/etsy/`)
+uses Etsy Open API v3 (no scraping) and proves `search()` →
+`normalize_listing()` end-to-end against a live marketplace, exactly as
+this phase asked — nothing outside the connector's own module and the
+registry's factory dict had to change to add it. `EbayMarketplaceConnector`
 (`marketplace_alert/connectors/ebay/`) - the Buy Browse API, OAuth
 client_credentials, never the legacy Finding API - was added the same way
 afterward, confirming the same claim a second time with zero core changes.
 `ReverbMarketplaceConnector` (`marketplace_alert/connectors/reverb/`) -
 Reverb API v3, a single personal access token, real API access manually
-verified before implementation - confirmed it a third time. Further
-connectors beyond these three (Vinted, Yad2, Facebook Marketplace,
-Mercari, etc.) remain separate, not-yet-started pieces of work — this
-phase's goal only asked for proof via *a* real connector, not an
-exhaustive list.
+verified before implementation - confirmed it a third time.
+`BonanzaMarketplaceConnector` (`marketplace_alert/connectors/bonanza/`) -
+Bonanza's own eBay-Finding-API-shaped API, added after a broad feasibility
+pass across nine other named candidates (Craigslist, OfferUp, Gumtree,
+Kleinanzeigen, OLX, Vinted, Discogs, Mercado Libre, Facebook Marketplace -
+see PROJECT_CONTEXT.md decision #18 for why each was ruled out) found
+none of them offered both a self-serve credential and real marketplace-
+wide search - confirmed the zero-core-changes claim a fourth time.
+Further connectors beyond these four remain separate, not-yet-started
+pieces of work, gated on either a new candidate emerging or someone
+completing the human step OLX/Mercado Libre each specifically need (a
+partner-approval review, and a one-time OAuth consent flow, respectively)
+— this phase's goal only ever asked for proof via *a* real connector, not
+an exhaustive list.
 
 ## Phase 3 — Database and duplicate detection
 **Done ahead of schedule**, in Phase 1, against the mock connector: SQLAlchemy
@@ -105,24 +114,34 @@ dashboard view of discovered listings themselves, not just saved-search
 definitions (Phase 7).
 
 ## Phase 5 — Multiple marketplaces
-**Core claim proven, ahead of schedule, now with four connectors.** One
+**Core claim proven, ahead of schedule, now with five connectors.** One
 `SavedSearch` can now target several marketplaces at once (a normalized
 `SavedSearchMarketplace` join table, not a comma-separated string), each
 scanned independently by `SavedSearchRunner` with its own failure isolation
 - a connector failing for one marketplace never stops the others in the
 same search (verified concretely: an eBay failure doesn't stop an Etsy
-search on the same saved search, and vice versa; a Reverb failure doesn't
-stop an Etsy or eBay search on the same saved search either). Adding eBay
-as the third option required zero changes to any other connector, to
-duplicate detection, or to the notification layer; adding Reverb as the
-fourth proved the same claim a third time (see "The Reverb connector" in
-ARCHITECTURE.md and CHANGELOG.md's 2026-08-22 entry) - real API access was
-manually verified first (a real personal access token, `public` scope,
-against `GET https://api.reverb.com/api/listings`), and Reverb flows
-through the exact same saved-search/scheduler/relevance/duplicate-
-detection/notification/mobile-API/dashboard pipeline every other connector
-already uses. What's still open: further connectors beyond mock/Etsy/eBay/
-Reverb (Vinted, Yad2, Facebook Marketplace, Mercari, etc.) - see Phase 2.
+search on the same saved search and vice versa; a Reverb failure doesn't
+stop an Etsy or eBay search; a Bonanza failure doesn't stop a Reverb
+search on the same saved search either). Adding eBay as the third option
+required zero changes to any other connector, to duplicate detection, or
+to the notification layer; adding Reverb as the fourth proved the same
+claim a third time (see "The Reverb connector" in ARCHITECTURE.md and
+CHANGELOG.md's 2026-08-22 entry) - real API access was manually verified
+first (a real personal access token, `public` scope, against
+`GET https://api.reverb.com/api/listings`); adding Bonanza as the fifth
+proved it a fourth time, this time after a broad feasibility pass across
+nine other named candidates found none of them offered both a self-serve
+credential and real marketplace-wide search (see PROJECT_CONTEXT.md
+decision #18) - Bonanza's own API, deliberately modeled on eBay's
+(deprecated) Finding API, flows through the exact same saved-search/
+scheduler/relevance/duplicate-detection/notification/mobile-API/dashboard
+pipeline every other connector already uses, though (unlike eBay/Etsy/
+Reverb) it hasn't yet been live-validated against production - no real
+`BONANZA_DEV_NAME` was available while building it. What's still open:
+further connectors beyond mock/Etsy/eBay/Reverb/Bonanza - see Phase 2 for
+the nine candidates already evaluated and ruled out, and what would need
+to change (an external approval, or a new persistent-refresh-token
+mechanism) to make OLX or Mercado Libre buildable.
 
 ## Phase 6 — User accounts
 Multi-user support: accounts, auth, and searches scoped to a user.

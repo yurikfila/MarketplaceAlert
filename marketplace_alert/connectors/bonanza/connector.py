@@ -56,6 +56,11 @@ connector only ever makes the "non-secure" class of Bonanza API call
 (read-only search) - it never sends a Certificate ID, since that's only
 required for secure calls that act on a specific user's own account
 (managing their own listings/orders), which this connector never does.
+
+Transient failures (HTTP 429/502/503/504) on any one page request ARE
+retried, with bounded exponential backoff, via
+`core/connectors/retry.py`'s shared `request_with_retry`. 401/403 and any
+other permanent failure are unaffected, exactly as before.
 """
 
 import json
@@ -67,6 +72,7 @@ import httpx
 from pydantic import ValidationError
 
 from marketplace_alert.core.connectors.base import MarketplaceConnector, MarketplaceConnectorError
+from marketplace_alert.core.connectors.retry import request_with_retry
 from marketplace_alert.core.models.listing import Listing
 
 logger = logging.getLogger(__name__)
@@ -185,7 +191,10 @@ class BonanzaMarketplaceConnector(MarketplaceConnector):
         form_body = {"findItemsByKeywords": json.dumps(params)}
 
         try:
-            response = httpx.post(_BONANZA_API_URL, data=form_body, headers=headers, timeout=self._timeout)
+            response = request_with_retry(
+                lambda: httpx.post(_BONANZA_API_URL, data=form_body, headers=headers, timeout=self._timeout),
+                marketplace_name="Bonanza",
+            )
         except httpx.HTTPError as exc:
             logger.error("Bonanza API request failed (%s)", type(exc).__name__)
             raise MarketplaceConnectorError("Bonanza API request failed") from None

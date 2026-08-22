@@ -47,15 +47,6 @@ export function formatTimestamp(iso: string | null): string {
   });
 }
 
-function titleCase(value: string): string {
-  return value.length === 0 ? value : value.charAt(0).toUpperCase() + value.slice(1);
-}
-
-/** e.g. ["ebay", "etsy"] -> "Ebay, Etsy" - mirrors the backend dashboard's own marketplaces_display. */
-export function formatMarketplacesDisplay(marketplaces: string[]): string {
-  return marketplaces.map(titleCase).join(', ');
-}
-
 /**
  * `null` when there's no price to show - callers must not render a
  * placeholder in its place (see api/types.ts's Listing - price is

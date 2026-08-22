@@ -94,6 +94,67 @@ call rather than each keeping an independent copy (see "Why these
 choices" below for why this was worth generalizing when Reverb was
 added, rather than adding a third hard-coded copy).
 
+## Shared connector retry helper
+
+`marketplace_alert/core/connectors/retry.py` (`request_with_retry()`) is
+a small helper every real connector (Etsy, eBay, Reverb, Bonanza) wraps
+its outbound HTTP call in - added during a production-hardening pass
+after auditing found connectors previously failed an entire search
+immediately on a transient rate-limit or upstream gateway blip, even
+though `SavedSearchRunner`/`BackgroundScanner` already isolate one
+marketplace's failure from the others on the same saved search. This
+closes the gap that isolation was compensating for, rather than relying
+on it alone.
+
+```python
+response = request_with_retry(
+    lambda: httpx.get(url, params=params, headers=headers, timeout=...),
+    marketplace_name="Etsy",
+)
+```
+
+- **Retries only genuinely transient responses**: HTTP 429, 502, 503, 504
+  - up to 2 additional attempts (3 total), exponential backoff
+  (`retry_base_seconds * 2^(attempt-1)`), honoring the response's own
+  `Retry-After` header when present instead of guessing a wait time.
+- **Never retries a permanent failure** - 401/403 (auth), 404, 400, or any
+  other status not in the retriable set - since retrying those could
+  never succeed and would only add latency before failing anyway. A
+  connector's own status-code-specific handling stays entirely outside
+  this helper: eBay's 401/403 token invalidation
+  (`EbayTokenManager.invalidate()`) still happens exactly where it always
+  has, in the connector, after `request_with_retry()` returns whatever
+  final response it got.
+- **A network error or timeout (`httpx.HTTPError`) propagates
+  immediately, unretried** - a connector retrying into the same scan
+  tick's time budget after it has already timed out once is a deliberate,
+  separate scope decision this helper doesn't make, not an oversight.
+- **Same retry *policy* as `notifications/telegram/provider.py`'s own
+  retry logic, deliberately not the same *code*.** Telegram's retry hint
+  comes from a JSON response body field (`parameters.retry_after`); this
+  helper's comes from the standard HTTP `Retry-After` header. The two are
+  also used in structurally different places - a single notification send
+  versus every connector's own search request - so sharing the policy
+  shape without forcing a shared abstraction across genuinely different
+  call sites was the deliberate choice; see PROJECT_CONTEXT.md decision
+  #19.
+- Each retry attempt is logged once at `WARNING` (marketplace name,
+  status code, attempt number, wait time) - never the request URL's query
+  string or any credential/header value.
+
+`tests/test_connector_retry.py` covers the helper directly (success,
+retry-then-succeed for each retriable code, exhaustion, every
+non-retriable code including an explicit check that 500 is *not*
+retried, zero/negative `max_retries`, backoff math, `Retry-After`
+honored vs. falling back to backoff, and network errors passing through
+unretried). Each connector's own test file additionally has one test
+proving it's actually wired to this helper (not just that the helper
+works in isolation), plus an autouse `_no_real_sleeps` fixture -
+monkeypatching `retry.time.sleep` to record durations instead of
+sleeping, the same pattern `tests/test_telegram_provider.py` already
+established - so a 429/502/503/504 test case doesn't make the suite
+actually wait out an exponential backoff.
+
 ## The normalized `Listing` model
 
 Defined in [`marketplace_alert/core/models/listing.py`](marketplace_alert/core/models/listing.py)

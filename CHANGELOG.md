@@ -5,6 +5,110 @@ All notable changes to this project are recorded here. Format is roughly
 
 ## [Unreleased]
 
+## 2026-08-22 — Production hardening and release-readiness pass
+
+A full-repository audit for reliability and correctness, not new
+features: no new marketplace, no visual redesign, and the only schema
+change is one purely-additive index. Confirmed sound by direct code
+reading (nothing changed): `BackgroundScanner`'s single-thread scan loop
+structurally can't overlap itself (the next tick's wait only starts after
+the current one fully returns), and `SavedSearchRunGuard` is a genuinely
+thread-safe (`threading.Lock`-backed) singleton shared by the scheduler
+and both manual-run endpoints (legacy + `/api/v1`) - no duplicate-run
+risk found there. Full backend suite: 489/489 passing.
+
+### Fixed
+- **Relevance engine: legitimate kit listings that mention a bundled
+  accessory were being wrongly rejected** - e.g. "Makita XFD131 18V
+  Cordless Drill Driver Kit with Carrying Case" scored below the relevance
+  threshold once `battery`/`charger`/`case` were added as accessory terms
+  (below), because the accessory penalty didn't distinguish "this listing
+  is fundamentally an accessory" from "this listing is the core product
+  and also happens to mention a bundled accessory." Fixed in
+  `evaluate_relevance()` (`core/relevance/evaluator.py`): a match via a
+  **2+ word family synonym** (e.g. "cordless drill", "drill driver") is
+  now treated as unambiguous core-product evidence and suppresses the
+  accessory penalty for that listing; a bare single-word overlap does
+  not qualify, since that's exactly the ambiguous case the penalty exists
+  to catch. Deliberately **not** extended to the lenient fallback path
+  used for unregistered product categories (e.g. guitars, which have no
+  registered `families.py` entry) - an earlier version of this fix did
+  extend it there and was reverted after "Gibson Les Paul Guitar Stand"
+  and "Gibson Les Paul Pickup Set" started scoring as relevant, since a
+  multi-word *model name* like "Les Paul" overlaps just as completely in
+  an accessory listing for that model as in a listing for the model
+  itself. See `evaluator.py`'s docstring for the full reasoning and the
+  accepted residual limitation (guitar accessories don't get the kit
+  exemption). Regression coverage added to `tests/test_relevance.py`.
+- `DiscoveredListing.first_discovered_at` had no database index despite
+  being the `ORDER BY` column on every `GET /api/v1/listings` page load
+  (the mobile app's Listings screen) - a full-table sort that only gets
+  slower as more listings accumulate. Added `index=True`
+  (`core/persistence/models.py`) plus a new, purely-additive Alembic
+  migration (`alembic/versions/c8800c505bb9_...py`, `create_index` only -
+  verified via a full upgrade/downgrade/re-upgrade cycle against a
+  throwaway database before finalizing).
+
+### Added
+- `marketplace_alert/core/connectors/retry.py` - a shared
+  `request_with_retry()` helper, wired into all four real connectors
+  (Etsy, eBay, Reverb, Bonanza). Retries only genuinely transient HTTP
+  responses - 429, 502, 503, 504 - up to 2 additional times with
+  exponential backoff, honoring a `Retry-After` header when a marketplace
+  sends one; a permanent failure (401/403 auth, 404, any other status) is
+  never retried, since retrying those could never succeed. A connector's
+  own status-code-specific handling (e.g. eBay's 401/403 token
+  invalidation) stays outside the retry wrapper, unchanged. A network
+  error/timeout (`httpx.HTTPError`) propagates immediately, unretried - a
+  deliberate scope decision, not an oversight. This closes a real gap:
+  connectors previously failed immediately on a transient rate-limit or
+  gateway blip, even though `SavedSearchRunner`/`BackgroundScanner`
+  already isolate one marketplace's failure from the others in the same
+  saved search - this makes a single marketplace less likely to fail at
+  all in the first place. `tests/test_connector_retry.py` (17 new tests)
+  covers the helper directly; each connector's test file gained one test
+  proving it's actually wired to it, plus an autouse fixture
+  (`_no_real_sleeps`, mirroring the existing pattern in
+  `tests/test_telegram_provider.py`) so retry tests don't really sleep.
+- `core/relevance/brands.py` - registered common guitar brands (Fender,
+  Squier, Gibson, Epiphone, Ibanez, PRS, Martin, Taylor, Yamaha, ESP,
+  Jackson, Charvel, Gretsch, Rickenbacker, Schecter). Previously only
+  power-tool brands were registered, so a Reverb/Bonanza search like
+  "Fender Stratocaster" got no brand-conflict protection at all - a
+  Gibson listing wouldn't have been rejected for a Fender query.
+- `core/relevance/accessories.py` - registered common guitar/instrument
+  accessory terms (battery, charger, bag, pickguard, pickup, neck, body,
+  strap, stand, manual) alongside the existing tool-accessory vocabulary.
+
+### Removed
+- `mobile/src/utils/format.ts` - `titleCase()` and
+  `formatMarketplacesDisplay()`, dead code confirmed unused by any real
+  screen (`SavedSearchCard` renders a saved search's marketplace ids
+  directly) and subtly incorrect (wrong brand casing, e.g. "Ebay" instead
+  of "eBay"). Their tests removed from `format.test.ts` along with them.
+
+### Reviewed, not changed
+- Considered wiring proper backend-driven marketplace display names
+  (`display_name_for()`, already used by the dashboard and
+  `GET /api/v1/marketplaces`) into the mobile app's `SavedSearchCard`/
+  `SavedSearchDetailScreen`, which currently show raw lowercase ids like
+  "ebay" instead of "eBay". Deliberately deferred - purely cosmetic, zero
+  functional/reliability impact, and out of proportion for a hardening
+  pass whose mobile-side brief was "prioritize reliability, avoid
+  unnecessary visual redesign."
+- Git history, tracked files, and the working tree were checked for
+  committed secrets, tokens, `.env` files, or other credential-shaped
+  content - none found; `.gitignore` (root and `mobile/`) already covers
+  `.claude/`/`*.apk` from the previous task. No git history rewrite was
+  needed or performed.
+
+### Not yet implemented
+- The remaining items already tracked in PROJECT_CONTEXT.md "Things that
+  have NOT yet been implemented" (Bonanza awaiting `BONANZA_DEV_NAME`,
+  Mercado Libre/OLX blocked on external auth/approval, mobile
+  marketplace-display-name cosmetics, etc.) - this pass hardened the
+  existing product, it did not close any of those out.
+
 ## 2026-08-22 — Marketplace expansion: nine candidates evaluated, Bonanza added
 
 A broad feasibility pass across nine named marketplace candidates

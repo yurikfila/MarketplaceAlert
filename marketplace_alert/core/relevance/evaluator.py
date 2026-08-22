@@ -25,7 +25,20 @@ Scoring, in order:
    term (holder, mount, case, ...) and the *query* did not ask for one,
    subtract `ACCESSORY_PENALTY`. This is what rejects "Makita battery
    holder" for a "Makita drill" search while still allowing it for a
-   "Makita battery holder" search.
+   "Makita battery holder" search - *unless* the core match itself came
+   from a **multi-word** strong/related synonym (e.g. "cordless drill",
+   "drill driver", "impact driver" - two or more words, not just the
+   bare family word). A multi-word match is unambiguous evidence the
+   core product itself is genuinely what's being sold, so an accessory
+   term elsewhere in the same title (e.g. "...Cordless Drill Driver Kit
+   with Carrying Case and 2 Batteries") is read as an included bonus
+   item, not the actual subject of the listing - the penalty stays fully
+   in force for a *bare single-word* match (e.g. just "drill"), which is
+   exactly the "Bosch Drill Bit Holder" case: "drill" there is only
+   describing what kind of holder it is, not naming the product for
+   sale. Found and fixed via this module's own regression-testing
+   audit - see `_score_core_match`'s `unambiguous` return value and
+   `tests/test_relevance.py`'s "kit/bundle" test cases.
 
 A query that is *only* a recognized brand name, with no core product term
 left after removing it (e.g. just "Makita"), is a special case: it's
@@ -102,14 +115,20 @@ def evaluate_relevance(query: str, listing: Listing) -> RelevanceEvaluation:
             is_relevant=False, score=score, matched_terms=matched_terms, rejected_reason="brand_only_query_not_mentioned"
         )
 
-    core_score, core_matched, core_matched_terms = _score_core_match(parsed_query, listing_tokens)
+    core_score, core_matched, core_matched_terms, core_match_unambiguous = _score_core_match(
+        parsed_query, listing_tokens
+    )
     matched_terms.extend(core_matched_terms)
 
     listing_accessory_matches = find_phrase_matches(listing_tokens, accessories.accessory_vocabulary())
     query_accessory_matches = find_phrase_matches(parsed_query.core_tokens, accessories.accessory_vocabulary())
     query_is_accessory_seeking = bool(query_accessory_matches)
 
-    accessory_penalty = ACCESSORY_PENALTY if listing_accessory_matches and not query_is_accessory_seeking else 0
+    accessory_penalty = (
+        ACCESSORY_PENALTY
+        if listing_accessory_matches and not query_is_accessory_seeking and not core_match_unambiguous
+        else 0
+    )
 
     score = _clamp(brand_score + core_score - accessory_penalty)
     is_relevant = core_matched and score >= RELEVANCE_THRESHOLD
@@ -126,26 +145,56 @@ def evaluate_relevance(query: str, listing: Listing) -> RelevanceEvaluation:
     return RelevanceEvaluation(is_relevant=is_relevant, score=score, matched_terms=matched_terms, rejected_reason=rejected_reason)
 
 
-def _score_core_match(parsed_query: ParsedQuery, listing_tokens: list[str]) -> tuple[int, bool, list[str]]:
+def _score_core_match(
+    parsed_query: ParsedQuery, listing_tokens: list[str]
+) -> tuple[int, bool, list[str], bool]:
+    """Returns `(score, matched, matched_terms, unambiguous)`.
+
+    `unambiguous` is True when the match is strong, unambiguous evidence
+    that the core product itself - not merely an accessory that happens
+    to mention it - is what the listing is for: specifically, a
+    **multi-word** *family* synonym (e.g. "cordless drill", "impact
+    driver" - two or more words). A single bare word (e.g. just "drill")
+    is NOT unambiguous on its own - see `evaluate_relevance`'s
+    accessory-penalty step for what this controls and why.
+
+    Deliberately NOT extended to the lenient-fallback branch (an
+    unregistered product category) even when multiple query tokens
+    overlap: a multi-word *model name* (e.g. "Les Paul") appearing intact
+    is exactly as likely in an accessory listing for that model ("Gibson
+    Les Paul Guitar Stand") as in a listing for the model itself - unlike
+    a curated family synonym, which was deliberately chosen to represent
+    genuine product identity, "the query's own phrase matched completely"
+    isn't evidence either way. Found via this module's own regression
+    audit alongside the multi-word-family fix above - see
+    `tests/test_relevance.py`.
+    """
     family = families.find_family(parsed_query.core_tokens)
     if family is not None:
         strong_vocab = {tuple(tokenize(s)): s for s in family.strong_synonyms}
-        if find_phrase_matches(listing_tokens, strong_vocab):
-            return STRONG_CORE_MATCH_SCORE, True, [family.core_term]
+        strong_matches = find_phrase_matches(listing_tokens, strong_vocab)
+        if strong_matches:
+            unambiguous = any(len(phrase.split(" ")) > 1 for phrase in strong_matches)
+            return STRONG_CORE_MATCH_SCORE, True, [family.core_term], unambiguous
         related_vocab = {tuple(tokenize(s)): s for s in family.related_synonyms}
         related_matches = find_phrase_matches(listing_tokens, related_vocab)
         if related_matches:
-            return RELATED_CORE_MATCH_SCORE, True, sorted(set(related_matches.values()))
-        return 0, False, []
+            unambiguous = any(len(phrase.split(" ")) > 1 for phrase in related_matches)
+            return RELATED_CORE_MATCH_SCORE, True, sorted(set(related_matches.values())), unambiguous
+        return 0, False, [], False
 
     query_accessory_matches = find_phrase_matches(parsed_query.core_tokens, accessories.accessory_vocabulary())
     if query_accessory_matches:
         # The query itself names an accessory (e.g. "battery holder") - the
         # listing must contain that same phrase to count as a core match.
+        # Always "unambiguous": the accessory-penalty step already exempts
+        # an accessory-seeking query independently, so this value is moot
+        # for that step, but true either way - there's nothing ambiguous
+        # about a match on the exact phrase the user asked for.
         target_phrase = max(query_accessory_matches, key=lambda phrase: len(phrase.split(" ")))
         if find_phrase_matches(listing_tokens, {tuple(tokenize(target_phrase)): target_phrase}):
-            return STRONG_CORE_MATCH_SCORE, True, [target_phrase]
-        return 0, False, []
+            return STRONG_CORE_MATCH_SCORE, True, [target_phrase], True
+        return 0, False, [], False
 
     # No registered family or accessory phrase applies - the query names a
     # product category this vocabulary doesn't know about. Deliberately
@@ -158,8 +207,8 @@ def _score_core_match(parsed_query: ParsedQuery, listing_tokens: list[str]) -> t
     # the cases that actually matter.
     overlap = [token for token in parsed_query.core_tokens if token in listing_tokens]
     if overlap:
-        return STRONG_CORE_MATCH_SCORE, True, overlap
-    return 0, False, []
+        return STRONG_CORE_MATCH_SCORE, True, overlap, False
+    return 0, False, [], False
 
 
 def _clamp(score: int) -> int:

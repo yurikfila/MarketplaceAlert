@@ -50,6 +50,27 @@ def test_upgrade_head_creates_every_expected_table(tmp_path, monkeypatch: pytest
     assert "alembic_version" in tables
 
 
+def test_upgrade_head_creates_the_first_discovered_at_index(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`GET /api/v1/listings` orders by `first_discovered_at` on every
+    page load (used by the mobile app's Listings screen - the web
+    dashboard has no listings view) - found unindexed during a
+    production-hardening audit, fixed by a dedicated migration. Confirms
+    it's actually applied on a fresh database, not just present in the
+    model."""
+    db_path = tmp_path / "alembic_index_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        index_names = {idx["name"] for idx in inspect(engine).get_indexes("discovered_listings")}
+    finally:
+        engine.dispose()
+
+    assert "ix_discovered_listings_first_discovered_at" in index_names
+
+
 def test_upgrade_head_matches_base_metadata_tables(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The baseline migration must create exactly the tables the current
     SQLAlchemy models define - no more, no less (aside from Alembic's own

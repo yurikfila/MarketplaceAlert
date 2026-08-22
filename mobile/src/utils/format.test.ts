@@ -1,4 +1,4 @@
-import { formatIntervalSeconds, formatMarketplacesDisplay, formatPrice, formatTimestamp } from './format';
+import { formatIntervalSeconds, formatPrice, formatTimestamp } from './format';
 
 describe('formatIntervalSeconds', () => {
   it.each([
@@ -38,16 +38,6 @@ describe('formatTimestamp', () => {
     expect(result.length).toBeGreaterThan(0);
     expect(result).not.toBe('Never');
     expect(result).not.toBe('Unknown');
-  });
-});
-
-describe('formatMarketplacesDisplay', () => {
-  it('title-cases and joins marketplace ids', () => {
-    expect(formatMarketplacesDisplay(['ebay', 'etsy', 'mock'])).toBe('Ebay, Etsy, Mock');
-  });
-
-  it('returns an empty string for an empty list', () => {
-    expect(formatMarketplacesDisplay([])).toBe('');
   });
 });
 

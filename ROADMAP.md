@@ -202,4 +202,15 @@ Paid tiers, billing.
 
 ## Phase 11 — Scaling and monitoring
 Performance under load, observability, alerting on the system itself
-(not just marketplace listings).
+(not just marketplace listings). **A first, partial step taken ahead of
+schedule (2026-08-22):** a production-hardening audit added bounded
+retry-with-backoff for transient connector failures (429/502/503/504,
+`core/connectors/retry.py`) so a rate-limited or momentarily-unavailable
+marketplace is less likely to fail an entire scan outright, and added a
+missing database index (`discovered_listings.first_discovered_at`) that
+was becoming a full-table sort on every mobile Listings page load as the
+table grew. Full write-up: CHANGELOG.md's 2026-08-22 "Production
+hardening and release-readiness pass" entry and PROJECT_CONTEXT.md
+decision #19. Still open: real observability (metrics, dashboards,
+alerting on the system itself), load testing, and anything beyond these
+two targeted fixes.

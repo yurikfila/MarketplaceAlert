@@ -50,6 +50,12 @@ client-credentials flow, there is no token refresh/expiry to manage here
 - a 401/403 means the token is missing, wrong, or has been revoked, and is
 reported as a clear, safe configuration/auth error (see
 ``_fetch_results_page``), never retried automatically.
+
+Transient failures (HTTP 429/502/503/504) on any one page request ARE
+retried, with bounded exponential backoff, via
+`core/connectors/retry.py`'s shared `request_with_retry` - each page
+fetched during pagination gets its own independent retry budget. 401/403/
+404 and any other permanent failure are unaffected, exactly as before.
 """
 
 import logging
@@ -60,6 +66,7 @@ import httpx
 from pydantic import ValidationError
 
 from marketplace_alert.core.connectors.base import MarketplaceConnector, MarketplaceConnectorError
+from marketplace_alert.core.connectors.retry import request_with_retry
 from marketplace_alert.core.models.listing import Listing
 
 logger = logging.getLogger(__name__)
@@ -171,7 +178,10 @@ class ReverbMarketplaceConnector(MarketplaceConnector):
         }
 
         try:
-            response = httpx.get(url, params=params, headers=headers, timeout=self._timeout)
+            response = request_with_retry(
+                lambda: httpx.get(url, params=params, headers=headers, timeout=self._timeout),
+                marketplace_name="Reverb",
+            )
         except httpx.HTTPError as exc:
             logger.error("Reverb API request failed (%s)", type(exc).__name__)
             raise MarketplaceConnectorError("Reverb API request failed") from None

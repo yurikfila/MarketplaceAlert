@@ -5,7 +5,14 @@ detection (see this package's `__init__.py` and PROJECT_CONTEXT.md's
 Deliberately NOT hard-coded to a fixed set of four brands as permanent
 architecture - `register_brand()` is the maintainable extension point.
 The default catalog below covers common power-tool brands (the domain
-that triggered this feature) but is just a starting seed, registered via
+that triggered this feature) plus common musical-instrument brands (added
+once Reverb/Bonanza made music-gear searches - e.g. "Fender Stratocaster",
+"Gibson Les Paul" - a real, live use case; see PROJECT_CONTEXT.md's
+product-hardening-pass entry for the audit that found Fender/Gibson/etc.
+were missing, which meant a "Fender Stratocaster" search could only ever
+reject an actual Gibson listing by accident - via token non-overlap -
+rather than the deliberate, robust brand-conflict mechanism every other
+domain gets) - but this is all still just a starting seed, registered via
 the same public function anyone extending this would use.
 """
 
@@ -61,6 +68,22 @@ def _register_default_brands() -> None:
     register_brand("worx")
     register_brand("ego")
     register_brand("kobalt")
+    # Musical instrument brands (Reverb/Bonanza) - see module docstring.
+    register_brand("fender")
+    register_brand("squier")
+    register_brand("gibson")
+    register_brand("epiphone")
+    register_brand("ibanez")
+    register_brand("prs", aliases=["paul reed smith"])
+    register_brand("martin")
+    register_brand("taylor")
+    register_brand("yamaha")
+    register_brand("esp")
+    register_brand("jackson")
+    register_brand("charvel")
+    register_brand("gretsch")
+    register_brand("rickenbacker")
+    register_brand("schecter")
 
 
 _register_default_brands()

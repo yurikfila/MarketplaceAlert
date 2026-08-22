@@ -5,9 +5,14 @@ searches (e.g. "Rolex Submariner", "Maccabi", "vintage Adidas"), pick which
 marketplaces to search, and get alerted when a new matching listing
 appears — with a link straight to the original listing.
 
-> **Status:** early prototype (Phase 1 of `ROADMAP.md`). No marketplace
-> connector, database, or alerting is implemented yet — see
-> `PROJECT_CONTEXT.md` for exactly what exists today.
+> **Status:** live in production at
+> [marketplacealert.onrender.com](https://marketplacealert.onrender.com).
+> Real connectors for eBay, Etsy, and Reverb; Bonanza is implemented and
+> registered but disabled pending a free developer credential (see
+> `PROJECT_CONTEXT.md`). A React Native/Expo mobile app
+> ([`mobile/`](mobile/README.md)) and a server-rendered web dashboard
+> (`GET /`) both run against the same backend. See `PROJECT_CONTEXT.md`
+> for exactly what exists today and `ROADMAP.md` for what's next.
 
 ## Documentation
 
@@ -123,19 +128,84 @@ See `PROJECT_CONTEXT.md`/`ARCHITECTURE.md` for the full reasoning, and
 pytest
 ```
 
+## Adding a new marketplace connector
+
+Every real connector so far (Etsy, eBay, Reverb, Bonanza) was added the
+same way, with **zero changes outside its own module and one line in the
+registry** - see `ARCHITECTURE.md`'s "Why these choices" for why that's
+the actual test of whether this works, not just a claim. To add one:
+
+1. Create `marketplace_alert/connectors/<name>/connector.py`, a subclass
+   of `MarketplaceConnector` (`core/connectors/base.py`) implementing
+   `search()`/`normalize_listing()`/`health_check()`. Wrap your outbound
+   HTTP call in `request_with_retry()`
+   (`core/connectors/retry.py`, see `ARCHITECTURE.md` "Shared connector
+   retry helper") so transient 429/502/503/504 responses get bounded,
+   backed-off retries for free - your own code only needs to handle the
+   final response, same as every existing connector does.
+2. Map every field you can confidently identify onto `Listing`
+   (`core/models/listing.py`) - leave anything you can't confirm as
+   `null`, never a guess (see any existing connector's "Field mapping"
+   section in `ARCHITECTURE.md` for the pattern).
+3. Add `settings.<name>_...` fields for any credentials/limits to
+   `config.py`, and matching placeholder entries (no real values) to
+   `.env.example`. A missing credential must make `is_configured` False
+   and `search()` raise a clear `MarketplaceConnectorError` **before**
+   any network call - it must never crash app startup or affect any
+   other connector.
+4. Register it: one entry in `_CONNECTOR_FACTORIES`
+   (`connectors/registry.py`), plus a display name in
+   `display_name_for()`. This alone makes it selectable in saved
+   searches, appear in the dashboard's checkboxes/status panel, and show
+   up in `GET /api/v1/marketplaces` (and therefore the mobile app's
+   marketplace picker) - none of those places should need any other
+   change.
+5. Write mocked-HTTP tests mirroring an existing connector's test file
+   (request construction, field mapping including missing-field cases,
+   pagination if applicable, every failure mode: missing credentials,
+   401/403/429/5xx, timeout, malformed/empty responses, one malformed
+   listing not failing the whole search) - see any of
+   `tests/test_etsy_connector.py`/`test_ebay_connector.py`/
+   `test_reverb_connector.py`/`test_bonanza_connector.py` as a template.
+6. If the new connector introduces a product category the relevance
+   engine (`core/relevance/`) doesn't know about yet (a new brand
+   vocabulary, a new product-family synonym table), extend
+   `brands.py`/`families.py`/`accessories.py` - see `ARCHITECTURE.md`
+   "Relevance filtering". An unregistered category still works via the
+   lenient token-overlap fallback, just less precisely.
+
+Do not add scraping-based connectors - see PROJECT_CONTEXT.md decision #3
+and #18 for why every marketplace evaluated without a real API was ruled
+out rather than worked around with scraping.
+
 ## Project layout
 
 ```
 marketplace_alert/
-    main.py                    FastAPI app entry point
+    main.py                    FastAPI app entry point (dashboard + legacy routes)
+    dependencies.py            Shared singletons (notification service, run guard, ...)
     config.py                  Settings (env vars / .env)
+    api/v1/                    Versioned Mobile API (status, marketplaces, saved-searches, listings)
+    templates/, static/        The web dashboard (Jinja2 + vanilla JS)
     core/
         logging_config.py      Structured (JSON) logging setup
         connectors/
             base.py            MarketplaceConnector interface
+            retry.py            Shared bounded-retry helper for connector HTTP calls
         models/
             listing.py         Normalized Listing model
+        persistence/            SQLite/PostgreSQL, duplicate detection, historical cleanup
+        relevance/               Deterministic relevance-scoring engine
+        notifications/           NotificationProvider interface + dispatch service
+        saved_searches/          Saved search CRUD, run logic
+        scheduler/                Background scanning loop + overlap guard
+    connectors/
+        registry.py              get_connector / is_marketplace_supported / display_name_for
+        mock/, etsy/, ebay/, reverb/, bonanza/   One package per marketplace
+    notifications/telegram/     TelegramNotificationProvider
+alembic/                        PostgreSQL schema migrations
 tests/                          Tests, mirroring the package layout
+mobile/                         React Native/Expo mobile app - see mobile/README.md
 ```
 
-See `ARCHITECTURE.md` for why it's structured this way.
+See `ARCHITECTURE.md` for the full picture and the reasoning behind it.

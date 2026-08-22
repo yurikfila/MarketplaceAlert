@@ -4,10 +4,20 @@ import httpx
 import pytest
 
 from marketplace_alert.connectors.ebay.connector import EbayMarketplaceConnector
+from marketplace_alert.core.connectors import retry as retry_module
 from marketplace_alert.core.connectors.base import MarketplaceConnectorError
 from marketplace_alert.core.models.listing import Listing
 
 _TOKEN_BODY = {"access_token": "fake-access-token", "expires_in": 7200}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Never actually sleep for retry backoff in tests - see
+    tests/test_connector_retry.py for the exhaustive retry-policy tests."""
+    calls: list[float] = []
+    monkeypatch.setattr(retry_module.time, "sleep", lambda seconds: calls.append(seconds))
+    return calls
 
 
 def _raw_listing(**overrides) -> dict:
@@ -253,6 +263,21 @@ def test_rate_limit_status_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _mock_token_and_search(monkeypatch, httpx.Response(429))
     with pytest.raises(MarketplaceConnectorError):
         _connector().search("Makita")
+
+
+def test_rate_limit_is_retried_then_succeeds(monkeypatch: pytest.MonkeyPatch, _no_real_sleeps: list[float]) -> None:
+    """A transient 429 must not fail the search outright if a retry
+    succeeds - full retry-policy behavior is exhaustively tested in
+    tests/test_connector_retry.py; this just confirms eBay's connector is
+    actually wired up to it."""
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(200, json=_TOKEN_BODY))
+    responses = [httpx.Response(429), httpx.Response(200, json={"itemSummaries": [_raw_listing()]})]
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: responses.pop(0))
+
+    results = _connector().search("Makita")
+
+    assert len(results) == 1
+    assert len(_no_real_sleeps) == 1
 
 
 def test_timeout_raises(monkeypatch: pytest.MonkeyPatch) -> None:

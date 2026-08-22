@@ -30,8 +30,16 @@ class DiscoveredListing(Base):
     title: Mapped[str] = mapped_column(String, nullable=False)
     listing_url: Mapped[str] = mapped_column(String, nullable=False)
 
+    # Indexed - `ListingRepository.list_recent()` (backing `GET
+    # /api/v1/listings`, the mobile app's Listings screen) orders by this
+    # column on every page load; without an index, that's a full-table
+    # sort that gets slower as this table grows. Found during a
+    # production-hardening audit - see PROJECT_CONTEXT.md and
+    # alembic/versions/ for the migration that adds it to an
+    # already-deployed PostgreSQL database (this column already existed -
+    # only the index is new).
     first_discovered_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False, index=True
     )
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False

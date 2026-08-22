@@ -271,8 +271,11 @@ What's covered:
   with a string or Pydantic-array-shaped `detail`, malformed JSON, a 204
   with no body), and the retryable/non-retryable classification.
 - `src/utils/format.test.ts` / `src/utils/validation.test.ts` - display
-  formatting (intervals, timestamps, marketplace display names, prices)
-  and the create-search form validation rules.
+  formatting (scan-interval labels, timestamps, prices) and the
+  create-search form validation rules. (A `formatMarketplacesDisplay`
+  helper and its tests were removed during a production-hardening pass -
+  it was dead code, unused by any screen; `SavedSearchCard` renders a
+  saved search's raw marketplace ids directly.)
 - `src/screens/SavedSearchesScreen.test.tsx` /
   `src/screens/CreateSearchScreen.test.tsx` - loading → data, empty state,
   error state with a working retry button, client-side validation

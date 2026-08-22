@@ -746,6 +746,108 @@ marketplace connector yet.
       action before this connector can be verified against production
       Bonanza.
 
+19. **A production-hardening pass (2026-08-22) audited the whole system
+    for reliability rather than adding features, and found - not just
+    confirmed - real, fixable issues.** No new marketplace, no schema
+    change beyond one additive index, no visual redesign. Full write-up
+    in CHANGELOG.md's 2026-08-22 "Production hardening and
+    release-readiness pass" entry; the load-bearing points:
+    - **A shared, bounded connector-retry helper
+      (`core/connectors/retry.py`) closed a real gap**: every real
+      connector (Etsy, eBay, Reverb, Bonanza) previously failed a whole
+      search immediately on a transient 429/502/503/504, even though
+      `SavedSearchRunner`/`BackgroundScanner` already isolate one
+      marketplace's failure from the others on the same saved search -
+      this makes that isolation less often *necessary* in the first
+      place. `request_with_retry()` retries only the four genuinely
+      transient status codes, honors a `Retry-After` header when present,
+      and never retries a permanent failure (401/403, 404, or a network
+      error/timeout) - retrying those could never succeed. Each
+      connector's own status-specific handling (eBay's 401/403 token
+      invalidation, in particular) stays outside the retry wrapper,
+      unchanged. Deliberately a *separate* implementation from
+      `notifications/telegram/provider.py`'s own retry logic (same
+      policy shape, different retry-hint source - a JSON body field there
+      vs. a standard HTTP header here, and used in a different place - a
+      single send vs. every connector's search request) rather than
+      forcing a shared abstraction across two things that only coincide
+      in *policy*, not in *mechanism*.
+    - **A real relevance-engine bug, found by testing real product
+      categories the engine hadn't been exercised against before -
+      caught and fixed before it shipped, not after.** Registering
+      `battery`/`charger`/`case`/`bag` as accessory terms (needed for the
+      new guitar vocabulary below) caused genuine kit listings - "Makita
+      XFD131 18V Cordless Drill Driver Kit with Carrying Case" - to score
+      below the relevance threshold, since the accessory penalty didn't
+      distinguish "this listing is fundamentally an accessory" from
+      "this listing is the core product and also mentions a bundled
+      accessory." Fixed by treating a match via a **2+ word family
+      synonym** (e.g. "cordless drill") as unambiguous core-product
+      evidence that suppresses the accessory penalty - a bare single-word
+      overlap doesn't qualify, since that's exactly the ambiguous case
+      the penalty exists to catch. A second attempt to generalize the
+      same exemption to the lenient fallback path (unregistered
+      categories like guitars, which have no `families.py` entry) was
+      caught and reverted during testing: "Gibson Les Paul Guitar Stand"
+      and "...Pickup Set" started scoring relevant, because a multi-word
+      *model name* ("Les Paul") overlaps just as fully in an accessory
+      listing for that model as in a listing for the model itself - a
+      brand/product name is not the same kind of signal as a curated
+      family synonym. This is now a deliberately accepted, documented
+      residual limitation (see `evaluator.py`'s docstring and
+      `accessories.py`'s), not a silently-fixed one: guitar accessory
+      listings don't get the kit exemption, since there's no registered
+      "guitar" product family to grant it. Verified against a 25+ case
+      hand-traced matrix before finalizing, with regression tests added
+      to `tests/test_relevance.py` for both the fix and the reverted
+      near-miss.
+    - **Registered real guitar brand/accessory vocabulary**
+      (`brands.py`/`accessories.py`) - Reverb and Bonanza had been live
+      since earlier the same day with *zero* guitar-specific brand or
+      accessory terms registered (only power-tool ones), so a query like
+      "Fender Stratocaster" had no brand-conflict protection at all (a
+      Gibson listing wouldn't have been rejected).
+    - **A missing database index, found by reading the actual query
+      pattern, not by guessing.** `DiscoveredListing.first_discovered_at`
+      is the `ORDER BY` column on every `GET /api/v1/listings` page load
+      (the mobile app's Listings screen - the web dashboard has no
+      listings view of its own) but had no index - a full-table sort that
+      only gets slower as the table grows. Added `index=True` plus one
+      new, purely-additive Alembic migration
+      (`alembic/versions/c8800c505bb9_...py`), generated against a
+      throwaway SQLite database (confirmed beforehand that the local
+      `.env` has no `DATABASE_URL` set, so nothing about generating this
+      migration could touch a real database) and verified via a full
+      upgrade/downgrade/re-upgrade cycle before finalizing.
+    - **Two structural soundness checks that found nothing wrong -
+      confirmed by reading the code, not assumed from the architecture
+      docs.** `BackgroundScanner._loop` is a synchronous single-thread
+      loop where the next tick's wait only begins after the current
+      tick's work fully returns - it cannot overlap itself by
+      construction. `SavedSearchRunGuard` is a `threading.Lock`-backed
+      singleton (`dependencies.py`) shared by the scheduler and both
+      manual-run endpoints (legacy and `/api/v1`) - genuinely one guard,
+      not per-caller instances that could each let the same saved search
+      through. Both are "audit and confirm," not "audit and fix."
+    - **Dead, subtly-incorrect mobile code removed.**
+      `mobile/src/utils/format.ts`'s `titleCase()`/
+      `formatMarketplacesDisplay()` were unused by any real screen
+      (`SavedSearchCard` renders a saved search's marketplace ids
+      directly) and produced wrong brand casing (e.g. "Ebay" instead of
+      "eBay") had anything called them. Removed, along with their tests.
+      Wiring the *existing*, already-correct `display_name_for()`
+      (already used by the dashboard and `GET /api/v1/marketplaces`)
+      into the mobile screens that show raw marketplace ids was
+      considered and deliberately deferred - purely cosmetic, zero
+      functional/reliability impact, out of proportion for a pass whose
+      explicit mobile brief was "prioritize reliability, avoid
+      unnecessary visual redesign."
+    - **Security review found nothing.** Git history and the tracked
+      working tree were checked for committed secrets, tokens, `.env`
+      files, or other credential-shaped content - none found; the
+      `.gitignore` hardening from the previous (Bonanza) task already
+      covers `.claude/`/`*.apk`. No git history rewrite was needed.
+
 ## Things that have NOT yet been implemented
 
 - Any marketplace beyond mock/Etsy/eBay/Reverb/Bonanza. Nine additional
@@ -855,13 +957,11 @@ marketplace connector yet.
   needed for the support added here (schema compatibility + selection
   only) - production data initialization/migration is explicitly separate,
   future work.
-- Rate limiting, retries, or resilience handling for **connectors** (Etsy,
-  eBay) - a slow/rate-limited marketplace API still fails immediately
-  today, same as before. This is now implemented for **Telegram
-  notification delivery only** (bounded retry with backoff, paced sends -
-  see "Important architectural decisions" below and `ARCHITECTURE.md`),
-  not for the marketplace connectors, which is a different, not-yet-done
-  piece of work.
+- Connector retry is bounded to transient HTTP failures only (429/502/
+  503/504, via `core/connectors/retry.py`, see decision #19) - a network
+  error/timeout still fails immediately (unretried, by deliberate
+  design), and there's no cross-request rate-limit awareness beyond what
+  a single search's bounded retries provide.
 - **Relevance filtering's product-family/accessory vocabulary only covers
   power tools today.** `families.py` registers one family ("drill");
   `accessories.py` registers common accessory *words* (holder, mount,

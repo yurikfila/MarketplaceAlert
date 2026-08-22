@@ -21,6 +21,14 @@ shared, cached token manager, never requested fresh per search.
 ``X-EBAY-C-MARKETPLACE-ID: EBAY_US`` is also sent (required for
 marketplaces other than the US default; sent explicitly here rather than
 relying on the implicit default).
+
+Transient failures (HTTP 429/502/503/504) are retried with bounded
+exponential backoff via `core/connectors/retry.py`'s shared
+`request_with_retry`, wrapping only the search request itself - never the
+401/403 token-invalidation handling below, which stays a permanent,
+unretried failure exactly as before (a bad/expired token won't start
+working by asking again). A 429/5xx that still fails after every retry
+raises the same error message this connector always has.
 """
 
 import logging
@@ -32,6 +40,7 @@ from pydantic import ValidationError
 
 from marketplace_alert.connectors.ebay.token_manager import EbayTokenManager
 from marketplace_alert.core.connectors.base import MarketplaceConnector, MarketplaceConnectorError
+from marketplace_alert.core.connectors.retry import request_with_retry
 from marketplace_alert.core.models.listing import Listing
 
 logger = logging.getLogger(__name__)
@@ -123,7 +132,10 @@ class EbayMarketplaceConnector(MarketplaceConnector):
         }
 
         try:
-            response = httpx.get(_SEARCH_URL, params=params, headers=headers, timeout=self._timeout)
+            response = request_with_retry(
+                lambda: httpx.get(_SEARCH_URL, params=params, headers=headers, timeout=self._timeout),
+                marketplace_name="eBay",
+            )
         except httpx.HTTPError as exc:
             logger.error("eBay API request failed (%s)", type(exc).__name__)
             raise MarketplaceConnectorError("eBay API request failed") from None

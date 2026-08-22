@@ -24,6 +24,12 @@ samples. No OAuth user-authorization flow is required for this endpoint;
 it is a public, read-only, marketplace-wide search. The shared secret *is*
 still required even though this is a plain read - it's part of the
 x-api-key value itself, not something only needed for OAuth.
+
+Transient failures (HTTP 429/502/503/504) are retried with bounded
+exponential backoff via `core/connectors/retry.py`'s shared
+`request_with_retry` - see that module's docstring for the exact policy.
+Every other failure (network error, timeout, a permanent 4xx, malformed
+JSON) still fails on the first attempt, exactly as before.
 """
 
 import logging
@@ -34,6 +40,7 @@ import httpx
 from pydantic import ValidationError
 
 from marketplace_alert.core.connectors.base import MarketplaceConnector, MarketplaceConnectorError
+from marketplace_alert.core.connectors.retry import request_with_retry
 from marketplace_alert.core.models.listing import Listing
 
 logger = logging.getLogger(__name__)
@@ -122,11 +129,14 @@ class EtsyMarketplaceConnector(MarketplaceConnector):
         headers = {"x-api-key": f"{self._api_key}:{self._shared_secret}"}
 
         try:
-            response = httpx.get(
-                f"{_ETSY_API_BASE}{_ACTIVE_LISTINGS_PATH}",
-                params=params,
-                headers=headers,
-                timeout=self._timeout,
+            response = request_with_retry(
+                lambda: httpx.get(
+                    f"{_ETSY_API_BASE}{_ACTIVE_LISTINGS_PATH}",
+                    params=params,
+                    headers=headers,
+                    timeout=self._timeout,
+                ),
+                marketplace_name="Etsy",
             )
         except httpx.HTTPError as exc:
             logger.error("Etsy API request failed (%s)", type(exc).__name__)

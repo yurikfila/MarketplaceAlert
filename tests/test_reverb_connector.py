@@ -4,8 +4,18 @@ import httpx
 import pytest
 
 from marketplace_alert.connectors.reverb.connector import ReverbMarketplaceConnector
+from marketplace_alert.core.connectors import retry as retry_module
 from marketplace_alert.core.connectors.base import MarketplaceConnectorError
 from marketplace_alert.core.models.listing import Listing
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Never actually sleep for retry backoff in tests - see
+    tests/test_connector_retry.py for the exhaustive retry-policy tests."""
+    calls: list[float] = []
+    monkeypatch.setattr(retry_module.time, "sleep", lambda seconds: calls.append(seconds))
+    return calls
 
 
 def _raw_listing(**overrides) -> dict:
@@ -460,6 +470,20 @@ def test_429_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(429))
     with pytest.raises(MarketplaceConnectorError, match="429"):
         _connector().search("Fender")
+
+
+def test_429_is_retried_then_succeeds(monkeypatch: pytest.MonkeyPatch, _no_real_sleeps: list[float]) -> None:
+    """A transient 429 must not fail the search outright if a retry
+    succeeds - full retry-policy behavior is exhaustively tested in
+    tests/test_connector_retry.py; this just confirms Reverb's connector
+    is actually wired up to it."""
+    responses = [httpx.Response(429), httpx.Response(200, json=_body([_raw_listing()]))]
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: responses.pop(0))
+
+    results = _connector().search("Fender")
+
+    assert len(results) == 1
+    assert len(_no_real_sleeps) == 1
 
 
 def test_500_raises(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -390,6 +390,127 @@ def test_unregistered_product_category_falls_back_to_lenient_token_overlap() -> 
 
 
 # =====================================================================
+# Product-hardening audit regressions - real false positives/negatives
+# found by testing the exact queries named in that task: Makita/Bosch/
+# Milwaukee drill, Fender Stratocaster, Gibson Les Paul, DeWalt impact
+# driver. See CHANGELOG.md's product-hardening-pass entry for the full
+# write-up of what was found and why each fix works.
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "query,title",
+    [
+        # A genuine tool KIT that happens to mention included accessories
+        # must NOT be rejected just because it also mentions them - found
+        # as a real false positive (these used to score 40, below
+        # threshold, purely because "case"/"battery"/"charger" appeared
+        # anywhere in an otherwise-clearly-a-drill title).
+        ("Makita drill", "Makita XFD131 18V Cordless Drill Driver Kit with Carrying Case"),
+        ("Bosch drill", "Bosch 18V Rotary Hammer Drill with Case and 2 Batteries"),
+        ("Milwaukee drill", "Milwaukee M18 FUEL Drill/Driver Kit w/ Battery and Charger"),
+    ],
+)
+def test_multi_word_family_match_exempts_a_genuine_kit_from_the_accessory_penalty(query: str, title: str) -> None:
+    result = evaluate_relevance(query, _listing(title))
+    assert result.is_relevant is True
+
+
+def test_single_word_family_match_still_gets_the_full_accessory_penalty() -> None:
+    """The exemption above must be narrow: a *bare* single-word family
+    match (just "drill", not a multi-word synonym like "cordless drill")
+    is NOT enough - "Bosch Drill Bit Holder Organizer" must still be
+    rejected exactly as before, since "drill" there only describes what
+    kind of holder it is, not that a drill is for sale."""
+    result = evaluate_relevance("Bosch drill", _listing("Bosch Drill Bit Holder Organizer"))
+    assert result.is_relevant is False
+    assert result.rejected_reason == "accessory_without_core_product_match"
+
+
+@pytest.mark.parametrize(
+    "query,title",
+    [
+        ("Makita drill", "Makita BL1850B 18V 5.0Ah LXT Lithium-Ion Battery"),
+        ("Makita drill", "Makita DC18RC 18V Rapid Optimum Charger"),
+        ("DeWalt impact driver", "DeWalt DCB205 20V MAX 5.0Ah Battery"),
+        ("DeWalt impact driver", "DeWalt DCB115 Fast Charger"),
+    ],
+)
+def test_standalone_battery_or_charger_listing_is_rejected(query: str, title: str) -> None:
+    """A battery/charger sold on its own (no drill-family term at all) was
+    already correctly rejected before this audit, via no_core_product_match
+    - confirmed still true now that "battery"/"charger" are also
+    registered accessory terms in their own right."""
+    result = evaluate_relevance(query, _listing(title))
+    assert result.is_relevant is False
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Fender Stratocaster Pickguard White 3-Ply",
+        "Fender Stratocaster Pickup Set Alnico V",
+        "Fender Stratocaster Replacement Neck Maple",
+        "Fender Stratocaster Body Alder Unfinished",
+        "Fender Stratocaster Hard Case",
+        "Fender Stratocaster Gig Bag",
+        "Guitar Strap for Fender Stratocaster",
+        "Fender Stratocaster Owner's Manual",
+    ],
+)
+def test_fender_stratocaster_search_rejects_guitar_parts_and_accessories(title: str) -> None:
+    result = evaluate_relevance("Fender Stratocaster", _listing(title))
+    assert result.is_relevant is False
+    assert result.rejected_reason == "accessory_without_core_product_match"
+
+
+def test_fender_stratocaster_search_accepts_a_complete_guitar() -> None:
+    result = evaluate_relevance("Fender Stratocaster", _listing("Fender American Professional II Stratocaster"))
+    assert result.is_relevant is True
+
+
+@pytest.mark.parametrize("title", ["Gibson Les Paul Guitar Stand", "Gibson Les Paul Pickup Set"])
+def test_gibson_les_paul_search_rejects_accessories(title: str) -> None:
+    """Regression for a subtler false positive found while fixing the
+    Fender case above: a naive "more than one query token overlaps ->
+    unambiguous" heuristic would have wrongly exempted these too, since
+    "Les Paul" (the model name) appears intact in both - but that's
+    exactly as likely in an accessory listing for that model as in a
+    listing for the model itself, unlike a curated multi-word family
+    synonym. See `evaluator.py::_score_core_match`'s docstring."""
+    result = evaluate_relevance("Gibson Les Paul", _listing(title))
+    assert result.is_relevant is False
+    assert result.rejected_reason == "accessory_without_core_product_match"
+
+
+def test_gibson_les_paul_search_accepts_a_complete_guitar() -> None:
+    result = evaluate_relevance("Gibson Les Paul", _listing("Gibson Les Paul Standard 60s"))
+    assert result.is_relevant is True
+
+
+def test_fender_stratocaster_search_rejects_gibson_les_paul_as_brand_conflict() -> None:
+    result = evaluate_relevance("Fender Stratocaster", _listing("Gibson Les Paul Standard"))
+    assert result.is_relevant is False
+    assert result.rejected_reason == "brand_conflict"
+
+
+def test_gibson_les_paul_search_rejects_fender_stratocaster_as_brand_conflict() -> None:
+    result = evaluate_relevance("Gibson Les Paul", _listing("Fender Stratocaster American Professional"))
+    assert result.is_relevant is False
+    assert result.rejected_reason == "brand_conflict"
+
+
+def test_milwaukee_drill_search_rejects_milwaukee_drill_bit_case() -> None:
+    result = evaluate_relevance("Milwaukee drill", _listing("Milwaukee Drill Bit Case"))
+    assert result.is_relevant is False
+
+
+def test_dewalt_impact_driver_search_accepts_the_tool_itself() -> None:
+    result = evaluate_relevance("DeWalt impact driver", _listing("DeWalt 20V Impact Driver DCF887"))
+    assert result.is_relevant is True
+
+
+# =====================================================================
 # filter_relevant_listings - the shared service entrypoint
 # =====================================================================
 

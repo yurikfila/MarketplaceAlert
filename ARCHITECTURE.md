@@ -804,19 +804,36 @@ scripts/backfill_listing_metadata.py (CLI)
         -> _apply_enrichment(row, fresh)   (fills only what's still null)
 ```
 
-- **What counts as "missing"**: a row is a backfill candidate if *any* of
-  `price`/`currency`/`image_url`/`condition`/`location`/`seller`/
-  `source_created_at` is `null` - `ListingRepository.list_missing_metadata()`
-  is one `OR`'d `IS NULL` query, ordered newest-first, no new bookkeeping
-  column. This is deliberate: the alternative (a `backfilled_at`/`attempted`
-  column) would need schema changes for a maintenance-only tool, so the
-  "still has a null field" condition is used as the resumability mechanism
-  instead. **Accepted tradeoff**: a row missing a field its source
-  genuinely never provides (e.g. an Etsy row's `condition`, which is `null`
-  by design, permanently) keeps matching every future run - low-risk (each
-  run is bounded by `--limit` anyway, and re-enriching a row that has
-  nothing new to gain is a wasted request, not a wrong one), and considered
-  a better trade than adding schema complexity for it.
+- **What counts as "missing" - fixed after a real production bug** (see
+  PROJECT_CONTEXT.md decision #23 for the full incident writeup). The
+  original design used *only* "does this row have any `null` enrichable
+  field" as the candidate condition, with no memory of what had already
+  been tried - a row missing a field its marketplace genuinely never
+  provides (e.g. Etsy's permanently-`null` `condition`) matched that
+  query forever. Since candidates are selected newest-first up to
+  `--limit`, a batch of these stuck recent rows could occupy every
+  candidate slot in every run, starving older, genuinely-enrichable rows
+  from ever being reached - exactly what production hit.
+
+  `DiscoveredListing` now has `metadata_backfill_status` (`NULL`
+  pending, or terminal `enriched`/`no_data`/`not_found`/`unsupported`,
+  or retryable `failed`) and `metadata_backfill_attempted_at`
+  (nullable, additive migration `3e288e0d0a15`). `ListingRepository
+  .list_missing_metadata()` now filters on **both**: status must be
+  pending/`failed` (the primary gate - a terminal row is never selected
+  again, full stop) **and** at least one enrichable field must still be
+  `null` (an efficiency filter - a row that already had everything at
+  discovery time, e.g. a freshly-scanned eBay listing, is never
+  attempted even though it's technically still "pending", since there'd
+  be nothing to gain).
+
+  **Partial enrichment is terminal - the critical nuance.** A row
+  becomes `enriched` (terminal) the moment a lookup fills in *any*
+  field, even if others stay `null` because the marketplace doesn't
+  provide them for that listing - "done for this backfill generation"
+  is judged by whether an authoritative lookup was successfully applied,
+  never by whether every field happens to be non-`null` afterward (that
+  was the original bug, one level down).
 - **Never overwrites**: `_apply_enrichment()` only ever sets a field when
   the *existing* value is `null` and the freshly-fetched value is not - a
   value the connector already captured (even an old or since-changed one)
@@ -851,17 +868,38 @@ scripts/backfill_listing_metadata.py (CLI)
     429, 5xx, malformed responses), and any other unexpected exception are
     all caught, logged, and counted, and the batch continues with the next
     row.
+  - *An authentication failure gets a per-run circuit breaker, not
+    per-row retries*: `MarketplaceAuthError` (a new
+    `MarketplaceConnectorError` subclass, raised only from
+    `get_listing_by_id()` on a 401/403 - eBay/Etsy/Reverb) is nearly
+    certain to fail identically for every remaining candidate of the
+    same marketplace within one run, so repeating the same doomed
+    request for each one would be a real request-storm risk. The first
+    row that actually hits it is recorded as a genuine (retryable)
+    `failed` attempt; every other already-queued candidate for that
+    marketplace is skipped immediately, with no request and no persisted
+    state change - retried fresh on the next run, not pre-emptively
+    marked failed.
   - *Rate-limit-aware*: a configurable delay
     (`--delay-ms` / `LISTING_BACKFILL_DELAY_MS` /
     `settings.listing_backfill_delay_ms`, default 500ms) is paced between
-    consecutive marketplace requests via `time.sleep()` - never before the
-    very first request of a run.
-  - *Idempotent / resumable*: reruns naturally converge - once a row has no
-    more `null` enrichable fields, it stops matching
-    `list_missing_metadata()` and is never touched again (subject to the
-    accepted tradeoff above). Each enriched row is committed individually,
-    not batched into one giant transaction, so a later failure in the same
-    run can't undo already-applied enrichment.
+    consecutive *actual* marketplace requests via `time.sleep()` - never
+    before the very first request of a run, and never charged for a
+    circuit-breaker-skipped row (no request was made).
+  - *Idempotent / resumable*: a terminal row (`enriched`/`no_data`/
+    `not_found`/`unsupported`) never matches `list_missing_metadata()`
+    again - reruns naturally advance to whatever's still pending or
+    `failed`, rather than getting stuck re-selecting the same rows (see
+    "What counts as missing" above). Each processed row's status is
+    committed individually, not batched into one giant transaction, so a
+    later failure in the same run can't undo already-applied work.
+  - *Explicit retry, never automatic*: `reset_backfill_status()` /
+    `scripts/backfill_listing_metadata.py --reset-status STATUS`
+    (repeatable) / `--retry-no-data` (shorthand for `--reset-status
+    no_data`) deliberately requeues terminal rows - e.g. after improving
+    a connector's extraction. Dry-run by default, like everything else
+    here; performs *only* the reset (never also runs a backfill pass in
+    the same invocation). A normal run never does this on its own.
   - *Dry-run by default*: `run_backfill(..., dry_run=True)` is the
     function's own default (verified directly via `inspect.signature`, not
     just by convention) - it computes and reports exactly what *would*
@@ -873,10 +911,13 @@ scripts/backfill_listing_metadata.py (CLI)
   lifecycle). Flags: `--marketplace` (defaults to all supported
   marketplaces; validated against `is_marketplace_supported` before
   running), `--limit`, `--delay-ms`, `--dry-run` (explicit synonym for the
-  default) / `--apply` (required to write). Prints a summary report
-  (candidates seen, enriched, skipped-unsupported, not-found/deleted,
-  failed, per-marketplace breakdown) - never logs a credential, token, or
-  full request/response body.
+  default) / `--apply` (required to write), `--reset-status`/
+  `--retry-no-data` (the explicit requeue mechanism above - mutually
+  exclusive with a normal backfill pass in the same invocation). Prints a
+  summary report (candidates seen, enriched, no-data, not-found,
+  failed/retryable, skipped-unsupported, skipped-not-configured,
+  per-marketplace breakdown) - never logs a credential, token, or full
+  request/response body.
 - **A real, standalone-script bug found and fixed by actually running the
   CLI end-to-end**, not just via pytest: `DiscoveredListing
   .discovered_by_saved_search_id`'s foreign key

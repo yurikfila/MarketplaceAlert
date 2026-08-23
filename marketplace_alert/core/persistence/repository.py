@@ -12,7 +12,7 @@ from sqlalchemy import Select, func, or_, select
 from sqlalchemy.orm import Session
 
 from marketplace_alert.core.models.listing import Listing
-from marketplace_alert.core.persistence.models import DiscoveredListing
+from marketplace_alert.core.persistence.models import BACKFILL_STATUS_FAILED, DiscoveredListing
 
 ListingSort = Literal["newest", "oldest", "price_asc", "price_desc"]
 
@@ -236,28 +236,53 @@ class ListingRepository:
     def list_missing_metadata(
         self, *, marketplace: str | None = None, limit: int
     ) -> list[DiscoveredListing]:
-        """Rows with at least one backfill-candidate field still `NULL`
-        (price/currency/image_url/condition/location/seller/
-        source_created_at), newest-discovered first - a listing found
-        more recently is more likely to still exist on the source
-        marketplace than an older one, for the same total API budget.
+        """Backfill candidates: rows whose `metadata_backfill_status` is
+        still pending (`NULL`) or retryable (`'failed'`), **and** that
+        still have at least one enrichable field `NULL` - newest-
+        discovered first, since a more recently found listing is more
+        likely to still exist on the source marketplace than an older
+        one, for the same total API budget.
 
         Backs the historical listing-metadata backfill service
         (`core/persistence/backfill.py`) only - never the normal scan/
-        dedup path. This query *is* the backfill mechanism's resumability
-        and idempotency: once a row's fields are all filled in, it stops
-        matching and naturally drops out of future candidate sets, with
-        no separate "already processed" bookkeeping needed.
+        dedup path. **`metadata_backfill_status` is the primary gate**
+        (a real, previously-shipped bug - see PROJECT_CONTEXT.md decision
+        #23 - came from selecting on missing fields *alone*: a row
+        missing only a field its marketplace never provides matched this
+        query forever, permanently occupying candidate slots and
+        starving genuinely-enrichable rows further back in the newest-
+        first order). Status becomes terminal
+        (`core/persistence/models.py`'s `BACKFILL_TERMINAL_STATUSES`) the
+        moment a real backfill run determines there's nothing more to
+        usefully attempt for a row - including a *partial* enrichment
+        (some fields filled, others left `NULL` because the source
+        genuinely doesn't provide them) - so this query naturally stops
+        selecting a row once backfill has done everything it usefully
+        can for it, not merely once every field happens to be non-`NULL`.
+        The missing-field check stays as a secondary filter so a listing
+        that already had every field populated at discovery time (e.g. a
+        freshly-scanned eBay listing) is never selected at all - even
+        though it's still nominally "pending" (never attempted) - since
+        there would be nothing to gain from a lookup.
         """
-        stmt = select(DiscoveredListing).where(
-            or_(
-                DiscoveredListing.price.is_(None),
-                DiscoveredListing.currency.is_(None),
-                DiscoveredListing.image_url.is_(None),
-                DiscoveredListing.condition.is_(None),
-                DiscoveredListing.location.is_(None),
-                DiscoveredListing.seller.is_(None),
-                DiscoveredListing.source_created_at.is_(None),
+        stmt = (
+            select(DiscoveredListing)
+            .where(
+                or_(
+                    DiscoveredListing.metadata_backfill_status.is_(None),
+                    DiscoveredListing.metadata_backfill_status == BACKFILL_STATUS_FAILED,
+                )
+            )
+            .where(
+                or_(
+                    DiscoveredListing.price.is_(None),
+                    DiscoveredListing.currency.is_(None),
+                    DiscoveredListing.image_url.is_(None),
+                    DiscoveredListing.condition.is_(None),
+                    DiscoveredListing.location.is_(None),
+                    DiscoveredListing.seller.is_(None),
+                    DiscoveredListing.source_created_at.is_(None),
+                )
             )
         )
         if marketplace is not None:
@@ -266,6 +291,30 @@ class ListingRepository:
             DiscoveredListing.first_discovered_at.desc(), DiscoveredListing.id.desc()
         ).limit(limit)
         return list(self._session.execute(stmt).scalars().all())
+
+    def reset_backfill_status(
+        self, *, statuses: list[str], marketplace: str | None = None
+    ) -> int:
+        """Reset every row currently in one of `statuses` back to pending
+        (`metadata_backfill_status` and `metadata_backfill_attempted_at`
+        both set to `NULL`), so a future backfill run will reconsider
+        them. Returns how many rows were reset.
+
+        The explicit, deliberate retry mechanism for terminal rows (see
+        `scripts/backfill_listing_metadata.py --reset-status`/
+        `--retry-no-data`) - never called automatically by a normal
+        backfill run. `statuses` is required (no "reset everything"
+        default) so a caller must always say exactly which terminal
+        state they intend to reopen.
+        """
+        stmt = select(DiscoveredListing).where(DiscoveredListing.metadata_backfill_status.in_(statuses))
+        if marketplace is not None:
+            stmt = stmt.where(DiscoveredListing.marketplace == marketplace)
+        rows = list(self._session.execute(stmt).scalars().all())
+        for row in rows:
+            row.metadata_backfill_status = None
+            row.metadata_backfill_attempted_at = None
+        return len(rows)
 
     def list_all(self) -> list[DiscoveredListing]:
         """Every discovered listing, unpaginated - for maintenance operations

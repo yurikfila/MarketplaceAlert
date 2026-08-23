@@ -54,7 +54,7 @@ import httpx
 from pydantic import ValidationError
 
 from marketplace_alert.connectors.ebay.token_manager import EbayTokenManager
-from marketplace_alert.core.connectors.base import MarketplaceConnector, MarketplaceConnectorError
+from marketplace_alert.core.connectors.base import MarketplaceAuthError, MarketplaceConnector, MarketplaceConnectorError
 from marketplace_alert.core.connectors.retry import request_with_retry
 from marketplace_alert.core.models.listing import Listing
 
@@ -208,7 +208,7 @@ class EbayMarketplaceConnector(MarketplaceConnector):
                 response.status_code,
             )
             self._token_manager.invalidate()
-            raise MarketplaceConnectorError(f"eBay API returned HTTP {response.status_code}")
+            raise MarketplaceAuthError(f"eBay API returned HTTP {response.status_code}")
         if response.status_code == 429:
             logger.error("eBay API rate limit exceeded (HTTP 429) during item lookup")
             raise MarketplaceConnectorError("eBay API rate limit exceeded (HTTP 429)")

@@ -21,6 +21,32 @@ class MarketplaceConnectorError(Exception):
     """
 
 
+class MarketplaceAuthError(MarketplaceConnectorError):
+    """A ``MarketplaceConnectorError`` specifically caused by an
+    authentication/authorization failure (HTTP 401/403) - a *configured*
+    credential that the marketplace itself rejected as missing, invalid,
+    or revoked. Distinct from every other ``MarketplaceConnectorError``
+    (timeout, 429, 5xx, malformed response) because it means every other
+    request using the same credential is essentially certain to fail the
+    same way too - not a one-off transient blip worth retrying per row.
+
+    A plain ``except MarketplaceConnectorError`` anywhere in the codebase
+    still catches this (it's a subclass), so nothing that already handles
+    connector failures needs to change. Only
+    ``core/persistence/backfill.py`` currently checks for this specific
+    subclass, to stop attempting further rows for the same marketplace
+    within one backfill run rather than repeating the same failing
+    request across every remaining candidate (see that module's
+    docstring for why - a request-storm risk this exists to prevent).
+
+    Raised only from ``get_listing_by_id()`` implementations today (the
+    only place a connector failure could otherwise repeat many times in
+    quick succession within one process) - existing ``search()`` 401/403
+    handling is untouched, since a single search request failing once
+    per scan was never the request-storm risk this class exists for.
+    """
+
+
 class ListingLookupNotSupportedError(Exception):
     """Raised by ``get_listing_by_id()`` when a connector has no documented,
     authoritative single-item lookup - e.g. Bonanza's Bonapitit API has no

@@ -5,7 +5,7 @@ import pytest
 
 from marketplace_alert.connectors.etsy.connector import EtsyMarketplaceConnector
 from marketplace_alert.core.connectors import retry as retry_module
-from marketplace_alert.core.connectors.base import MarketplaceConnectorError
+from marketplace_alert.core.connectors.base import MarketplaceAuthError, MarketplaceConnectorError
 from marketplace_alert.core.models.listing import Listing
 
 
@@ -320,6 +320,21 @@ def test_get_listing_by_id_returns_a_fully_normalized_listing(monkeypatch: pytes
 def test_get_listing_by_id_returns_none_on_404(monkeypatch: pytest.MonkeyPatch) -> None:
     _mock_get_item(monkeypatch, httpx.Response(404))
     assert _connector().get_listing_by_id("000000000") is None
+
+
+def test_get_listing_by_id_unauthorized_raises_marketplace_auth_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_get_item(monkeypatch, httpx.Response(401))
+    # MarketplaceAuthError specifically - not just any MarketplaceConnectorError
+    # - so the historical backfill service can circuit-break on it (see
+    # core/persistence/backfill.py's module docstring).
+    with pytest.raises(MarketplaceAuthError):
+        _connector().get_listing_by_id("123456789")
+
+
+def test_get_listing_by_id_forbidden_raises_marketplace_auth_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_get_item(monkeypatch, httpx.Response(403))
+    with pytest.raises(MarketplaceAuthError):
+        _connector().get_listing_by_id("123456789")
 
 
 def test_get_listing_by_id_missing_credentials_raises_before_any_network_call(

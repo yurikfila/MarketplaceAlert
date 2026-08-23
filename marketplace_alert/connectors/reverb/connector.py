@@ -80,7 +80,7 @@ from urllib.parse import quote
 import httpx
 from pydantic import ValidationError
 
-from marketplace_alert.core.connectors.base import MarketplaceConnector, MarketplaceConnectorError
+from marketplace_alert.core.connectors.base import MarketplaceAuthError, MarketplaceConnector, MarketplaceConnectorError
 from marketplace_alert.core.connectors.retry import request_with_retry
 from marketplace_alert.core.models.listing import Listing
 
@@ -280,7 +280,7 @@ class ReverbMarketplaceConnector(MarketplaceConnector):
                 "Reverb API returned HTTP %s during item lookup - token missing, invalid, or revoked",
                 response.status_code,
             )
-            raise MarketplaceConnectorError(
+            raise MarketplaceAuthError(
                 f"Reverb API returned HTTP {response.status_code} (check REVERB_API_TOKEN)"
             )
         if response.status_code == 429:

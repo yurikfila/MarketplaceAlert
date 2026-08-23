@@ -77,7 +77,7 @@ from urllib.parse import quote
 import httpx
 from pydantic import ValidationError
 
-from marketplace_alert.core.connectors.base import MarketplaceConnector, MarketplaceConnectorError
+from marketplace_alert.core.connectors.base import MarketplaceAuthError, MarketplaceConnector, MarketplaceConnectorError
 from marketplace_alert.core.connectors.retry import request_with_retry
 from marketplace_alert.core.models.listing import Listing
 
@@ -219,6 +219,14 @@ class EtsyMarketplaceConnector(MarketplaceConnector):
         if response.status_code == 404:
             logger.info("Etsy item lookup: listing no longer exists (404)")
             return None
+        if response.status_code in (401, 403):
+            logger.error(
+                "Etsy API returned HTTP %s during item lookup - key/secret missing, invalid, or revoked",
+                response.status_code,
+            )
+            raise MarketplaceAuthError(
+                f"Etsy API returned HTTP {response.status_code} (check ETSY_API_KEY/ETSY_SHARED_SECRET)"
+            )
         if response.status_code != 200:
             logger.error("Etsy API returned HTTP %s during item lookup", response.status_code)
             raise MarketplaceConnectorError(f"Etsy API returned HTTP {response.status_code}")

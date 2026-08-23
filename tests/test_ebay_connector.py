@@ -5,7 +5,7 @@ import pytest
 
 from marketplace_alert.connectors.ebay.connector import EbayMarketplaceConnector
 from marketplace_alert.core.connectors import retry as retry_module
-from marketplace_alert.core.connectors.base import MarketplaceConnectorError
+from marketplace_alert.core.connectors.base import MarketplaceAuthError, MarketplaceConnectorError
 from marketplace_alert.core.models.listing import Listing
 
 _TOKEN_BODY = {"access_token": "fake-access-token", "expires_in": 7200}
@@ -352,9 +352,18 @@ def test_get_listing_by_id_returns_none_on_404(monkeypatch: pytest.MonkeyPatch) 
 def test_get_listing_by_id_unauthorized_invalidates_token_and_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _mock_token_and_get_item(monkeypatch, httpx.Response(401))
     connector = _connector()
-    with pytest.raises(MarketplaceConnectorError):
+    # MarketplaceAuthError specifically - not just any MarketplaceConnectorError
+    # - so the historical backfill service can circuit-break on it (see
+    # core/persistence/backfill.py's module docstring).
+    with pytest.raises(MarketplaceAuthError):
         connector.get_listing_by_id("v1|123456789|0")
     assert connector._token_manager._access_token is None
+
+
+def test_get_listing_by_id_forbidden_raises_marketplace_auth_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_token_and_get_item(monkeypatch, httpx.Response(403))
+    with pytest.raises(MarketplaceAuthError):
+        _connector().get_listing_by_id("v1|123456789|0")
 
 
 def test_get_listing_by_id_rate_limit_raises(monkeypatch: pytest.MonkeyPatch) -> None:

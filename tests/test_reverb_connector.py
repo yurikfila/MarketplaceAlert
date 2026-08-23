@@ -5,7 +5,7 @@ import pytest
 
 from marketplace_alert.connectors.reverb.connector import ReverbMarketplaceConnector
 from marketplace_alert.core.connectors import retry as retry_module
-from marketplace_alert.core.connectors.base import MarketplaceConnectorError
+from marketplace_alert.core.connectors.base import MarketplaceAuthError, MarketplaceConnectorError
 from marketplace_alert.core.models.listing import Listing
 
 
@@ -593,7 +593,16 @@ def test_get_listing_by_id_missing_token_raises_before_any_network_call(monkeypa
 
 def test_get_listing_by_id_401_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _mock_get_item(monkeypatch, httpx.Response(401))
-    with pytest.raises(MarketplaceConnectorError):
+    # MarketplaceAuthError specifically - not just any MarketplaceConnectorError
+    # - so the historical backfill service can circuit-break on it (see
+    # core/persistence/backfill.py's module docstring).
+    with pytest.raises(MarketplaceAuthError):
+        _connector().get_listing_by_id("84838674")
+
+
+def test_get_listing_by_id_403_raises_marketplace_auth_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_get_item(monkeypatch, httpx.Response(403))
+    with pytest.raises(MarketplaceAuthError):
         _connector().get_listing_by_id("84838674")
 
 

@@ -5,6 +5,101 @@ All notable changes to this project are recorded here. Format is roughly
 
 ## [Unreleased]
 
+## 2026-08-23 — Backfill candidate-selection fix (production bug)
+
+**A real bug found by running the historical backfill (added earlier the
+same day) against production**: the candidate query selected any row
+with *any* enrichable field still `null`, with no memory of what had
+already been tried. A row missing only a field its marketplace
+genuinely never provides (e.g. Etsy's permanently-`null` `condition`)
+matched that query forever - since candidates are always selected
+newest-first up to `--limit`, a batch of these stuck rows occupied every
+candidate slot in every run, starving older, genuinely-enrichable rows
+from ever being reached. Confirmed directly in production: after the
+first applied batch, a follow-up dry-run at `--limit 25` re-selected
+some of the same rows (0 newly enriched), while `--limit 50` reached a
+second batch of 25 that were all freely enrichable once the query
+actually got to them. See PROJECT_CONTEXT.md decision #23 for the full
+incident writeup.
+
+### Added
+- `DiscoveredListing.metadata_backfill_status` /
+  `.metadata_backfill_attempted_at` (nullable, additive migration
+  `3e288e0d0a15`) - explicit, persisted terminal/retryable state per
+  row, replacing "still has a null field" as the sole resumability
+  mechanism. Terminal (`enriched`/`no_data`/`not_found`/`unsupported`)
+  rows are never selected as candidates again; retryable (`failed`)
+  rows remain eligible. Every existing row defaults to `null`
+  (pending) - the migration does not mark anything complete.
+  **Partial enrichment is terminal**: a row becomes `enriched` the
+  moment a lookup fills in *any* field, even if others stay `null`
+  because the marketplace doesn't provide them - "done for this
+  generation" is judged by whether a lookup was applied, never by
+  whether every field ended up non-`null`.
+- `MarketplaceAuthError(MarketplaceConnectorError)`
+  (`core/connectors/base.py`) - raised by eBay/Etsy/Reverb's
+  `get_listing_by_id()` specifically for 401/403 (never from `search()`,
+  untouched). `run_backfill` uses it as a per-run circuit breaker: the
+  first row that hits it is recorded as a genuine retryable `failed`
+  attempt; every other already-queued candidate for that marketplace is
+  skipped with no request and no persisted state change, avoiding a
+  request storm against a credential that's almost certainly going to
+  keep failing identically for the rest of the batch.
+- An unconfigured marketplace (missing credentials right now) is
+  deliberately **never** persisted as terminal, unlike a structurally
+  unsupported one (no connector capability at all) - an operational
+  condition an operator can fix without a data migration shouldn't
+  permanently lock rows out.
+- `ListingRepository.reset_backfill_status()` /
+  `scripts/backfill_listing_metadata.py --reset-status STATUS`
+  (repeatable) / `--retry-no-data` - the explicit, deliberate way to
+  requeue terminal rows (e.g. after improving a connector's extraction).
+  Dry-run by default; performs only the reset, never also a backfill
+  pass in the same invocation.
+- `tests/test_backfill.py` grew from ~28 to 53 tests - every
+  terminal/retryable status persisted correctly, partial enrichment is
+  terminal, the auth circuit breaker (one real request per marketplace
+  per run, skipped rows left completely untouched, retryable next run),
+  unconfigured-vs-unsupported persistence distinction, reset/retry
+  (dry-run and apply, marketplace filter, status filter), and a direct
+  regression test reproducing the exact production scenario (25 stuck
+  "no_data" rows followed by 25 genuinely enrichable ones - the second
+  batch must be reached after one applied run, not blocked forever).
+  `tests/test_persistence.py` gained coverage for the new status-aware
+  `list_missing_metadata()` filter and `reset_backfill_status()`.
+  `tests/test_ebay_connector.py` / `test_etsy_connector.py` /
+  `test_reverb_connector.py` gained `MarketplaceAuthError`-specific
+  assertions for 401/403 on `get_listing_by_id`.
+
+### Changed
+- `ListingRepository.list_missing_metadata()` now filters on
+  `metadata_backfill_status` (pending/`failed`) **and** the existing
+  missing-field check (an efficiency filter - a row already fully
+  populated at discovery time is never attempted even though it's
+  technically "pending").
+- `core/persistence/backfill.py` persists a status after every real
+  (non-dry-run) outcome via one shared `_persist_status()` helper - the
+  single place the "dry-run writes nothing" guarantee is enforced for
+  status, so no call site needs its own `if not dry_run` check.
+- `BackfillSummary`'s `no_change`/`skipped_unsupported_marketplace`
+  fields renamed to `no_data`/`skipped_unsupported` +
+  `skipped_unconfigured` (split into the structural-vs-operational
+  distinction above) - an internal rename, the CLI's report labels
+  updated to match.
+
+### Not run
+- No production backfill/reset was executed as part of this fix -
+  implemented, tested, and validated locally (including a real
+  end-to-end CLI smoke test against the developer's local database with
+  real eBay/Etsy credentials) only. See the final report for the exact
+  next dry-run command.
+
+### Not changed
+- No scheduler/relevance-engine/deduplication/Telegram-notification
+  change, no connector `search()` behavior change (only
+  `get_listing_by_id`, backfill-only, gained the auth-error
+  distinction), no mobile code change, no marketplace added or removed.
+
 ## 2026-08-23 — Listing enrichment + historical backfill
 
 **Closes the gap between "the schema can hold rich metadata" (the

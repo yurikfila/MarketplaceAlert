@@ -1158,6 +1158,71 @@ marketplace connector yet.
       manual-only). See CHANGELOG.md's 2026-08-23 entry for the exact
       dry-run findings and the proposed safe next step.
 
+23. **Backfill candidate-selection fix (2026-08-23): a real production
+    bug, found by actually running decision #22's backfill against
+    production - a "still missing a field" query has no memory of what's
+    already been tried, so it doesn't converge.** After the first
+    production `--apply` batch, a second dry-run showed some of the
+    *same* rows re-appearing as candidates with nothing new to offer,
+    and a subsequent applied run selected 25 candidates and enriched
+    zero of them - every one had already been fully processed but still
+    had a `null` field the marketplace genuinely never provides (e.g.
+    Etsy's permanently-`null` `condition`/`location`). Because
+    `list_missing_metadata()` ordered newest-first and had no concept of
+    "already dealt with", these stuck rows permanently occupied every
+    candidate slot in every run, starving older, genuinely-enrichable
+    rows from ever being reached - a `--limit 50` dry-run proved this
+    directly, enriching a second batch of 25 rows that `--limit 25`
+    alone could never reach (those 25 were freely enrichable once the
+    query actually got to them).
+    - **Fix: `DiscoveredListing` gained `metadata_backfill_status` /
+      `metadata_backfill_attempted_at`** (nullable, additive migration
+      `3e288e0d0a15`) - explicit, persisted terminal/retryable state per
+      row, replacing "does this row still have a null field" as the
+      resumability mechanism. Terminal (`enriched`/`no_data`/
+      `not_found`/`unsupported`) rows are never selected again;
+      retryable (`failed`) rows remain eligible. See ARCHITECTURE.md
+      "Historical listing metadata backfill" for the complete state
+      model and `core/persistence/models.py`'s `BACKFILL_STATUS_*`
+      constants for exactly what each value means.
+    - **Partial enrichment is terminal - a deliberate, easy-to-get-wrong
+      nuance.** A row is `enriched` (terminal) the moment a lookup fills
+      in *any* field, even if other fields stay `null` because the
+      marketplace itself doesn't provide them for that listing. The
+      alternative (only terminal once every field is non-`null`) is
+      exactly the bug this fix closes, just moved one level down.
+    - **An unconfigured marketplace (missing credentials right now) is
+      never persisted as terminal, unlike a structurally unsupported
+      one (no connector capability at all, e.g. Bonanza).** The former
+      is an operational condition an operator can fix without a data
+      migration; persisting a terminal status for it would mean adding
+      the missing credential later still wouldn't reopen those rows. The
+      distinction is `_STRUCTURAL_SKIP_REASONS` in
+      `core/persistence/backfill.py`.
+    - **A new `MarketplaceAuthError(MarketplaceConnectorError)` gives
+      authentication failures (401/403) a per-run circuit breaker,
+      raised only from `get_listing_by_id()` (eBay/Etsy/Reverb), never
+      from `search()`.** A configured-but-rejected credential is nearly
+      certain to fail identically for every remaining candidate in the
+      same marketplace within one run - continuing to retry each one
+      individually would be a real request-storm risk. The first row
+      that actually hits it is recorded as a genuine (retryable) `failed`
+      attempt; every other already-queued candidate for that marketplace
+      is skipped with no request and no persisted state change, so it's
+      retried fresh (not pre-emptively marked failed) on the next run.
+    - **`reset_backfill_status()` / `scripts/backfill_listing_metadata.py
+      --reset-status` / `--retry-no-data`** - the explicit, deliberate way
+      to requeue terminal rows (e.g. after improving a connector's
+      extraction). Dry-run by default, same as everything else in this
+      feature. Never invoked automatically by a normal run - decision
+      #6's "manual maintenance tool" character is unchanged, this only
+      adds an intentional escape hatch to it.
+    - **No index added on `metadata_backfill_status`**, despite it now
+      being the primary candidate-query filter - same "don't optimize
+      without evidence" discipline as decision #19/#21's index
+      decisions; the production table is still small (187 rows).
+      Revisit if it grows enough to matter.
+
 ## Things that have NOT yet been implemented
 
 - Any marketplace beyond mock/Etsy/eBay/Reverb/Bonanza. Nine additional

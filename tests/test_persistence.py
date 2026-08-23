@@ -260,3 +260,98 @@ def test_list_missing_metadata_orders_newest_discovered_first(db_session) -> Non
     candidates = ListingRepository(db_session).list_missing_metadata(limit=10)
 
     assert [c.external_listing_id for c in candidates] == ["new", "old"]
+
+
+def test_list_missing_metadata_excludes_a_terminal_status_row_even_with_a_null_field(db_session) -> None:
+    """The exact fix for the production bug: a row with a terminal
+    metadata_backfill_status must never be selected again, regardless of
+    whether it still has a null enrichable field (e.g. condition, which
+    some marketplaces never provide)."""
+    from marketplace_alert.core.persistence.models import BACKFILL_STATUS_NO_DATA
+
+    _bare_row(db_session, external_id="terminal", condition=None, metadata_backfill_status=BACKFILL_STATUS_NO_DATA)
+
+    candidates = ListingRepository(db_session).list_missing_metadata(limit=10)
+
+    assert candidates == []
+
+
+def test_list_missing_metadata_includes_a_pending_row_with_null_status(db_session) -> None:
+    _bare_row(db_session, external_id="pending", condition=None, metadata_backfill_status=None)
+
+    candidates = ListingRepository(db_session).list_missing_metadata(limit=10)
+
+    assert len(candidates) == 1
+
+
+def test_list_missing_metadata_includes_a_failed_status_row(db_session) -> None:
+    """`failed` is retryable, not terminal - it must stay selectable."""
+    from marketplace_alert.core.persistence.models import BACKFILL_STATUS_FAILED
+
+    _bare_row(db_session, external_id="retryable", condition=None, metadata_backfill_status=BACKFILL_STATUS_FAILED)
+
+    candidates = ListingRepository(db_session).list_missing_metadata(limit=10)
+
+    assert len(candidates) == 1
+
+
+def test_list_missing_metadata_excludes_every_terminal_status(db_session) -> None:
+    from marketplace_alert.core.persistence.models import BACKFILL_TERMINAL_STATUSES
+
+    for status in BACKFILL_TERMINAL_STATUSES:
+        _bare_row(db_session, external_id=f"terminal-{status}", condition=None, metadata_backfill_status=status)
+
+    candidates = ListingRepository(db_session).list_missing_metadata(limit=10)
+
+    assert candidates == []
+
+
+# --- reset_backfill_status ------------------------------------------------
+
+
+def test_reset_backfill_status_clears_status_and_attempted_at(db_session) -> None:
+    from marketplace_alert.core.persistence.models import BACKFILL_STATUS_NO_DATA
+
+    row = _bare_row(
+        db_session,
+        external_id="a",
+        condition=None,
+        metadata_backfill_status=BACKFILL_STATUS_NO_DATA,
+        metadata_backfill_attempted_at=datetime.now(timezone.utc),
+    )
+
+    count = ListingRepository(db_session).reset_backfill_status(statuses=[BACKFILL_STATUS_NO_DATA])
+    db_session.commit()
+
+    assert count == 1
+    db_session.refresh(row)
+    assert row.metadata_backfill_status is None
+    assert row.metadata_backfill_attempted_at is None
+
+
+def test_reset_backfill_status_only_matches_given_statuses(db_session) -> None:
+    from marketplace_alert.core.persistence.models import BACKFILL_STATUS_NO_DATA, BACKFILL_STATUS_NOT_FOUND
+
+    _bare_row(db_session, external_id="a", condition=None, metadata_backfill_status=BACKFILL_STATUS_NO_DATA)
+    _bare_row(db_session, external_id="b", condition=None, metadata_backfill_status=BACKFILL_STATUS_NOT_FOUND)
+
+    count = ListingRepository(db_session).reset_backfill_status(statuses=[BACKFILL_STATUS_NO_DATA])
+    db_session.commit()
+
+    assert count == 1
+    row_b = ListingRepository(db_session).get("mock", "b")
+    assert row_b.metadata_backfill_status == BACKFILL_STATUS_NOT_FOUND
+
+
+def test_reset_backfill_status_respects_marketplace_filter(db_session) -> None:
+    from marketplace_alert.core.persistence.models import BACKFILL_STATUS_NO_DATA
+
+    _bare_row(db_session, marketplace="mock", external_id="m1", condition=None, metadata_backfill_status=BACKFILL_STATUS_NO_DATA)
+    _bare_row(db_session, marketplace="etsy", external_id="e1", condition=None, metadata_backfill_status=BACKFILL_STATUS_NO_DATA)
+
+    count = ListingRepository(db_session).reset_backfill_status(statuses=[BACKFILL_STATUS_NO_DATA], marketplace="mock")
+    db_session.commit()
+
+    assert count == 1
+    row_etsy = ListingRepository(db_session).get("etsy", "e1")
+    assert row_etsy.metadata_backfill_status == BACKFILL_STATUS_NO_DATA

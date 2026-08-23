@@ -13,6 +13,27 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from marketplace_alert.core.persistence.database import Base
 
+# `DiscoveredListing.metadata_backfill_status` values - see that column's
+# docstring below for what each one means and why. Defined here (rather
+# than in `core/persistence/backfill.py`) so both the repository's
+# candidate query and the backfill service can import the same constants
+# without a circular import (the service already imports the repository).
+BACKFILL_STATUS_ENRICHED = "enriched"
+BACKFILL_STATUS_NO_DATA = "no_data"
+BACKFILL_STATUS_NOT_FOUND = "not_found"
+BACKFILL_STATUS_UNSUPPORTED = "unsupported"
+BACKFILL_STATUS_FAILED = "failed"
+
+# Terminal: once persisted, a row in one of these states is never selected
+# as a backfill candidate again. `BACKFILL_STATUS_FAILED` is deliberately
+# excluded - it's retryable, not terminal.
+BACKFILL_TERMINAL_STATUSES = (
+    BACKFILL_STATUS_ENRICHED,
+    BACKFILL_STATUS_NO_DATA,
+    BACKFILL_STATUS_NOT_FOUND,
+    BACKFILL_STATUS_UNSUPPORTED,
+)
+
 
 class DiscoveredListing(Base):
     """A listing previously discovered, keyed by (marketplace, external_listing_id)."""
@@ -101,3 +122,38 @@ class DiscoveredListing(Base):
         nullable=True,
         index=True,
     )
+
+    # --- Historical metadata backfill state (added in the backfill
+    # candidate-selection fix pass) ---
+    #
+    # `None` means "never attempted" (pending) - the default for every
+    # row, including a brand-new one from a normal scan. A row that
+    # already has every enrichable field populated at discovery time
+    # simply never becomes a backfill candidate regardless of this
+    # status (see `ListingRepository.list_missing_metadata`'s combined
+    # status-and-missing-field filter), so defaulting every row to
+    # "pending" costs nothing extra - it only matters for rows that
+    # genuinely still need a lookup.
+    #
+    # Terminal (a row in one of these states is never selected as a
+    # backfill candidate again, once persisted - see
+    # `BACKFILL_TERMINAL_STATUSES` below): `enriched` (an authoritative
+    # lookup filled in at least one field - this backfill generation is
+    # done for this row, even if some fields remain `None` because the
+    # marketplace itself doesn't provide them for this listing -
+    # PROJECT_CONTEXT.md decision #23), `no_data` (the lookup succeeded
+    # but had nothing new to add), `not_found` (the marketplace
+    # confirmed the listing no longer exists), `unsupported` (this
+    # marketplace has no connector lookup capability at all - a
+    # structural fact, not a temporary condition).
+    #
+    # Retryable: `failed` (a transient failure - timeout/429/5xx/
+    # malformed response) stays eligible for a future run, same as
+    # `None`. A marketplace that's merely *unconfigured* right now
+    # (missing credentials) is never persisted here at all - that's an
+    # operational condition that can change without a data migration
+    # (an operator adding the missing credential), so those rows are
+    # simply left `None`/untouched and naturally retried whenever the
+    # marketplace becomes configured.
+    metadata_backfill_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    metadata_backfill_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

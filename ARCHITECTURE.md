@@ -45,6 +45,7 @@ class MarketplaceConnector(ABC):
     def search(self, query: str, filters: dict | None = None) -> list[Listing]: ...
     def normalize_listing(self, raw_listing: Any) -> Listing: ...
     def health_check(self) -> bool: ...
+    def get_listing_by_id(self, external_listing_id: str) -> Listing | None: ...  # optional
 ```
 
 Rules for connectors:
@@ -61,6 +62,20 @@ Rules for connectors:
   `marketplace_alert/connectors/<name>/` (created when the first real
   connector is implemented) — it must never require changes to the core
   engine, the `Listing` model, or other connectors.
+- `get_listing_by_id(external_listing_id)` is an **optional capability**,
+  added for the historical backfill service (see "Historical listing
+  metadata backfill" below): re-fetches one listing's current, authoritative
+  state by its own id. `MarketplaceConnector` provides a concrete default
+  implementation that raises `ListingLookupNotSupportedError` - a connector
+  only overrides it when the marketplace has a real, documented single-item
+  endpoint (eBay, Etsy, Reverb, and the mock connector do; Bonanza
+  deliberately does not - no confirmed endpoint was found). Callers detect
+  support with a class-level identity check
+  (`type(connector).get_listing_by_id is not MarketplaceConnector.get_listing_by_id`)
+  rather than calling it and catching the exception, so checking support
+  never costs a wasted API call. Returns `None` if the marketplace confirms
+  the listing no longer exists (e.g. a 404) - a real, expected outcome for
+  an old listing, distinct from a transient failure.
 
 **Resolving a connector by name**: `marketplace_alert/connectors/registry.py`
 maps a marketplace name (e.g. `"mock"`, `"etsy"`, `"ebay"`, `"reverb"`,
@@ -307,9 +322,16 @@ Quickstart tutorial, and the Definitions page.
 - **Endpoint**: `GET https://api.etsy.com/v3/application/listings/active`
   (operation `findAllListingsActive`) - searches active listings
   marketplace-wide by keyword (`keywords` query param), not scoped to one
-  shop. `limit`/`offset` paginate (Etsy's own max `limit` is 100);
-  `includes=Images` is passed so image URLs come back in the same request
-  instead of a second call per listing.
+  shop. `limit`/`offset` paginate (Etsy's own max `limit` is 100).
+  **`findAllListingsActive` does not accept an `includes` parameter at
+  all** - confirmed live (not just from documentation) during the Listing
+  Enrichment + Historical Backfill pass (2026-08-23): a real search request
+  with `includes=Images` still comes back with no `images` key whatsoever,
+  meaning this connector's `search()` has never actually returned an Etsy
+  image, in production or otherwise, since it was first built. The dead
+  parameter has been removed from the search request (see "Historical
+  listing metadata backfill" below for the one endpoint that genuinely does
+  return image data).
 - **Auth**: every request needs an `x-api-key` header of the form
   `"<ETSY_API_KEY>:<ETSY_SHARED_SECRET>"` - keystring and shared secret,
   colon-separated, confirmed from Etsy's own quickstart code samples. No
@@ -324,14 +346,19 @@ Quickstart tutorial, and the Definitions page.
   Etsy's own Definitions page, not assumed.
 - **Field mapping**: `listing_id` → `external_listing_id`, `title`,
   `description`, `url` → `listing_url`, computed price/`currency_code`,
-  `images[0].url_570xN` (falling back to `url_fullxfull`) → `image_url`,
-  `original_creation_timestamp` (Unix seconds) → `created_at`.
-  `location`/`seller`/`condition` are left `null` - Etsy has no direct
-  "condition" concept (it's a handmade/vintage/craft marketplace, not
-  general resale), and mapping shop name/location would need an
-  `includes=Shop` request and schema verification not done yet. Per the
-  connector-interface rule, a field that isn't confidently known is left
-  `null`, never invented.
+  `original_creation_timestamp` (Unix seconds) → `created_at`. `image_url`
+  (from `images[0].url_570xN`, falling back to `url_fullxfull`) and
+  `seller` (from `shop.shop_name`) are only ever populated when the raw
+  listing came from `get_listing_by_id()` below, since search responses
+  never carry an `images` or `shop` key at all - a listing discovered via
+  `search()` genuinely has neither field available yet. `location` is left
+  `null` everywhere - no Etsy field for a shop's precise location was
+  confirmed with enough confidence to extract safely. `condition` is left
+  `null` everywhere, permanently: Etsy has no condition concept at all - it
+  has `who_made`/`when_made`/`is_supply` instead, a different semantic
+  category (handmade/vintage/craft classification, not physical wear).
+  Per the connector-interface rule, a field that isn't confidently known is
+  left `null`, never invented.
 - **Configuration**: `EtsyMarketplaceConnector.__init__` takes
   `api_key`/`shared_secret` explicitly (the registry wires these from
   `settings.etsy_api_key`/`settings.etsy_shared_secret`, i.e.
@@ -421,6 +448,14 @@ written.
   key entirely when a search matches nothing, rather than returning an
   empty array - the connector treats a missing key as "0 results" (not an
   error), but a *present*, non-list `itemSummaries` as malformed.
+- **Single-item lookup**: `get_listing_by_id()` calls
+  `GET https://api.ebay.com/buy/browse/v1/item/{item_id}` (the Browse API's
+  Get Item operation, confirmed via eBay's own reference to use the
+  identical RESTful `itemId` format and reuse the same field/type names as
+  `item_summary/search` results) - so `normalize_listing()` is reused
+  completely unchanged for both search and single-item lookup. Used only by
+  the historical backfill service (see "Historical listing metadata
+  backfill" below); a 404 returns `None` (the listing no longer exists).
 - **Configuration**: `EbayMarketplaceConnector.__init__` takes
   `app_id`/`cert_id` explicitly (the registry wires these from
   `settings.ebay_app_id`/`settings.ebay_cert_id`) - it never reads settings
@@ -520,6 +555,16 @@ that field is `null` for a listing, never fabricated data.
   all, so this is never invented from unrelated data. Any field not
   present for a given listing is left `null`, never guessed - same rule
   as Etsy/eBay.
+- **Single-item lookup**: `get_listing_by_id()` calls
+  `GET https://api.reverb.com/api/listings/{id}` (confirmed via Reverb's
+  own official docs), reusing the same `Authorization`/`Accept`/
+  `Accept-Version` headers as search and reusing `normalize_listing()`
+  completely unchanged - a REST-convention assumption (search is
+  `/api/listings?query=`, this is `/api/listings/{id}`) documented
+  honestly as inferred, not independently confirmed by a worked example,
+  same as this connector's other inferred field mappings above. Used only
+  by the historical backfill service (see "Historical listing metadata
+  backfill" below).
 - **Character encoding**: `httpx`'s own JSON decoding (`response.json()`)
   correctly handles UTF-8 per RFC 8259 - titles/descriptions with
   accents, symbols, or emoji round-trip intact. A dedicated test
@@ -737,6 +782,115 @@ listings plus a count of how many were already seen. Unlike `/search`,
 zero) new listings the second time. Route handlers only orchestrate
 (connector search -> service call -> shape the response) and never contain
 raw persistence logic themselves.
+
+## Historical listing metadata backfill
+
+`marketplace_alert/core/persistence/backfill.py` (`run_backfill`), added in
+the Listing Enrichment + Historical Backfill pass (2026-08-23), re-fetches
+individual **pre-existing** `discovered_listings` rows from their source
+marketplace, by id, to fill in fields that were `null` because they were
+discovered before rich metadata persistence existed (the Listings
+product-experience pass, decision #21) or before a connector could extract
+a given field at all (e.g. Etsy's `seller`, only obtainable via
+`get_listing_by_id`, never `search()` - see "The Etsy connector" above).
+It is a maintenance tool, not part of the normal scan pipeline - nothing
+calls it automatically.
+
+```
+scripts/backfill_listing_metadata.py (CLI)
+    -> run_backfill(session, resolve_connector, is_marketplace_supported, ...)
+        -> ListingRepository.list_missing_metadata()   (candidate rows)
+        -> connector.get_listing_by_id(external_listing_id)   (per row, per marketplace)
+        -> _apply_enrichment(row, fresh)   (fills only what's still null)
+```
+
+- **What counts as "missing"**: a row is a backfill candidate if *any* of
+  `price`/`currency`/`image_url`/`condition`/`location`/`seller`/
+  `source_created_at` is `null` - `ListingRepository.list_missing_metadata()`
+  is one `OR`'d `IS NULL` query, ordered newest-first, no new bookkeeping
+  column. This is deliberate: the alternative (a `backfilled_at`/`attempted`
+  column) would need schema changes for a maintenance-only tool, so the
+  "still has a null field" condition is used as the resumability mechanism
+  instead. **Accepted tradeoff**: a row missing a field its source
+  genuinely never provides (e.g. an Etsy row's `condition`, which is `null`
+  by design, permanently) keeps matching every future run - low-risk (each
+  run is bounded by `--limit` anyway, and re-enriching a row that has
+  nothing new to gain is a wasted request, not a wrong one), and considered
+  a better trade than adding schema complexity for it.
+- **Never overwrites**: `_apply_enrichment()` only ever sets a field when
+  the *existing* value is `null` and the freshly-fetched value is not - a
+  value the connector already captured (even an old or since-changed one)
+  is never replaced. Identity fields (`marketplace`, `external_listing_id`),
+  `first_discovered_at`, and `discovered_by_saved_search_id` are never
+  touched at all - only enrichable metadata fields can change.
+- **The single most important safety property, structural, not just
+  tested**: enriching a row must never make the notification pipeline
+  think an old listing was newly discovered. `run_backfill` **never
+  imports** `NotificationService`/`NotificationProvider`, and **never
+  calls** `ListingDiscoveryService`/`ListingRepository.save_new()` - it
+  only ever updates columns on a row that already exists via `save_new`'s
+  original call, so no "new listing" code path can ever run again for it.
+  Proven two ways in `tests/test_backfill.py`: structurally (an AST-based
+  check that the module's own import statements contain no notification
+  dependency - not a source-text grep, which would also flag the
+  docstring's own prose explaining this guarantee) and behaviorally
+  (`test_enriching_a_row_never_makes_it_look_newly_discovered` runs the
+  same listing through the real `ListingDiscoveryService.process_listings()`
+  after backfill and confirms it's still classified as already-seen, never
+  new).
+- **Safety properties, all deliberate, all tested**:
+  - *Bounded*: `--limit` (`LISTING_BACKFILL_BATCH_SIZE` /
+    `settings.listing_backfill_batch_size`, default 25) caps one
+    invocation's row count - never unbounded.
+  - *Marketplace-isolated*: connector resolution/support is checked once
+    per marketplace at the start of a batch (`_resolve_backfill_connector`),
+    not per row - one unsupported or unconfigured marketplace among several
+    candidate rows never blocks the others.
+  - *Failure-isolated*: each row is wrapped in its own try/except -
+    `ListingLookupNotSupportedError`, `MarketplaceConnectorError` (timeouts,
+    429, 5xx, malformed responses), and any other unexpected exception are
+    all caught, logged, and counted, and the batch continues with the next
+    row.
+  - *Rate-limit-aware*: a configurable delay
+    (`--delay-ms` / `LISTING_BACKFILL_DELAY_MS` /
+    `settings.listing_backfill_delay_ms`, default 500ms) is paced between
+    consecutive marketplace requests via `time.sleep()` - never before the
+    very first request of a run.
+  - *Idempotent / resumable*: reruns naturally converge - once a row has no
+    more `null` enrichable fields, it stops matching
+    `list_missing_metadata()` and is never touched again (subject to the
+    accepted tradeoff above). Each enriched row is committed individually,
+    not batched into one giant transaction, so a later failure in the same
+    run can't undo already-applied enrichment.
+  - *Dry-run by default*: `run_backfill(..., dry_run=True)` is the
+    function's own default (verified directly via `inspect.signature`, not
+    just by convention) - it computes and reports exactly what *would*
+    change without writing anything; the CLI mirrors this (`--apply` is
+    required to actually write).
+- **CLI**: `scripts/backfill_listing_metadata.py`, matching the existing
+  `scripts/cleanup_historical_listings.py`'s conventions (argparse, UTF-8
+  stdout reconfiguration for Windows consoles, a `SessionLocal()` session
+  lifecycle). Flags: `--marketplace` (defaults to all supported
+  marketplaces; validated against `is_marketplace_supported` before
+  running), `--limit`, `--delay-ms`, `--dry-run` (explicit synonym for the
+  default) / `--apply` (required to write). Prints a summary report
+  (candidates seen, enriched, skipped-unsupported, not-found/deleted,
+  failed, per-marketplace breakdown) - never logs a credential, token, or
+  full request/response body.
+- **A real, standalone-script bug found and fixed by actually running the
+  CLI end-to-end**, not just via pytest: `DiscoveredListing
+  .discovered_by_saved_search_id`'s foreign key
+  (`ForeignKey("saved_searches.id", ...)`) is a lazy, string-form reference,
+  resolved against `Base.metadata` only at first flush/commit - not at
+  class-definition/import time. The CLI script's narrower import graph
+  (unlike the main app, which transitively imports the full saved-searches
+  module chain) never happened to import
+  `marketplace_alert.core.saved_searches.models`, so its first real commit
+  failed with `NoReferencedTableError`. Pytest never caught this because
+  test collection imports the full app elsewhere first. Fixed with a
+  defensive `import marketplace_alert.core.saved_searches.models  # noqa`
+  directly in `backfill.py` - the same pattern `alembic/env.py` already
+  uses for the identical underlying reason.
 
 ## Relevance filtering
 
@@ -1941,6 +2095,42 @@ GET  /api/v1/listings          -> ListingRepository.list_recent/count(...)
   this specific case - a targeted fix, not a change to the brand-neutral
   rule itself, which still applies normally whenever a core term is
   present.
+
+- **The historical backfill's "still missing a field" query was chosen
+  over a new bookkeeping column, deliberately.** A `backfilled_at` or
+  `attempted` column would make resumability explicit and give every row
+  exactly one backfill attempt, but it's schema complexity added purely
+  for a manual maintenance tool, and it would need its own migration. The
+  "any enrichable field is still `null`" condition already used by
+  `ListingRepository.list_missing_metadata()` gives resumability and
+  idempotency for free, at the cost of one accepted edge case: a row
+  missing a field its source marketplace genuinely never provides (e.g.
+  Etsy's `condition`) keeps matching every future run. Judged low-risk -
+  every run is bounded by `--limit` regardless, and the wasted cost is one
+  extra lookup request per stuck row per run, not incorrect behavior - and
+  reconsider only if that cost becomes observable in practice.
+- **Backfill detects connector `get_listing_by_id` support with a
+  class-level identity check, not a try/except around calling it.**
+  Calling the method and catching `ListingLookupNotSupportedError` would
+  also work, but it would cost one wasted call (or worse, a real network
+  request, if a future connector's default implementation ever became
+  more expensive than a plain `raise`) every time an unsupported
+  marketplace's row came up. Checking
+  `type(connector).get_listing_by_id is not MarketplaceConnector.get_listing_by_id`
+  answers "does this connector override the default" with no call at all -
+  support is a property of the *class*, decided once per marketplace per
+  batch, not re-discovered per row.
+- **Backfill enriches; it never re-discovers.** It was tempting to give
+  `run_backfill` access to `ListingDiscoveryService` so a listing that
+  turns out to have been deleted could be cleaned up in the same pass -
+  deliberately not done. The one requirement this feature cannot get
+  wrong is that enriching an old row must never make it look newly
+  discovered; the only way to *guarantee* that structurally, not just by
+  careful conditionals, is for the backfill module to have no code path
+  that can call `save_new()` or a notification provider at all. A listing
+  confirmed deleted (`get_listing_by_id` returning `None`) is logged and
+  left as-is, not deleted - removal is `cleanup.py`'s job (relevance-based,
+  decision #16), a distinct concern with a distinct script.
 
 ## Non-goals (for now)
 

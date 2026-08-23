@@ -70,7 +70,11 @@ def test_search_requests_correct_url_params_and_auth_header(monkeypatch: pytest.
     assert captured["url"] == "https://api.etsy.com/v3/application/listings/active"
     assert captured["params"]["keywords"] == "Maccabi"
     assert captured["params"]["limit"] == 10
-    assert captured["params"]["includes"] == "Images"
+    # findAllListingsActive doesn't support `includes` at all (confirmed
+    # live, not just from docs - see this module's docstring); an
+    # earlier version sent includes=Images here, which Etsy silently
+    # ignored - removed rather than left in as misleading dead weight.
+    assert "includes" not in captured["params"]
     assert captured["headers"]["x-api-key"] == "test-keystring:test-shared-secret"
 
 
@@ -250,3 +254,129 @@ def test_timeout_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(httpx, "get", raise_timeout)
     with pytest.raises(MarketplaceConnectorError):
         _connector().search("Maccabi")
+
+
+# --- normalize_listing picks up shop name only when a `shop` key is present ---
+
+
+def test_normalize_listing_populates_seller_when_shop_object_present() -> None:
+    """Only ever present on a get_listing_by_id (includes=Shop) response -
+    search responses never have this key, so this can't change what a
+    search-discovered listing returns (see test above, still asserts
+    seller is None for a plain search-shaped raw listing)."""
+    raw = _raw_listing(shop={"shop_id": 987654, "shop_name": "VintageSportsIL"})
+    listing = _connector().normalize_listing(raw)
+    assert listing.seller == "VintageSportsIL"
+    assert listing.location is None  # never populated, even with a shop object present
+    assert listing.condition is None  # Etsy has no condition concept at all
+
+
+def test_normalize_listing_shop_without_shop_name_leaves_seller_null() -> None:
+    raw = _raw_listing(shop={"shop_id": 987654})
+    listing = _connector().normalize_listing(raw)
+    assert listing.seller is None
+
+
+# --- get_listing_by_id (historical backfill) --------------------------------
+
+
+def _mock_get_item(monkeypatch: pytest.MonkeyPatch, item_response: httpx.Response) -> dict:
+    captured = {}
+
+    def fake_get(url, params, headers, timeout):
+        captured["url"] = url
+        captured["params"] = params
+        captured["headers"] = headers
+        return item_response
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    return captured
+
+
+def test_get_listing_by_id_requests_the_correct_url_includes_and_auth_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _mock_get_item(monkeypatch, httpx.Response(200, json=_raw_listing()))
+
+    _connector().get_listing_by_id("123456789")
+
+    assert captured["url"] == "https://api.etsy.com/v3/application/listings/123456789"
+    assert captured["params"]["includes"] == "Images,Shop"
+    assert captured["headers"]["x-api-key"] == "test-keystring:test-shared-secret"
+
+
+def test_get_listing_by_id_returns_a_fully_normalized_listing(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = _raw_listing(shop={"shop_id": 987654, "shop_name": "VintageSportsIL"})
+    _mock_get_item(monkeypatch, httpx.Response(200, json=raw))
+
+    listing = _connector().get_listing_by_id("123456789")
+
+    assert listing is not None
+    assert listing.price == 25.0
+    assert listing.seller == "VintageSportsIL"
+    assert str(listing.image_url) == "https://i.etsystatic.com/3.jpg"
+
+
+def test_get_listing_by_id_returns_none_on_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_get_item(monkeypatch, httpx.Response(404))
+    assert _connector().get_listing_by_id("000000000") is None
+
+
+def test_get_listing_by_id_missing_credentials_raises_before_any_network_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def fake_get(*args, **kwargs):
+        nonlocal called
+        called = True
+        return httpx.Response(200, json=_raw_listing())
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    connector = EtsyMarketplaceConnector(api_key=None, shared_secret=None)
+    with pytest.raises(MarketplaceConnectorError):
+        connector.get_listing_by_id("123456789")
+
+    assert called is False
+
+
+def test_get_listing_by_id_api_error_status_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_get_item(monkeypatch, httpx.Response(500))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().get_listing_by_id("123456789")
+
+
+def test_get_listing_by_id_rate_limit_is_retried_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch, _no_real_sleeps: list[float]
+) -> None:
+    responses = [httpx.Response(429), httpx.Response(200, json=_raw_listing())]
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: responses.pop(0))
+
+    listing = _connector().get_listing_by_id("123456789")
+
+    assert listing is not None
+    assert len(_no_real_sleeps) == 1
+
+
+def test_get_listing_by_id_malformed_response_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = _raw_listing()
+    del raw["listing_id"]
+    _mock_get_item(monkeypatch, httpx.Response(200, json=raw))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().get_listing_by_id("123456789")
+
+
+def test_get_listing_by_id_non_json_response_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_get_item(monkeypatch, httpx.Response(200, content=b"not valid json"))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().get_listing_by_id("123456789")
+
+
+def test_get_listing_by_id_network_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def raise_timeout(*args, **kwargs):
+        raise httpx.TimeoutException("simulated timeout")
+
+    monkeypatch.setattr(httpx, "get", raise_timeout)
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().get_listing_by_id("123456789")

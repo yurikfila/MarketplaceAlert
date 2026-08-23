@@ -56,11 +56,26 @@ retried, with bounded exponential backoff, via
 `core/connectors/retry.py`'s shared `request_with_retry` - each page
 fetched during pagination gets its own independent retry budget. 401/403/
 404 and any other permanent failure are unaffected, exactly as before.
+
+**Single-item lookup (`get_listing_by_id`), added for the historical
+listing-metadata backfill** (`core/persistence/backfill.py`): calls
+Reverb's own documented single-listing GET
+(``GET https://api.reverb.com/api/listings/{id}``, confirmed via
+Reverb's "Find and Update Listings" docs - the exact same auth headers
+this connector's search already uses). The response body's exact shape
+isn't independently confirmed (same gap as search results - see above);
+assumed to be the same `Listing` resource one entry of search's
+`listings` array is, per standard REST convention (one resource,
+singular vs. in a collection) - so `normalize_listing()` is reused
+unchanged rather than a second, differently-uncertain implementation. A
+wrong assumption here has the same safe failure mode as everywhere else
+in this connector: a field lands on `None`, never fabricated data.
 """
 
 import logging
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from pydantic import ValidationError
@@ -72,6 +87,7 @@ from marketplace_alert.core.models.listing import Listing
 logger = logging.getLogger(__name__)
 
 _REVERB_LISTINGS_URL = "https://api.reverb.com/api/listings"
+_LISTING_BY_ID_URL_TEMPLATE = "https://api.reverb.com/api/listings/{listing_id}"
 _ACCEPT_VERSION = "3.0"
 
 # Reverb's own documented maximum per_page/result count is not published
@@ -229,6 +245,62 @@ class ReverbMarketplaceConnector(MarketplaceConnector):
         retry_after = response.headers.get("Retry-After")
         if response.status_code == 429 and retry_after is not None:
             logger.info("Reverb API requested Retry-After: %s", retry_after)
+
+    def get_listing_by_id(self, external_listing_id: str) -> Listing | None:
+        """Re-fetch one listing's current state via Reverb's single-
+        listing GET - see this module's docstring. Used only by the
+        historical backfill service. Returns `None` on a 404 (the
+        listing no longer exists - expected for an old listing)."""
+        if not self.is_configured:
+            raise MarketplaceConnectorError(
+                "Reverb connector is not configured: REVERB_API_TOKEN is not set"
+            )
+
+        url = _LISTING_BY_ID_URL_TEMPLATE.format(listing_id=quote(external_listing_id, safe=""))
+        headers = {
+            "Authorization": f"Bearer {self._api_token}",
+            "Accept": "application/hal+json",
+            "Accept-Version": _ACCEPT_VERSION,
+        }
+
+        try:
+            response = request_with_retry(
+                lambda: httpx.get(url, headers=headers, timeout=self._timeout),
+                marketplace_name="Reverb",
+            )
+        except httpx.HTTPError as exc:
+            logger.error("Reverb item lookup request failed (%s)", type(exc).__name__)
+            raise MarketplaceConnectorError("Reverb API request failed") from None
+
+        if response.status_code == 404:
+            logger.info("Reverb item lookup: listing no longer exists (404)")
+            return None
+        if response.status_code in (401, 403):
+            logger.error(
+                "Reverb API returned HTTP %s during item lookup - token missing, invalid, or revoked",
+                response.status_code,
+            )
+            raise MarketplaceConnectorError(
+                f"Reverb API returned HTTP {response.status_code} (check REVERB_API_TOKEN)"
+            )
+        if response.status_code == 429:
+            logger.error("Reverb API rate limit exceeded (HTTP 429) during item lookup")
+            raise MarketplaceConnectorError("Reverb API rate limit exceeded (HTTP 429)")
+        if response.status_code != 200:
+            logger.error("Reverb API returned HTTP %s during item lookup", response.status_code)
+            raise MarketplaceConnectorError(f"Reverb API returned HTTP {response.status_code}")
+
+        try:
+            raw_listing = response.json()
+        except ValueError:
+            logger.error("Reverb API returned a non-JSON response during item lookup")
+            raise MarketplaceConnectorError("Reverb API returned a malformed response") from None
+
+        try:
+            return self.normalize_listing(raw_listing)
+        except (KeyError, TypeError, ValueError, ValidationError):
+            logger.error("Reverb item lookup returned a malformed listing")
+            raise MarketplaceConnectorError("Reverb API returned a malformed listing") from None
 
     @staticmethod
     def _extract_next_href(body: dict[str, Any]) -> str | None:

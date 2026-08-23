@@ -93,11 +93,16 @@
                             {% endif %}
                         </div>
                         <p class="listing-title">{{ listing.title }}</p>
+                        {% if listing.condition or listing.location %}
                         <p class="listing-meta">
                             {% if listing.condition %}{{ listing.condition }}{% endif %}
                             {% if listing.condition and listing.location %} · {% endif %}
                             {% if listing.location %}{{ listing.location }}{% endif %}
                         </p>
+                        {% endif %}
+                        {% if listing.seller %}
+                        <p class="listing-meta">Seller: {{ listing.seller }}</p>
+                        {% endif %}
                         <p class="listing-meta">Discovered {{ listing.discovered_display }}</p>
                     </div>
                 </a>

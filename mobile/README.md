@@ -263,7 +263,14 @@ position for items that were already on screen.
   duplicate detection"); a price drop or condition change on the source
   marketplace after that isn't picked up. Still genuinely absent (`null`,
   never faked) for a marketplace/listing that didn't provide a given
-  field in the first place - rendered conditionally either way.
+  field in the first place - rendered conditionally either way. A listing
+  discovered before that field was ever persisted (or before a connector
+  could extract it) can still show it as missing until a backend developer
+  runs the manual, dry-run-by-default historical backfill
+  (`scripts/backfill_listing_metadata.py` - see the backend's README.md
+  and PROJECT_CONTEXT.md decision #22); `ListingCard` was written from the
+  start to render correctly either way - a field appearing or disappearing
+  after a backfill run is expected, not a bug.
 - **A saved-search filter attribution, not a strict relationship.** A
   listing's `saved_search_id` (used by the Listings screen's filter and
   Saved Search Detail's "Latest listings") records whichever saved search

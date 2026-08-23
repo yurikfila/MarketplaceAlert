@@ -529,3 +529,113 @@ def test_log_output_never_contains_the_token(monkeypatch: pytest.MonkeyPatch, ca
     with caplog.at_level("DEBUG"):
         _connector(api_token="super-secret-token-value").search("Fender")
     assert "super-secret-token-value" not in caplog.text
+
+
+# --- get_listing_by_id (historical backfill) --------------------------------
+
+
+def _mock_get_item(monkeypatch: pytest.MonkeyPatch, item_response: httpx.Response) -> dict:
+    captured = {}
+
+    def fake_get(url, headers, timeout):
+        captured["url"] = url
+        captured["headers"] = headers
+        return item_response
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    return captured
+
+
+def test_get_listing_by_id_requests_the_correct_url_and_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _mock_get_item(monkeypatch, httpx.Response(200, json=_raw_listing()))
+
+    _connector().get_listing_by_id("84838674")
+
+    assert captured["url"] == "https://api.reverb.com/api/listings/84838674"
+    assert captured["headers"]["Authorization"] == "Bearer test-token"
+    assert captured["headers"]["Accept"] == "application/hal+json"
+    assert captured["headers"]["Accept-Version"] == "3.0"
+
+
+def test_get_listing_by_id_returns_a_fully_normalized_listing(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_get_item(monkeypatch, httpx.Response(200, json=_raw_listing()))
+
+    listing = _connector().get_listing_by_id("84838674")
+
+    assert listing is not None
+    assert listing.price == 1419.30
+    assert listing.condition == "Very Good"
+    assert listing.seller == "Pedal Haus"
+    assert str(listing.image_url) == "https://img.reverb.com/full.jpg"
+
+
+def test_get_listing_by_id_returns_none_on_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_get_item(monkeypatch, httpx.Response(404))
+    assert _connector().get_listing_by_id("00000000") is None
+
+
+def test_get_listing_by_id_missing_token_raises_before_any_network_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    called = False
+
+    def fake_get(*args, **kwargs):
+        nonlocal called
+        called = True
+        return httpx.Response(200, json=_raw_listing())
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    connector = ReverbMarketplaceConnector(api_token=None)
+    with pytest.raises(MarketplaceConnectorError):
+        connector.get_listing_by_id("84838674")
+
+    assert called is False
+
+
+def test_get_listing_by_id_401_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_get_item(monkeypatch, httpx.Response(401))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().get_listing_by_id("84838674")
+
+
+def test_get_listing_by_id_429_is_retried_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch, _no_real_sleeps: list[float]
+) -> None:
+    responses = [httpx.Response(429), httpx.Response(200, json=_raw_listing())]
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: responses.pop(0))
+
+    listing = _connector().get_listing_by_id("84838674")
+
+    assert listing is not None
+    assert len(_no_real_sleeps) == 1
+
+
+def test_get_listing_by_id_malformed_response_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = _raw_listing()
+    del raw["title"]
+    _mock_get_item(monkeypatch, httpx.Response(200, json=raw))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().get_listing_by_id("84838674")
+
+
+def test_get_listing_by_id_non_json_response_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_get_item(monkeypatch, httpx.Response(200, content=b"not valid json"))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().get_listing_by_id("84838674")
+
+
+def test_get_listing_by_id_network_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def raise_timeout(*args, **kwargs):
+        raise httpx.TimeoutException("simulated timeout")
+
+    monkeypatch.setattr(httpx, "get", raise_timeout)
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().get_listing_by_id("84838674")
+
+
+def test_get_listing_by_id_never_logs_the_token(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _mock_get_item(monkeypatch, httpx.Response(200, json=_raw_listing()))
+    with caplog.at_level("DEBUG"):
+        _connector(api_token="super-secret-token-value").get_listing_by_id("84838674")
+    assert "super-secret-token-value" not in caplog.text

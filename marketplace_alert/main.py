@@ -307,6 +307,7 @@ def listings_page(
             "price_display": _format_price(row.price, row.currency),
             "condition": row.condition,
             "location": row.location,
+            "seller": row.seller,
             "image_url": row.image_url,
             "listing_url": row.listing_url,
             "discovered_display": row.first_discovered_at.strftime("%Y-%m-%d %H:%M UTC"),

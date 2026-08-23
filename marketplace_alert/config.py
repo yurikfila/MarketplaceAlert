@@ -107,6 +107,20 @@ class Settings(BaseSettings):
     # safety cap - see connectors/bonanza/connector.py).
     bonanza_result_limit: int = 25
 
+    # Historical listing metadata backfill
+    # (core/persistence/backfill.py, scripts/backfill_listing_metadata.py) -
+    # re-fetches individual pre-existing listings from their source
+    # marketplace (by id, via each connector's `get_listing_by_id()`) to
+    # fill in fields that were missing before rich metadata persistence
+    # existed (see PROJECT_CONTEXT.md). Deliberately conservative
+    # defaults - this is a slow, rate-limit-aware maintenance task run
+    # manually via the CLI script, never automatically, and never a bulk
+    # operation: `listing_backfill_batch_size` bounds how many rows one
+    # invocation processes; `listing_backfill_delay_ms` paces the gap
+    # between consecutive marketplace requests within a run.
+    listing_backfill_batch_size: int = 25
+    listing_backfill_delay_ms: int = 500
+
     # CORS for future web/dev tooling (Phase 9 mobile-API prep). Native
     # mobile apps don't need browser CORS at all - this exists only in
     # case future web-based tooling (e.g. an Expo/React Native web

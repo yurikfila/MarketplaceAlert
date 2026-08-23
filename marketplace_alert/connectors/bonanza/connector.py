@@ -61,6 +61,21 @@ Transient failures (HTTP 429/502/503/504) on any one page request ARE
 retried, with bounded exponential backoff, via
 `core/connectors/retry.py`'s shared `request_with_retry`. 401/403 and any
 other permanent failure are unaffected, exactly as before.
+
+**No `get_listing_by_id()` override - deliberately.** The historical
+listing-metadata backfill service (`core/persistence/backfill.py`) needs
+a documented, authoritative single-item lookup to safely re-fetch an old
+listing; no such endpoint for Bonanza's Bonapitit API was found with
+enough confidence during research (eBay's old Finding API, which
+Bonanza's is modeled on, did have a `GetSingleItem` call, but Bonanza's
+own docs don't confirm an equivalent) - guessing at an unconfirmed
+endpoint would risk silently doing the wrong thing rather than cleanly
+failing. This connector simply doesn't override the base class's
+default, which raises `ListingLookupNotSupportedError` - the backfill
+service treats that as "skip this marketplace, log why," never a
+connector bug. Moot in practice today anyway: Bonanza has never been
+live (still awaiting `BONANZA_DEV_NAME`), so there are no Bonanza rows
+to backfill yet.
 """
 
 import json

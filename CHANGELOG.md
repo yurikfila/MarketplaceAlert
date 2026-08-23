@@ -5,6 +5,194 @@ All notable changes to this project are recorded here. Format is roughly
 
 ## [Unreleased]
 
+## 2026-08-23 — Listing enrichment + historical backfill
+
+**Closes the gap between "the schema can hold rich metadata" (the
+Listings product-experience pass, 2026-08-22) and "every historical row
+actually has it."** Root cause, confirmed before writing any code: a
+direct production API check showed newly-discovered eBay listings already
+carry full metadata - the reported "missing metadata" problem is entirely
+about rows discovered *before* that migration existed, not a live
+connector bug. No new marketplace, no schema change (every column already
+exists), no scanning/notification/relevance behavior change.
+
+### Added - Connector capability
+- `MarketplaceConnector.get_listing_by_id(external_listing_id)` - a new
+  **optional** capability (`core/connectors/base.py`), concrete by
+  default (raises `ListingLookupNotSupportedError`), overridden only where
+  a marketplace has a real, documented single-item endpoint. Support is
+  detected via a class-level identity check
+  (`type(connector).get_listing_by_id is not
+  MarketplaceConnector.get_listing_by_id`), never by calling the method
+  and catching the exception - zero wasted API calls to check support.
+- **eBay**: `GET /buy/browse/v1/item/{item_id}` (the Browse API's Get
+  Item operation) - confirmed to reuse the exact same field/type names as
+  `item_summary/search`, so `normalize_listing()` needed zero changes to
+  support it.
+- **Etsy**: `GET /application/listings/{listing_id}?includes=Images,Shop`
+  - a separate, more detailed operation than `findAllListingsActive`
+  (search). Its `includes` parameter genuinely works (confirmed live),
+  unlike search's (see "Fixed" below) - this is what lets `seller` (the
+  shop's display name) be populated for a listing re-fetched this way.
+- **Reverb**: `GET /api/listings/{id}` (confirmed via Reverb's own docs),
+  reusing the existing `normalize_listing()` unchanged - a REST-convention
+  assumption, documented honestly as inferred (search's exact response
+  shape was never fully documented by Reverb either - same honesty
+  standard as the rest of this connector).
+- **Mock connector**: looks up by id in its fixed catalog - used by
+  `tests/test_backfill.py`'s one real (non-stubbed) connector round-trip
+  test.
+- **Bonanza**: deliberately *not* overridden - no confirmed single-item
+  endpoint exists in Bonanza's public docs, and it's moot in practice
+  since Bonanza has never gone live (still awaiting `BONANZA_DEV_NAME`).
+
+### Fixed
+- **A real, previously-shipped Etsy bug, found by live verification, not
+  assumed from documentation**: `findAllListingsActive` (search) does not
+  accept an `includes` parameter at all - confirmed via a raw HTTP
+  request showing the `images` key completely absent from every search
+  result regardless of `includes=Images`. This connector's `search()` has
+  never actually returned an Etsy image, in production or otherwise,
+  since it was first built. The dead parameter is removed from the search
+  request (it did nothing; keeping it misleadingly suggested otherwise).
+  `seller` was previously hardcoded `null` for every Etsy listing;
+  `get_listing_by_id`'s `includes=Shop` now populates it for listings
+  re-fetched that way (see above) - genuinely new data, not a change to
+  what `search()` itself returns.
+- **Web dashboard was missing a `seller` line entirely** - found during a
+  field-by-field audit against every marketplace's normalized fields.
+  `main.py`'s `listings_page()` now passes `seller` through;
+  `templates/listings.html` renders it conditionally. Also fixed: the
+  condition/location `<p class="listing-meta">` always rendered, even as
+  an empty tag, when both fields were absent - now wrapped in a
+  conditional.
+
+### Added - Historical backfill
+- `core/persistence/backfill.py` (`run_backfill`) - re-fetches
+  **pre-existing** `discovered_listings` rows via `get_listing_by_id()`
+  and fills in whichever of `price`/`currency`/`image_url`/`condition`/
+  `location`/`seller`/`source_created_at` are still `null`. Never
+  overwrites an existing value; never touches `marketplace`/
+  `external_listing_id`/`first_discovered_at`/`discovered_by_saved_search_id`.
+  Resumability/idempotency come entirely from
+  `ListingRepository.list_missing_metadata()` (any enrichable field still
+  `null`) - no new bookkeeping column, an explicit tradeoff (see
+  PROJECT_CONTEXT.md decision #22).
+- **The one requirement enforced structurally**: `run_backfill` never
+  imports `NotificationService`/`NotificationProvider` and never calls
+  `ListingDiscoveryService`/`ListingRepository.save_new()` - enriching a
+  row cannot make the notification pipeline think an old listing is
+  newly discovered, because no code path exists that could trigger that.
+  Proven both structurally (an AST-based check of the module's actual
+  import statements) and behaviorally (a test that runs the same listing
+  through the real `ListingDiscoveryService.process_listings()` after
+  backfill and confirms it's still classified already-seen).
+  Bounded (`--limit`), marketplace-isolated, failure-isolated (per-row
+  try/except - one 404/timeout/429/malformed response never stops the
+  batch), rate-limit-aware (`--delay-ms`, paced between requests, never
+  before the first), and dry-run by default (verified via
+  `inspect.signature`, not just convention).
+- `settings.listing_backfill_batch_size` / `LISTING_BACKFILL_BATCH_SIZE`
+  (default 25) and `settings.listing_backfill_delay_ms` /
+  `LISTING_BACKFILL_DELAY_MS` (default 500) in `config.py`.
+- `ListingRepository.list_missing_metadata(marketplace=None, limit)`
+  (`core/persistence/repository.py`) - the query that is the backfill's
+  entire resumability mechanism.
+- `scripts/backfill_listing_metadata.py` - CLI, matching
+  `scripts/cleanup_historical_listings.py`'s existing conventions
+  (argparse, UTF-8 stdout, `SessionLocal()` lifecycle). `--marketplace`,
+  `--limit`, `--delay-ms`, `--dry-run` (explicit synonym for the default)
+  / `--apply` (required to write). Prints a summary report; never logs a
+  credential or full request/response body. See README.md "Historical
+  listing metadata backfill" for usage.
+- A real, standalone-script bug caught by running the CLI end-to-end
+  (not just via pytest): `discovered_by_saved_search_id`'s foreign key is
+  a lazy, string-form reference resolved only at first commit, and the
+  CLI's narrower import graph never happened to import the saved-searches
+  models module - causing a real `NoReferencedTableError` on its first
+  `--apply` run in a fresh process. Fixed with the same defensive import
+  pattern `alembic/env.py` already uses for the identical reason.
+
+### Tests
+- Backend: 615/615 passing (up from 547) - `tests/test_backfill.py` (new,
+  ~30 tests: fills-missing/never-overwrites/partial-fill, the
+  never-looks-newly-discovered guarantee (both structural and
+  behavioral), dry-run-no-writes, dry-run-is-default, rerun-is-noop,
+  batch-limit, marketplace-filter, skip-unsupported-marketplace/connector/
+  unconfigured, one marketplace's failure doesn't block another,
+  not-found/404, timeout/429/500/malformed-response/unexpected-exception
+  all isolated, delay-pacing, credentials never logged, a real round-trip
+  through the mock connector); new `get_listing_by_id` coverage in every
+  connector's existing test file (URL construction, full normalization,
+  404, auth failures, malformed/non-JSON responses, network errors); new
+  `list_missing_metadata` coverage in `tests/test_persistence.py`; new
+  dashboard tests for the `seller` line and the empty condition/location
+  tag fix. Mobile: 150/150 passing, unchanged (no mobile files touched
+  this pass) - re-confirmed rather than assumed, along with `tsc --noEmit`
+  (clean) and `npx expo install --check` (dependencies up to date).
+- All mocked HTTP - no automated test makes a real marketplace API call.
+
+### Live connector validation (read-only, `search()` + `get_listing_by_id()`
+only - never through a saved search, `/scan`, or any endpoint that
+persists or notifies)
+- **eBay** ("Makita drill"): 25 real results; the first already carries
+  full price/currency/condition/location/seller/image/created_at from
+  `search()` alone, confirming production's live connector already works
+  correctly for anything discovered going forward. `get_listing_by_id()`
+  returned consistent data for the same item (a slightly more precise
+  location - "Shipshewana, Indiana, US" vs. search's "Shipshewana, US" -
+  both genuine, not a bug).
+- **Etsy** ("Bosch drill"): 25 real results; the first has price/currency/
+  created_at from `search()` but `null` condition/location/seller/
+  image_url, exactly matching the newly-documented limitation.
+  `get_listing_by_id()` on that same listing correctly returned a real
+  `seller` and a real `image_url` - end-to-end proof the fix works
+  against Etsy's live API, not just mocked tests.
+- **Reverb**: not configured in this local environment (no
+  `REVERB_API_TOKEN` in `.env`) - skipped, honestly, rather than faked.
+  Production *does* have a Reverb token configured (confirmed via
+  `GET /api/v1/marketplaces`), so Reverb backfill is expected to work
+  there; it just couldn't be live-validated from here this pass.
+
+### Dry-run results
+- **Local dev database** (real data, real credentials, real live
+  lookups): 174 total rows, all 174 missing-metadata candidates (100% -
+  this local database predates the metadata migration entirely). A
+  25-candidate dry run enriched all 25 cleanly (25 price/currency/
+  image_url/seller/source_created_at, 3 condition, 3 location - the
+  condition/location split reflects the eBay/Etsy mix, not a bug). A
+  5-row `--apply` run wrote successfully; re-running dry-run afterward
+  showed those 5 rows correctly no longer needed price/currency/image/
+  seller (idempotent), while 2-3 of them still showed as candidates for
+  condition/location specifically - genuinely `null` on the source, the
+  documented "keeps matching" tradeoff in action, not a bug.
+- **Production** (via the public read-only `GET /api/v1/listings` API
+  only - this environment has no direct production database access, so
+  this is a *proxy* estimate, not the backfill script's own count):
+  eBay 101 total listings, 9 with a known price (92 likely candidates -
+  the 9 are new listings discovered since the 2026-08-22 metadata
+  migration went live); Etsy 59 total, 0 with a known price (59
+  candidates); Reverb 27 total, 0 with a known price (27 candidates);
+  Bonanza and mock: 0 listings. **Estimated ~178 of 187 production rows
+  are backfill candidates.**
+
+### Not run
+- **No large production backfill was executed.** Per this task's explicit
+  requirement, only local dry-run/apply validation and small,
+  non-destructive production read-only checks were performed. This
+  environment has no direct production `DATABASE_URL` or shell/exec
+  access to Render, so it could not have run one even if that had been
+  judged safe - a human with production database access needs to run it.
+  Proposed first step: `python scripts/backfill_listing_metadata.py
+  --apply --limit 25` (the default batch size) against production's
+  `DATABASE_URL`, reviewed via `GET /api/v1/listings` afterward before
+  running a larger batch.
+
+### Not changed
+- No scheduler/relevance-engine/deduplication/Telegram-notification
+  change, no new database migration (every column already existed), no
+  mobile code change, no marketplace added or removed.
+
 ## 2026-08-22 — Listings product-experience pass
 
 **Product Experience Phase 2**: turned the Listings feature from

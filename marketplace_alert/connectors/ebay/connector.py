@@ -29,11 +29,26 @@ exponential backoff via `core/connectors/retry.py`'s shared
 unretried failure exactly as before (a bad/expired token won't start
 working by asking again). A 429/5xx that still fails after every retry
 raises the same error message this connector always has.
+
+**Single-item lookup (`get_listing_by_id`), added for the historical
+listing-metadata backfill** (`core/persistence/backfill.py`): calls the
+Browse API's "Get Item" method
+(``GET https://api.ebay.com/buy/browse/v1/item/{item_id}``) - confirmed,
+not guessed, that it accepts the exact same RESTful item id format
+`item_summary/search` already returns (`v1|<legacy id>|<variation id>`,
+percent-encoded since it contains `|`), and that the `Item` resource
+reuses the same nested type names (`price`, `image`, `itemLocation`,
+`seller`, `condition`, `itemWebUrl`, `itemCreationDate`) as
+`ItemSummary` - both types are documented as sharing eBay's own
+`Amount`/`Image`/`Seller`/`ItemLocationImpl` definitions. Because of
+that, this reuses the existing `normalize_listing()` unchanged rather
+than a second field-mapping implementation.
 """
 
 import logging
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from pydantic import ValidationError
@@ -46,6 +61,7 @@ from marketplace_alert.core.models.listing import Listing
 logger = logging.getLogger(__name__)
 
 _SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+_ITEM_URL_TEMPLATE = "https://api.ebay.com/buy/browse/v1/item/{item_id}"
 _MARKETPLACE_ID = "EBAY_US"
 
 # eBay's own documented maximum is 200 per page; this connector fetches a
@@ -160,6 +176,57 @@ class EbayMarketplaceConnector(MarketplaceConnector):
         except ValueError:
             logger.error("eBay API returned a non-JSON response")
             raise MarketplaceConnectorError("eBay API returned a malformed response") from None
+
+    def get_listing_by_id(self, external_listing_id: str) -> Listing | None:
+        """Re-fetch one listing's current state via eBay's "Get Item" call.
+        Used only by the historical backfill service - see this module's
+        docstring for why `normalize_listing()` is safely reused unchanged.
+        Returns `None` on a 404 (the item no longer exists - expected for
+        an old listing, not an error)."""
+        token = self._token_manager.get_token()
+        url = _ITEM_URL_TEMPLATE.format(item_id=quote(external_listing_id, safe=""))
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-EBAY-C-MARKETPLACE-ID": _MARKETPLACE_ID,
+        }
+
+        try:
+            response = request_with_retry(
+                lambda: httpx.get(url, headers=headers, timeout=self._timeout),
+                marketplace_name="eBay",
+            )
+        except httpx.HTTPError as exc:
+            logger.error("eBay item lookup request failed (%s)", type(exc).__name__)
+            raise MarketplaceConnectorError("eBay API request failed") from None
+
+        if response.status_code == 404:
+            logger.info("eBay item lookup: listing no longer exists (404)")
+            return None
+        if response.status_code in (401, 403):
+            logger.error(
+                "eBay API returned HTTP %s during item lookup - invalidating cached token",
+                response.status_code,
+            )
+            self._token_manager.invalidate()
+            raise MarketplaceConnectorError(f"eBay API returned HTTP {response.status_code}")
+        if response.status_code == 429:
+            logger.error("eBay API rate limit exceeded (HTTP 429) during item lookup")
+            raise MarketplaceConnectorError("eBay API rate limit exceeded (HTTP 429)")
+        if response.status_code != 200:
+            logger.error("eBay API returned HTTP %s during item lookup", response.status_code)
+            raise MarketplaceConnectorError(f"eBay API returned HTTP {response.status_code}")
+
+        try:
+            raw_listing = response.json()
+        except ValueError:
+            logger.error("eBay API returned a non-JSON response during item lookup")
+            raise MarketplaceConnectorError("eBay API returned a malformed response") from None
+
+        try:
+            return self.normalize_listing(raw_listing)
+        except (KeyError, TypeError, ValueError, ValidationError):
+            logger.error("eBay item lookup returned a malformed listing")
+            raise MarketplaceConnectorError("eBay API returned a malformed listing") from None
 
     def normalize_listing(self, raw_listing: dict[str, Any]) -> Listing:
         price, currency = self._parse_price(raw_listing.get("price"))

@@ -8,7 +8,7 @@ details. Everything above it - the service layer, routes - works with
 from datetime import datetime, timezone
 from typing import Literal
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, or_, select
 from sqlalchemy.orm import Session
 
 from marketplace_alert.core.models.listing import Listing
@@ -232,6 +232,40 @@ class ListingRepository:
                 DiscoveredListing.id.desc(),
             )
         return (DiscoveredListing.first_discovered_at.desc(), DiscoveredListing.id.desc())  # "newest" (default)
+
+    def list_missing_metadata(
+        self, *, marketplace: str | None = None, limit: int
+    ) -> list[DiscoveredListing]:
+        """Rows with at least one backfill-candidate field still `NULL`
+        (price/currency/image_url/condition/location/seller/
+        source_created_at), newest-discovered first - a listing found
+        more recently is more likely to still exist on the source
+        marketplace than an older one, for the same total API budget.
+
+        Backs the historical listing-metadata backfill service
+        (`core/persistence/backfill.py`) only - never the normal scan/
+        dedup path. This query *is* the backfill mechanism's resumability
+        and idempotency: once a row's fields are all filled in, it stops
+        matching and naturally drops out of future candidate sets, with
+        no separate "already processed" bookkeeping needed.
+        """
+        stmt = select(DiscoveredListing).where(
+            or_(
+                DiscoveredListing.price.is_(None),
+                DiscoveredListing.currency.is_(None),
+                DiscoveredListing.image_url.is_(None),
+                DiscoveredListing.condition.is_(None),
+                DiscoveredListing.location.is_(None),
+                DiscoveredListing.seller.is_(None),
+                DiscoveredListing.source_created_at.is_(None),
+            )
+        )
+        if marketplace is not None:
+            stmt = stmt.where(DiscoveredListing.marketplace == marketplace)
+        stmt = stmt.order_by(
+            DiscoveredListing.first_discovered_at.desc(), DiscoveredListing.id.desc()
+        ).limit(limit)
+        return list(self._session.execute(stmt).scalars().all())
 
     def list_all(self) -> list[DiscoveredListing]:
         """Every discovered listing, unpaginated - for maintenance operations

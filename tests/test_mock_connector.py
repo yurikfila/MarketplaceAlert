@@ -73,3 +73,16 @@ def test_filters_are_applied_when_supported() -> None:
     connector = MockMarketplaceConnector()
     results = connector.search("Jacket", filters={"min_price": 1000})
     assert results == []
+
+
+def test_get_listing_by_id_returns_a_matching_catalog_item() -> None:
+    connector = MockMarketplaceConnector()
+    listing = connector.get_listing_by_id("mock-001")
+    assert listing is not None
+    assert listing.external_listing_id == "mock-001"
+    assert listing.price is not None
+
+
+def test_get_listing_by_id_returns_none_for_an_unknown_id() -> None:
+    connector = MockMarketplaceConnector()
+    assert connector.get_listing_by_id("does-not-exist") is None

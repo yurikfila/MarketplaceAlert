@@ -302,3 +302,100 @@ def test_oauth_failure_propagates_as_connector_error(monkeypatch: pytest.MonkeyP
 
 def test_marketplace_name_is_ebay() -> None:
     assert _connector().marketplace_name == "ebay"
+
+
+# --- get_listing_by_id (historical backfill) --------------------------------
+
+
+def _mock_token_and_get_item(monkeypatch: pytest.MonkeyPatch, item_response: httpx.Response) -> dict:
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(200, json=_TOKEN_BODY))
+    captured = {}
+
+    def fake_get(url, headers, timeout):
+        captured["url"] = url
+        captured["headers"] = headers
+        return item_response
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    return captured
+
+
+def test_get_listing_by_id_requests_the_correct_url_and_percent_encodes_the_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _mock_token_and_get_item(monkeypatch, httpx.Response(200, json=_raw_listing()))
+
+    _connector().get_listing_by_id("v1|123456789|0")
+
+    assert captured["url"] == "https://api.ebay.com/buy/browse/v1/item/v1%7C123456789%7C0"
+    assert captured["headers"]["Authorization"] == "Bearer fake-access-token"
+    assert captured["headers"]["X-EBAY-C-MARKETPLACE-ID"] == "EBAY_US"
+
+
+def test_get_listing_by_id_returns_a_fully_normalized_listing(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_token_and_get_item(monkeypatch, httpx.Response(200, json=_raw_listing()))
+
+    listing = _connector().get_listing_by_id("v1|123456789|0")
+
+    assert listing is not None
+    assert listing.price == 89.99
+    assert listing.seller == "power_tools_seller"
+    assert listing.condition == "Used"
+    assert str(listing.image_url) == "https://i.ebayimg.com/images/g/abc/s-l500.jpg"
+
+
+def test_get_listing_by_id_returns_none_on_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_token_and_get_item(monkeypatch, httpx.Response(404))
+    assert _connector().get_listing_by_id("v1|000000000|0") is None
+
+
+def test_get_listing_by_id_unauthorized_invalidates_token_and_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_token_and_get_item(monkeypatch, httpx.Response(401))
+    connector = _connector()
+    with pytest.raises(MarketplaceConnectorError):
+        connector.get_listing_by_id("v1|123456789|0")
+    assert connector._token_manager._access_token is None
+
+
+def test_get_listing_by_id_rate_limit_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_token_and_get_item(monkeypatch, httpx.Response(429))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().get_listing_by_id("v1|123456789|0")
+
+
+def test_get_listing_by_id_rate_limit_is_retried_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch, _no_real_sleeps: list[float]
+) -> None:
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(200, json=_TOKEN_BODY))
+    responses = [httpx.Response(429), httpx.Response(200, json=_raw_listing())]
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: responses.pop(0))
+
+    listing = _connector().get_listing_by_id("v1|123456789|0")
+
+    assert listing is not None
+    assert len(_no_real_sleeps) == 1
+
+
+def test_get_listing_by_id_malformed_response_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = _raw_listing()
+    del raw["title"]  # required field missing
+    _mock_token_and_get_item(monkeypatch, httpx.Response(200, json=raw))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().get_listing_by_id("v1|123456789|0")
+
+
+def test_get_listing_by_id_non_json_response_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_token_and_get_item(monkeypatch, httpx.Response(200, content=b"not valid json"))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().get_listing_by_id("v1|123456789|0")
+
+
+def test_get_listing_by_id_network_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(200, json=_TOKEN_BODY))
+
+    def raise_timeout(*args, **kwargs):
+        raise httpx.TimeoutException("simulated timeout")
+
+    monkeypatch.setattr(httpx, "get", raise_timeout)
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().get_listing_by_id("v1|123456789|0")

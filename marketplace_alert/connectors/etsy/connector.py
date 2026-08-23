@@ -6,8 +6,8 @@ marketplace-wide by keyword. Verified before implementation against Etsy's
 own sources, not guessed:
   - the official generated OpenAPI v3 spec
     (https://www.etsy.com/openapi/generated/oas/3.0.0.json), which confirms
-    the path, the `keywords`/`limit`/`offset`/`includes` query parameters,
-    and that this specific operation's security requirement is the global
+    the path and the `keywords`/`limit`/`offset` query parameters, and
+    that this specific operation's security requirement is the global
     `api_key` scheme only (no OAuth scopes attached to it);
   - the official Quickstart tutorial
     (https://developers.etsy.com/documentation/tutorials/quickstart/),
@@ -16,6 +16,21 @@ own sources, not guessed:
     (https://developers.etsy.com/documentation/essentials/definitions/),
     which confirms the `money` object's `amount`/`divisor`/`currency_code`
     fields (actual price = amount / divisor - not a plain number).
+
+**`findAllListingsActive` does not accept an `includes` parameter at
+all - confirmed live, not just from documentation, during the Listing
+Enrichment pass (2026-08-23).** An earlier version of this connector
+sent `includes=Images` on every search request, based on the mistaken
+assumption (never actually exercised against a real response until this
+pass) that it worked the same way `includes=Shop` does on the *separate*
+single-listing endpoint below. A real live search request confirmed the
+parameter is silently ignored - the `images` key is completely absent
+from every search result, regardless of `includes` - so this connector's
+`search()` has never actually returned an Etsy image, in production or
+otherwise, since it was first built. The parameter has been removed from
+the search request (it did nothing; leaving it in would misleadingly
+suggest it does) - see `get_listing_by_id()` below for the one endpoint
+that genuinely does return image data.
 
 Authentication: every request needs an `x-api-key` header of the form
 ``"<ETSY_API_KEY>:<ETSY_SHARED_SECRET>"`` (keystring and shared secret,
@@ -30,11 +45,34 @@ exponential backoff via `core/connectors/retry.py`'s shared
 `request_with_retry` - see that module's docstring for the exact policy.
 Every other failure (network error, timeout, a permanent 4xx, malformed
 JSON) still fails on the first attempt, exactly as before.
+
+**Single-item lookup (`get_listing_by_id`), added for the historical
+listing-metadata backfill** (`core/persistence/backfill.py`): calls
+Etsy's single-listing ``getListing`` operation
+(``GET /application/listings/{listing_id}``, confirmed via Etsy's own
+OpenAPI v3 spec - a separate, more detailed operation than
+`findAllListingsActive`). Its `includes` parameter accepts `Shop`
+(confirmed - `findAllListingsActive` doesn't take an `includes`
+parameter at all, so shop data was never reachable from search), which
+is what lets `normalize_listing()` populate `seller` (the shop's display
+name) for a listing re-fetched this way - genuinely unavailable from
+search results alone, not a change to what search returns. `location`
+stays `None` even here: no Etsy API field for a shop's location was
+confirmed with enough confidence to extract safely (Etsy has trended
+toward *not* exposing precise seller location publicly) - left `None`
+rather than guessed, same rule as every other uncertain field in this
+project. `condition` stays `None` everywhere, permanently - confirmed,
+not just previously assumed, that Etsy's listing model has no condition
+concept at all; it has `who_made`/`when_made`/`is_supply` instead, a
+different semantic category (handmade/vintage/craft classification, not
+physical wear), and mapping those into a "condition" field would
+misrepresent what they actually mean.
 """
 
 import logging
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from pydantic import ValidationError
@@ -47,6 +85,7 @@ logger = logging.getLogger(__name__)
 
 _ETSY_API_BASE = "https://api.etsy.com/v3"
 _ACTIVE_LISTINGS_PATH = "/application/listings/active"
+_LISTING_BY_ID_PATH = "/application/listings/{listing_id}"
 
 # Etsy's own maximum is 100 per page; this connector fetches a single page
 # (no automatic multi-page looping yet), so keep the default conservative.
@@ -119,7 +158,6 @@ class EtsyMarketplaceConnector(MarketplaceConnector):
             "keywords": query,
             "limit": self._result_limit,
             "offset": offset,
-            "includes": "Images",
         }
         if "min_price" in filters:
             params["min_price"] = filters["min_price"]
@@ -152,6 +190,51 @@ class EtsyMarketplaceConnector(MarketplaceConnector):
             logger.error("Etsy API returned a non-JSON response")
             raise MarketplaceConnectorError("Etsy API returned a malformed response") from None
 
+    def get_listing_by_id(self, external_listing_id: str) -> Listing | None:
+        """Re-fetch one listing's current state via Etsy's `getListing`
+        operation, with `includes=Images,Shop` so `normalize_listing()`
+        can populate `seller` - see this module's docstring for exactly
+        what's newly available this way vs. from search. Used only by
+        the historical backfill service. Returns `None` on a 404 (the
+        listing no longer exists - expected for an old listing)."""
+        if not self.is_configured:
+            raise MarketplaceConnectorError(
+                "Etsy connector is not configured: ETSY_API_KEY and/or "
+                "ETSY_SHARED_SECRET are not set"
+            )
+
+        url = f"{_ETSY_API_BASE}{_LISTING_BY_ID_PATH.format(listing_id=quote(external_listing_id, safe=''))}"
+        params = {"includes": "Images,Shop"}
+        headers = {"x-api-key": f"{self._api_key}:{self._shared_secret}"}
+
+        try:
+            response = request_with_retry(
+                lambda: httpx.get(url, params=params, headers=headers, timeout=self._timeout),
+                marketplace_name="Etsy",
+            )
+        except httpx.HTTPError as exc:
+            logger.error("Etsy item lookup request failed (%s)", type(exc).__name__)
+            raise MarketplaceConnectorError("Etsy API request failed") from None
+
+        if response.status_code == 404:
+            logger.info("Etsy item lookup: listing no longer exists (404)")
+            return None
+        if response.status_code != 200:
+            logger.error("Etsy API returned HTTP %s during item lookup", response.status_code)
+            raise MarketplaceConnectorError(f"Etsy API returned HTTP {response.status_code}")
+
+        try:
+            raw_listing = response.json()
+        except ValueError:
+            logger.error("Etsy API returned a non-JSON response during item lookup")
+            raise MarketplaceConnectorError("Etsy API returned a malformed response") from None
+
+        try:
+            return self.normalize_listing(raw_listing)
+        except (KeyError, TypeError, ValueError, ValidationError):
+            logger.error("Etsy item lookup returned a malformed listing")
+            raise MarketplaceConnectorError("Etsy API returned a malformed listing") from None
+
     def normalize_listing(self, raw_listing: dict[str, Any]) -> Listing:
         price, currency = self._parse_price(raw_listing.get("price"))
 
@@ -168,7 +251,12 @@ class EtsyMarketplaceConnector(MarketplaceConnector):
             price=price,
             currency=currency,
             location=None,
-            seller=None,
+            # `shop` is only present when a request asked for it via
+            # `includes=Shop` (get_listing_by_id, not search) - a
+            # generically safe check either way, since search responses
+            # simply never have this key, so this can never change what
+            # a search-discovered listing returns.
+            seller=self._parse_shop_name(raw_listing.get("shop")),
             condition=None,
             listing_url=raw_listing["url"],
             image_url=self._parse_image_url(raw_listing.get("images")),
@@ -194,6 +282,13 @@ class EtsyMarketplaceConnector(MarketplaceConnector):
         if not isinstance(first_image, dict):
             return None
         return first_image.get("url_570xN") or first_image.get("url_fullxfull")
+
+    @staticmethod
+    def _parse_shop_name(shop_obj: Any) -> str | None:
+        if not isinstance(shop_obj, dict):
+            return None
+        shop_name = shop_obj.get("shop_name")
+        return shop_name if isinstance(shop_name, str) and shop_name else None
 
     def health_check(self) -> bool:
         return self.is_configured

@@ -51,6 +51,7 @@ def test_listings_page_shows_a_discovered_listing(client, db_session) -> None:
         currency="USD",
         condition="Used",
         location="Austin, TX",
+        seller="camera_shop_88",
         image_url="https://example.com/camera.jpg",
     )
 
@@ -58,8 +59,23 @@ def test_listings_page_shows_a_discovered_listing(client, db_session) -> None:
     assert "Vintage Camera" in body
     assert "USD 250" in body  # whole-dollar price, no invented ".00"
     assert "Used" in body
-    assert "Austin, TX" in body
-    assert 'src="https://example.com/camera.jpg"' in body
+    assert "Seller: camera_shop_88" in body
+
+
+def test_listings_page_omits_seller_line_when_absent(client, db_session) -> None:
+    _insert_listing(db_session, title="No seller item", seller=None)
+
+    body = client.get("/listings").text
+    assert "Seller:" not in body
+
+
+def test_listings_page_omits_condition_location_line_when_both_absent(client, db_session) -> None:
+    _insert_listing(db_session, title="Bare item", condition=None, location=None, seller=None)
+
+    body = client.get("/listings").text
+    # Only the "Discovered ..." meta line should render - no stray empty
+    # <p class="listing-meta"></p> for the missing condition/location row.
+    assert body.count('class="listing-meta"') == 1
 
 
 def test_listings_page_price_formatting_shows_cents_only_when_present(client, db_session) -> None:

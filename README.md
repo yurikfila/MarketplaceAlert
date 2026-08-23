@@ -165,6 +165,52 @@ alembic revision --autogenerate -m "describe the change"
 See `PROJECT_CONTEXT.md`/`ARCHITECTURE.md` for the full reasoning, and
 `alembic/versions/` for the baseline migration.
 
+## Historical listing metadata backfill
+
+New listings persist rich metadata (price, currency, image, condition,
+location, seller) immediately - no backfill needed for anything discovered
+going forward. `scripts/backfill_listing_metadata.py` is a manual
+maintenance tool for **pre-existing** rows that were discovered before that
+metadata existed, or before a connector could extract a given field at all
+(e.g. Etsy's `seller`). It never runs automatically (not at startup, not on
+a schedule, not from any API endpoint), and it never touches a listing's
+identity, discovery timestamp, or saved-search attribution - see
+ARCHITECTURE.md "Historical listing metadata backfill" for the full design
+and safety guarantees.
+
+**Always dry-run first** - the default, with no flag needed:
+
+```bash
+python scripts/backfill_listing_metadata.py
+```
+
+This reports how many rows are missing metadata, which fields, and how many
+the tool believes it can actually enrich - without writing anything.
+
+Once you've reviewed the dry-run report, apply it for real with `--apply`:
+
+```bash
+python scripts/backfill_listing_metadata.py --apply
+```
+
+Useful flags (combine as needed):
+
+```bash
+# Only one marketplace
+python scripts/backfill_listing_metadata.py --apply --marketplace ebay
+
+# A small, bounded batch (recommended for the first production run)
+python scripts/backfill_listing_metadata.py --apply --limit 25
+
+# Slow down further between requests (default is 500ms)
+python scripts/backfill_listing_metadata.py --apply --delay-ms 1000
+```
+
+Safe to interrupt or re-run: a row that still has a missing field is picked
+up again next run; a row that's already fully enriched is simply skipped.
+Only eBay, Etsy, and Reverb support this today (each has a real single-item
+lookup endpoint) - Bonanza does not, and is skipped with a logged reason.
+
 ## Running tests
 
 ```bash

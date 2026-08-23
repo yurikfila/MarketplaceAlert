@@ -181,3 +181,82 @@ def test_duplicate_marketplace_and_external_id_is_prevented_at_db_level(db_sessi
     )
     with pytest.raises(IntegrityError):
         db_session.flush()
+
+
+# --- list_missing_metadata (historical backfill candidate query) -----------
+
+
+def _bare_row(db_session, *, marketplace="mock", external_id="mock-001", **overrides) -> DiscoveredListing:
+    now = datetime.now(timezone.utc)
+    defaults = dict(
+        marketplace=marketplace,
+        external_listing_id=external_id,
+        title="Item",
+        listing_url=f"https://example.com/{marketplace}/{external_id}",
+        first_discovered_at=now,
+        last_seen_at=now,
+    )
+    defaults.update(overrides)
+    row = DiscoveredListing(**defaults)
+    db_session.add(row)
+    db_session.commit()
+    return row
+
+
+def test_list_missing_metadata_finds_a_row_missing_any_candidate_field(db_session) -> None:
+    _bare_row(db_session, external_id="a", price=None, currency=None)
+
+    candidates = ListingRepository(db_session).list_missing_metadata(limit=10)
+
+    assert len(candidates) == 1
+    assert candidates[0].external_listing_id == "a"
+
+
+def test_list_missing_metadata_excludes_a_fully_enriched_row(db_session) -> None:
+    _bare_row(
+        db_session,
+        external_id="complete",
+        price=10.0,
+        currency="USD",
+        image_url="https://example.com/i.jpg",
+        condition="New",
+        location="Somewhere",
+        seller="someone",
+        source_created_at=datetime.now(timezone.utc),
+    )
+
+    candidates = ListingRepository(db_session).list_missing_metadata(limit=10)
+
+    assert candidates == []
+
+
+def test_list_missing_metadata_respects_marketplace_filter(db_session) -> None:
+    _bare_row(db_session, marketplace="mock", external_id="m1")
+    _bare_row(db_session, marketplace="etsy", external_id="e1")
+
+    candidates = ListingRepository(db_session).list_missing_metadata(marketplace="etsy", limit=10)
+
+    assert len(candidates) == 1
+    assert candidates[0].marketplace == "etsy"
+
+
+def test_list_missing_metadata_respects_limit(db_session) -> None:
+    for i in range(5):
+        _bare_row(db_session, external_id=f"item-{i}")
+
+    candidates = ListingRepository(db_session).list_missing_metadata(limit=2)
+
+    assert len(candidates) == 2
+
+
+def test_list_missing_metadata_orders_newest_discovered_first(db_session) -> None:
+    from datetime import timedelta
+
+    older = datetime.now(timezone.utc) - timedelta(days=2)
+    newer = datetime.now(timezone.utc) - timedelta(minutes=1)
+    _bare_row(db_session, external_id="old", first_discovered_at=older)
+    _bare_row(db_session, external_id="new", first_discovered_at=newer)
+
+    candidates = ListingRepository(db_session).list_missing_metadata(limit=10)
+
+    assert [c.external_listing_id for c in candidates] == ["new", "old"]

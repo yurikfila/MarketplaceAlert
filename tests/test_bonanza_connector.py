@@ -400,3 +400,18 @@ def test_log_output_never_contains_the_dev_name(monkeypatch: pytest.MonkeyPatch,
     with caplog.at_level("DEBUG"):
         _connector(dev_name="super-secret-dev-name").search("Fender")
     assert "super-secret-dev-name" not in caplog.text
+
+
+# --- get_listing_by_id: deliberately unsupported (historical backfill) ------
+
+
+def test_get_listing_by_id_raises_not_supported() -> None:
+    """Bonanza has no confirmed single-item lookup endpoint (see the
+    connector's module docstring) - it must raise the base class's
+    ListingLookupNotSupportedError, which the historical backfill
+    service treats as "skip this marketplace, log why," never a
+    connector failure to retry."""
+    from marketplace_alert.core.connectors.base import ListingLookupNotSupportedError
+
+    with pytest.raises(ListingLookupNotSupportedError):
+        _connector().get_listing_by_id("123456789")

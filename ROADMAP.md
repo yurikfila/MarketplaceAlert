@@ -157,8 +157,18 @@ endpoints for every action (no duplicated logic). `GET /listings`
 of this phase's stated scope - viewing the *discovered listings*
 themselves, with filtering (marketplace, saved search, price range) and
 sorting - server-rendered, no JavaScript needed, reusing the exact same
-`ListingRepository` `GET /api/v1/listings` uses. Still open: authentication
-before this could ever be exposed beyond localhost (see Phase 6).
+`ListingRepository` `GET /api/v1/listings` uses; a `seller` line and a
+condition/location line that no longer renders empty when both are absent
+were added in the Listing Enrichment + Historical Backfill pass
+(2026-08-23). Still open: authentication before this could ever be
+exposed beyond localhost (see Phase 6).
+
+**Data-quality follow-up (2026-08-23):** viewing listings only became
+fully useful once historical rows actually had the metadata to show -
+`scripts/backfill_listing_metadata.py` (manual, dry-run by default) closes
+that gap for pre-existing rows on eBay/Etsy/Reverb; see PROJECT_CONTEXT.md
+decision #22 and ARCHITECTURE.md "Historical listing metadata backfill".
+Not a new phase - a maintenance tool supporting this one.
 
 ## Phase 8 — Cloud deployment
 Move off local-only development; real hosting, real database, secrets

@@ -135,5 +135,17 @@ class MockMarketplaceConnector(MarketplaceConnector):
             image_url=raw_listing.get("image_url"),
         )
 
+    def get_listing_by_id(self, external_listing_id: str) -> Listing | None:
+        """Looks up a fixed catalog entry by id - a genuine, if trivial,
+        implementation (not a stub), so tests that exercise the
+        historical backfill service (`core/persistence/backfill.py`)
+        against a real connector interface don't need real marketplace
+        credentials. Returns `None` for an id not in the catalog, the
+        same "no longer exists" signal a real connector's 404 produces."""
+        for item in _MOCK_LISTINGS:
+            if item["id"] == external_listing_id:
+                return self.normalize_listing(item)
+        return None
+
     def health_check(self) -> bool:
         return True

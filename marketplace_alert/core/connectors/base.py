@@ -21,6 +21,19 @@ class MarketplaceConnectorError(Exception):
     """
 
 
+class ListingLookupNotSupportedError(Exception):
+    """Raised by ``get_listing_by_id()`` when a connector has no documented,
+    authoritative single-item lookup - e.g. Bonanza's Bonapitit API has no
+    confirmed single-item endpoint (see its connector module docstring).
+
+    Distinct from ``MarketplaceConnectorError``: this means "this
+    marketplace doesn't offer this capability at all", not "the request
+    failed" - the historical backfill service (`core/persistence/backfill.py`)
+    treats it as a clean, expected reason to skip a marketplace entirely,
+    never as a connector failure to retry or report.
+    """
+
+
 class MarketplaceConnector(ABC):
     """Base class for all marketplace connectors.
 
@@ -57,3 +70,27 @@ class MarketplaceConnector(ABC):
     def health_check(self) -> bool:
         """Return True if the connector is currently able to reach the marketplace."""
         raise NotImplementedError
+
+    def get_listing_by_id(self, external_listing_id: str) -> Listing | None:
+        """Fetch the current, authoritative state of exactly one listing by
+        its own id, via a documented single-item marketplace endpoint -
+        never a new search, and never scraping.
+
+        Used only by the historical backfill service
+        (`core/persistence/backfill.py`) to re-fetch an older, incompletely
+        -persisted listing - normal search/scan flows never call this.
+
+        Returns ``None`` if the marketplace confirms the listing no longer
+        exists (e.g. a 404) - a legitimate, expected outcome for an old
+        listing (sold, ended, removed), not an error.
+
+        Raises ``ListingLookupNotSupportedError`` by default. A connector
+        with a real, documented single-item endpoint (Etsy, eBay, Reverb)
+        overrides this; one without such a capability (Bonanza) simply
+        doesn't override it, so calling this on an unsupported connector
+        fails clearly and immediately rather than silently returning
+        nothing or attempting to scrape/guess.
+        """
+        raise ListingLookupNotSupportedError(
+            f"{self.marketplace_name} does not support listing lookup by id"
+        )

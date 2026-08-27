@@ -31,7 +31,7 @@ from marketplace_alert.core.persistence.models import DiscoveredListing
 from marketplace_alert.core.relevance import accessories, brands, evaluate_relevance, families
 from marketplace_alert.core.relevance.query import parse_query
 from marketplace_alert.core.relevance.service import filter_relevant_listings
-from marketplace_alert.core.relevance.text import find_phrase_matches, normalize_text, tokenize
+from marketplace_alert.core.relevance.text import find_phrase_match_positions, find_phrase_matches, normalize_text, tokenize
 from marketplace_alert.core.saved_searches.repository import SavedSearchRepository
 from marketplace_alert.core.saved_searches.runner import SavedSearchRunner
 from marketplace_alert.core.scheduler.guard import SavedSearchRunGuard
@@ -104,6 +104,16 @@ def test_find_phrase_matches_matches_contiguous_multi_word_phrases() -> None:
 def test_find_phrase_matches_returns_empty_when_nothing_matches() -> None:
     vocabulary = {("impact", "driver"): "impact_driver"}
     assert find_phrase_matches(tokenize("makita cordless drill"), vocabulary) == {}
+
+
+def test_find_phrase_match_positions_returns_start_and_end_indices() -> None:
+    tokens = tokenize("fender stratocaster with pau ferro neck")
+    matches = find_phrase_match_positions(tokens, {("neck",): "neck"})
+    assert matches == [(5, 6, "neck")]
+
+
+def test_find_phrase_match_positions_returns_empty_when_nothing_matches() -> None:
+    assert find_phrase_match_positions(tokenize("makita cordless drill"), {("impact", "driver"): "impact_driver"}) == []
 
 
 # =====================================================================
@@ -469,6 +479,116 @@ def test_fender_stratocaster_search_accepts_a_complete_guitar() -> None:
     assert result.is_relevant is True
 
 
+def test_fender_stratocaster_search_accepts_a_complete_guitar_whose_description_mentions_body_and_neck() -> None:
+    """The exact production bug: a real, detailed guitar listing's
+    description routinely mentions body/neck wood - this must not be
+    treated the same as an accessory listing whose TITLE says 'Body' or
+    'Neck'. Description-only mentions are not what's being sold."""
+    result = evaluate_relevance(
+        "Fender Stratocaster",
+        _listing(
+            "Fender American Professional II Stratocaster",
+            description="Features an alder body and a maple neck with rosewood fingerboard, comes with hard case.",
+        ),
+    )
+    assert result.is_relevant is True
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "FENDER FENDER Stratocaster Masterbuilt John English 1996 1996",
+        "FENDER FENDER STRATOCASTER WALNUT de 1972 1972",
+        "Fender Stratocaster ST-110FIM Iron Maiden Signature Stratocaster 2001 - 2002 - Black",
+    ],
+)
+def test_fender_stratocaster_search_accepts_real_production_listing_titles(title: str) -> None:
+    """Regression for the exact three listings found live on Reverb that
+    were incorrectly rejected - see PROJECT_CONTEXT.md decision #24."""
+    result = evaluate_relevance("Fender Stratocaster", _listing(title))
+    assert result.is_relevant is True
+
+
+def test_fender_stratocaster_search_still_rejects_a_title_level_accessory_even_with_description() -> None:
+    """The fix must stay narrow: an accessory word IN THE TITLE (what's
+    actually being sold) must still be rejected, regardless of what the
+    description additionally says."""
+    result = evaluate_relevance(
+        "Fender Stratocaster",
+        _listing("Fender Stratocaster Pickguard White 3-Ply", description="Fits American Standard Stratocaster bodies."),
+    )
+    assert result.is_relevant is False
+    assert result.rejected_reason == "accessory_without_core_product_match"
+
+
+def test_makita_drill_search_accepts_a_bare_drill_whose_description_mentions_included_battery() -> None:
+    """Same fix, drill category: a bare 'drill' match (not the multi-word
+    'cordless drill' exemption) with an incidental battery/charger mention
+    only in the description must not be penalized the way a title-level
+    accessory listing correctly still is."""
+    result = evaluate_relevance(
+        "Makita drill",
+        _listing("Makita XFD131 18V Drill", description="Sold with battery and charger included, gently used."),
+    )
+    assert result.is_relevant is True
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Fender Stratocaster with Billy Corgan Pickups",
+        "Fender Fender Stratocaster w/Pau Ferro Neck MIM Stratocaster",
+        "Fender Stratocaster Hardtail with 3-Bolt Neck, Rosewood Fretboard",
+    ],
+)
+def test_fender_stratocaster_search_accepts_a_complete_guitar_with_included_feature_described(title: str) -> None:
+    """Regression for real Reverb false rejections found after the
+    title-only accessory fix: 'with'/'w/' immediately before an accessory
+    term marks it as a described feature of the complete guitar, not the
+    item being sold - see PROJECT_CONTEXT.md decision #25."""
+    result = evaluate_relevance("Fender Stratocaster", _listing(title))
+    assert result.is_relevant is True
+
+
+def test_fender_stratocaster_search_still_rejects_a_bare_neck_with_no_inclusion_marker() -> None:
+    """The rule must stay narrow: no 'with'/'w' before the accessory term
+    means it's still read as the head noun - the item being sold."""
+    result = evaluate_relevance("Fender Stratocaster", _listing("Fender Stratocaster 1973-1976 thin neck"))
+    assert result.is_relevant is False
+    assert result.rejected_reason == "accessory_without_core_product_match"
+
+
+@pytest.mark.parametrize(
+    "title",
+    ["Replacement Neck for Fender Stratocaster", "Hard Case for Fender Stratocaster"],
+)
+def test_fender_stratocaster_search_rejects_for_preposition_accessories(title: str) -> None:
+    """'for' is not 'with' - opposite meaning (accessory FOR the product,
+    not product WITH the accessory) - must not be treated as an inclusion
+    marker."""
+    result = evaluate_relevance("Fender Stratocaster", _listing(title))
+    assert result.is_relevant is False
+    assert result.rejected_reason == "accessory_without_core_product_match"
+
+
+def test_fender_stratocaster_search_still_rejects_when_the_sold_accessory_precedes_an_included_one() -> None:
+    """An accessory that's genuinely the subject (no marker before it)
+    still blocks relevance even if a LATER accessory in the same title
+    is legitimately exempted."""
+    result = evaluate_relevance("Fender Stratocaster", _listing("Fender Stratocaster Neck with case"))
+    assert result.is_relevant is False
+
+
+def test_makita_drill_search_accepts_a_drill_with_an_included_battery_in_the_title() -> None:
+    result = evaluate_relevance("Makita drill", _listing("Makita drill with battery"))
+    assert result.is_relevant is True
+
+
+def test_makita_drill_search_rejects_a_battery_sold_for_a_drill() -> None:
+    result = evaluate_relevance("Makita drill", _listing("battery for Makita drill"))
+    assert result.is_relevant is False
+
+
 @pytest.mark.parametrize("title", ["Gibson Les Paul Guitar Stand", "Gibson Les Paul Pickup Set"])
 def test_gibson_les_paul_search_rejects_accessories(title: str) -> None:
     """Regression for a subtler false positive found while fixing the
@@ -479,6 +599,17 @@ def test_gibson_les_paul_search_rejects_accessories(title: str) -> None:
     listing for the model itself, unlike a curated multi-word family
     synonym. See `evaluator.py::_score_core_match`'s docstring."""
     result = evaluate_relevance("Gibson Les Paul", _listing(title))
+    assert result.is_relevant is False
+    assert result.rejected_reason == "accessory_without_core_product_match"
+
+
+def test_gibson_les_paul_search_still_rejects_accessories_with_description_populated() -> None:
+    """Confirms the accessory rejections above aren't accidentally
+    weakened by narrowing the accessory-penalty check to the title only -
+    same title-level accessory word, now with a description present too."""
+    result = evaluate_relevance(
+        "Gibson Les Paul", _listing("Gibson Les Paul Guitar Stand", description="Sturdy stand for your Les Paul body and neck.")
+    )
     assert result.is_relevant is False
     assert result.rejected_reason == "accessory_without_core_product_match"
 

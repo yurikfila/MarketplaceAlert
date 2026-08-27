@@ -71,3 +71,31 @@ def find_phrase_matches(tokens: list[str], vocabulary: Mapping[tuple[str, ...], 
             if mapped is not None:
                 matches[" ".join(window)] = mapped
     return matches
+
+
+def find_phrase_match_positions(
+    tokens: list[str], vocabulary: Mapping[tuple[str, ...], str]
+) -> list[tuple[int, int, str]]:
+    """Like `find_phrase_matches()`, but returns `(start_index,
+    end_index_exclusive, canonical_value)` for every match instead of a
+    phrase-keyed dict - for a caller that needs to reason about *where* a
+    match occurred (e.g. whether an accessory term is immediately preceded
+    by an inclusion marker like "with"/"w/", meaning it describes a
+    feature of the product being sold rather than being the product for
+    sale itself - see `evaluator.py`'s accessory-penalty exemption).
+    Every other caller that only needs "is this phrase present" should
+    keep using `find_phrase_matches()` - this is deliberately a separate,
+    additive function rather than a signature change, so nothing else has
+    to reason about positions it doesn't need.
+    """
+    if not tokens or not vocabulary:
+        return []
+    matches: list[tuple[int, int, str]] = []
+    max_n = max(len(phrase) for phrase in vocabulary)
+    for n in range(1, min(max_n, len(tokens)) + 1):
+        for start in range(len(tokens) - n + 1):
+            window = tuple(tokens[start : start + n])
+            mapped = vocabulary.get(window)
+            if mapped is not None:
+                matches.append((start, start + n, mapped))
+    return matches

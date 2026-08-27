@@ -18,14 +18,17 @@ genuine, unambiguous drill match.
 
 Guitar/music-gear part terms (pickguard, pickup, neck, body, strap,
 stand, manual) were added in that same audit for Reverb/Bonanza's
-music-gear searches (e.g. "Fender Stratocaster") - these don't benefit
-from the same multi-word-match exemption today, since there's no
-registered "guitar" product family the way there is for "drill" (a
-genuine, deliberately accepted trade-off - see PROJECT_CONTEXT.md's
-"Things that have NOT yet been implemented" for what that means:
-occasionally a complete guitar listing that also mentions an upgraded
-part, e.g. "with new pickguard installed", could be scored as if it were
-an accessory-only listing).
+music-gear searches (e.g. "Fender Stratocaster") - these still don't
+benefit from the multi-word-match exemption the way "drill" does, since
+there's no registered "guitar" product family (a genuine, deliberately
+accepted trade-off - see PROJECT_CONTEXT.md decision #18). What *is*
+fixed (decision #24): the accessory penalty in `evaluator.py` only
+scans the listing **title** for these terms, not the description - a
+real production false rejection found three genuine complete Fender
+Stratocasters on Reverb scored as accessory-only purely because their
+*descriptions* mentioned body/neck/case wood, not because the guitar
+itself was an accessory. A title that itself says "Pickguard"/"Body"/
+"Case" (an actual part listing) is still correctly rejected either way.
 """
 
 from marketplace_alert.core.relevance.text import tokenize

@@ -21,14 +21,14 @@ Scoring, in order:
    product this vocabulary doesn't know about), fall back to a lenient
    "any core token present" check - see `_score_core_match` for why this
    fallback is deliberately not proportional/stricter.
-4. **Accessory penalty** - if the listing itself contains an accessory
-   term (holder, mount, case, ...) and the *query* did not ask for one,
-   subtract `ACCESSORY_PENALTY`. This is what rejects "Makita battery
-   holder" for a "Makita drill" search while still allowing it for a
-   "Makita battery holder" search - *unless* the core match itself came
-   from a **multi-word** strong/related synonym (e.g. "cordless drill",
-   "drill driver", "impact driver" - two or more words, not just the
-   bare family word). A multi-word match is unambiguous evidence the
+4. **Accessory penalty** - if the listing's **title** contains an
+   accessory term (holder, mount, case, ...) and the *query* did not ask
+   for one, subtract `ACCESSORY_PENALTY`. This is what rejects "Makita
+   battery holder" for a "Makita drill" search while still allowing it
+   for a "Makita battery holder" search - *unless* the core match itself
+   came from a **multi-word** strong/related synonym (e.g. "cordless
+   drill", "drill driver", "impact driver" - two or more words, not just
+   the bare family word). A multi-word match is unambiguous evidence the
    core product itself is genuinely what's being sold, so an accessory
    term elsewhere in the same title (e.g. "...Cordless Drill Driver Kit
    with Carrying Case and 2 Batteries") is read as an included bonus
@@ -39,6 +39,22 @@ Scoring, in order:
    sale. Found and fixed via this module's own regression-testing
    audit - see `_score_core_match`'s `unambiguous` return value and
    `tests/test_relevance.py`'s "kit/bundle" test cases.
+
+   **Title-only, deliberately narrower than every other check in this
+   function** (which all use title+description). A real, detailed
+   description routinely mentions a part in passing - a guitar's "alder
+   body and maple neck", a drill "sold with battery and charger included"
+   - without that being what's actually for sale; the title is what's for
+   sale. Found via a real production false rejection: three genuine
+   complete Fender Stratocasters on Reverb scored exactly
+   `BRAND_MATCH_BONUS + STRONG_CORE_MATCH_SCORE - ACCESSORY_PENALTY`
+   (30+55-45=40, just under `RELEVANCE_THRESHOLD`) purely because their
+   *descriptions* mentioned body/neck/case - see PROJECT_CONTEXT.md
+   decision #24. Every other check (brand conflict/match, core-term
+   match) still uses title+description - only this one specific
+   penalty's text source narrowed, since it's the one check where an
+   incidental, non-title mention was being misread as "this is what's
+   being sold."
 
 A query that is *only* a recognized brand name, with no core product term
 left after removing it (e.g. just "Makita"), is a special case: it's
@@ -54,13 +70,26 @@ production data - see CHANGELOG.md).
 
 Final score is clamped to [0, 100]. `is_relevant` requires both a core
 match and `score >= RELEVANCE_THRESHOLD`.
+
+**Title-level accessory terms preceded by an inclusion marker ("with"/
+"w/") are exempt from the accessory penalty** - e.g. "Fender Stratocaster
+with Billy Corgan Pickups" or "...w/Pau Ferro Neck" describe a feature of
+the complete product being sold, not an accessory being sold on its own.
+Found via real production false rejections *after* the title-only
+accessory fix above - see `_title_accessory_matches()` and
+PROJECT_CONTEXT.md decision #25 for the full reasoning, including why
+"for" (the opposite meaning - "accessory FOR the product") is
+deliberately *not* treated as a marker, and why the exemption is
+directional (only a match textually *after* "with"/"w" is exempted - an
+accessory word appearing as the listing's actual subject, before any
+"with", is never exempted no matter what follows it).
 """
 
 from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.relevance import accessories, brands, families
 from marketplace_alert.core.relevance.models import RelevanceEvaluation
 from marketplace_alert.core.relevance.query import ParsedQuery, parse_query
-from marketplace_alert.core.relevance.text import find_phrase_matches, tokenize
+from marketplace_alert.core.relevance.text import find_phrase_match_positions, find_phrase_matches, tokenize
 
 BRAND_MATCH_BONUS = 30
 BRAND_CONFLICT_SCORE = 15
@@ -71,11 +100,56 @@ RELEVANCE_THRESHOLD = 50
 MIN_SCORE = 0
 MAX_SCORE = 100
 
+# Tokens that mark whatever follows as an included/installed feature of
+# the product being sold, not the product for sale itself - "with" in
+# full, and "w" because normalize_text() strips the "/" in "w/" down to
+# a bare "w" token before tokenizing. Deliberately narrow: "for" ("neck
+# FOR a Stratocaster") means the opposite and is not included; "w/o"
+# ("without") tokenizes to "w"+"o" and is not distinguished from "w" -
+# a known, narrow limitation (rare in title text, more common in
+# descriptions, which this check never looks at) rather than a case any
+# current evidence requires handling.
+_INCLUSION_MARKERS = frozenset({"with", "w"})
+# How many tokens after a marker still count as "describing the same
+# included feature" - 3 is the minimum needed for the real listings that
+# motivated this ("with Pau Ferro Neck", "with Billy Corgan Pickups",
+# "with 3-Bolt Neck" are each exactly 3 tokens past the marker); one
+# extra token of headroom for a slightly longer real-world modifier.
+_INCLUSION_MARKER_WINDOW = 4
+
+
+def _title_accessory_matches(title_tokens: list[str]) -> dict[str, str]:
+    """Accessory-vocabulary matches in a listing's title, excluding any
+    match immediately preceded (within `_INCLUSION_MARKER_WINDOW` tokens)
+    by an inclusion marker - see this module's docstring and
+    `_INCLUSION_MARKERS` above."""
+    marker_positions = [i for i, token in enumerate(title_tokens) if token in _INCLUSION_MARKERS]
+    matches: dict[str, str] = {}
+    for start, end, canonical in find_phrase_match_positions(title_tokens, accessories.accessory_vocabulary()):
+        included_feature = any(
+            marker < start <= marker + _INCLUSION_MARKER_WINDOW for marker in marker_positions
+        )
+        if not included_feature:
+            matches[" ".join(title_tokens[start:end])] = canonical
+    return matches
+
 
 def evaluate_relevance(query: str, listing: Listing) -> RelevanceEvaluation:
     parsed_query = parse_query(query)
     listing_text = f"{listing.title} {listing.description or ''}"
     listing_tokens = tokenize(listing_text)
+    # Accessory *penalty* is scoped to the title only (see the accessory
+    # match below) - deliberately narrower than the title+description text
+    # used for everything else. A real, detailed description routinely
+    # mentions a part in passing (a guitar's "alder body and maple neck",
+    # a drill "sold with battery and charger") without that being what's
+    # for sale - the title is what's for sale. Found via a real false
+    # rejection: three genuine complete Fender Stratocasters on Reverb
+    # scored exactly BRAND_MATCH_BONUS + STRONG_CORE_MATCH_SCORE -
+    # ACCESSORY_PENALTY (30+55-45=40, just under threshold) because their
+    # descriptions mentioned body/neck/case - see PROJECT_CONTEXT.md
+    # decision #24.
+    listing_title_tokens = tokenize(listing.title)
     matched_terms: list[str] = []
 
     listing_brand_matches = find_phrase_matches(listing_tokens, brands.brand_vocabulary())
@@ -120,7 +194,7 @@ def evaluate_relevance(query: str, listing: Listing) -> RelevanceEvaluation:
     )
     matched_terms.extend(core_matched_terms)
 
-    listing_accessory_matches = find_phrase_matches(listing_tokens, accessories.accessory_vocabulary())
+    listing_accessory_matches = _title_accessory_matches(listing_title_tokens)
     query_accessory_matches = find_phrase_matches(parsed_query.core_tokens, accessories.accessory_vocabulary())
     query_is_accessory_seeking = bool(query_accessory_matches)
 

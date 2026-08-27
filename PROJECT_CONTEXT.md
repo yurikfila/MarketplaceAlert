@@ -1223,6 +1223,71 @@ marketplace connector yet.
       decisions; the production table is still small (187 rows).
       Revisit if it grows enough to matter.
 
+24. **Relevance false-negative fix (2026-08-23): a diagnostic investigation
+    into why Reverb had zero genuinely-new discoveries since decision
+    #21's `discovered_by_saved_search_id` attribution feature deployed
+    led to finding that `evaluate_relevance()` was silently rejecting
+    real, currently-live, matching Reverb inventory for the "Fender
+    Stratocaster" saved search.** Not a Reverb-specific bug (the
+    evaluator has no marketplace-specific code at all) - it only
+    surfaced there because Reverb was the only marketplace with an
+    active saved search using a guitar-brand query at the time. Found
+    and fixed in two sequential, empirically-verified steps against the
+    real, live `ReverbMarketplaceConnector` (never against production
+    persistence/notifications - read-only throughout):
+    - **Step one: the accessory penalty was scanning `title +
+      description`, not just the title.** Three genuine, live, complete
+      Fender Stratocasters (external ids `94439742`, `97584995`,
+      `98211647`) each scored exactly `BRAND_MATCH_BONUS (30) +
+      STRONG_CORE_MATCH_SCORE (55) - ACCESSORY_PENALTY (45) = 40`, just
+      under `RELEVANCE_THRESHOLD (50)`, because their *descriptions*
+      routinely mentioned body/neck/case wood - ordinary, near-universal
+      vocabulary for describing any real guitar, not evidence the
+      listing itself was an accessory. Fixed by scoping the accessory-
+      penalty check specifically to `listing.title` (every other check -
+      brand conflict, brand match, core-term match - still uses
+      `title + description` as before). Verified live: all three ids
+      moved from `REJECT score=40 accessory_without_core_product_match`
+      to `KEEP score=85`.
+    - **Step two, discovered by re-running the live verification *after*
+      step one shipped**: three further genuine complete guitars
+      (`98036091` "...w/Pau Ferro Neck...", `99733669` "...with Billy
+      Corgan Pickups", `100667007` "...Hardtail with 3-Bolt Neck...")
+      were still being rejected the same way - this time because the
+      accessory word (`neck`/`pickups`) was genuinely present *in the
+      title itself*, describing an installed/included feature of the
+      complete instrument, not the item for sale. Distinguished from a
+      genuine accessory listing (e.g. `"Fender Stratocaster 1973-1976
+      thin neck"` - id `91344667`, correctly still rejected) by a new,
+      narrow, marketplace-agnostic rule: an accessory term immediately
+      preceded (within a few tokens) by an inclusion marker (`"with"`/
+      `"w/"`) is exempted from the penalty; a bare accessory term, or one
+      preceded by `"for"` (the opposite meaning - "accessory FOR the
+      product") is not. Required a new primitive,
+      `find_phrase_match_positions()` (`core/relevance/text.py`),
+      additive alongside the existing `find_phrase_matches()`, since
+      determining "is this match preceded by a marker" needs match
+      *positions*, which the original function never exposed - every
+      other caller (brand/family/query-accessory matching) still uses
+      the original, unchanged.
+    - **Both fixes verified against the same live connector twice** (not
+      just the unit tests) - the final live run against production's
+      real "Fender Stratocaster" query, after both fixes, returned
+      `raw_count=25 kept_count=25 rejected_count=0` for that day's live
+      Reverb inventory, with every one of the seven ids named above
+      (six real, plus one - `83652176` - not present in that particular
+      live run, so left unverified rather than assumed) landing exactly
+      where the fix's design predicted. `tests/test_relevance.py` grew
+      from 80 to 96 tests, all passing, alongside the full backend
+      suite (669/669).
+    - **Deliberately not a whitelist of these specific titles/ids** - the
+      exemption is a general linguistic pattern (an inclusion-marker
+      proximity check), tested against both the guitar category and the
+      pre-existing drill category (`"Makita drill with battery"` now
+      correctly kept; `"battery for Makita drill"` still correctly
+      rejected), matching every other rule in this module's stated
+      design goal of staying marketplace/category-agnostic.
+
 ## Things that have NOT yet been implemented
 
 - Any marketplace beyond mock/Etsy/eBay/Reverb/Bonanza. Nine additional

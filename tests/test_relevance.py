@@ -545,7 +545,7 @@ def test_fender_stratocaster_search_accepts_a_complete_guitar_with_included_feat
     """Regression for real Reverb false rejections found after the
     title-only accessory fix: 'with'/'w/' immediately before an accessory
     term marks it as a described feature of the complete guitar, not the
-    item being sold - see PROJECT_CONTEXT.md decision #25."""
+    item being sold - see PROJECT_CONTEXT.md decision #24."""
     result = evaluate_relevance("Fender Stratocaster", _listing(title))
     assert result.is_relevant is True
 

@@ -77,7 +77,7 @@ with Billy Corgan Pickups" or "...w/Pau Ferro Neck" describe a feature of
 the complete product being sold, not an accessory being sold on its own.
 Found via real production false rejections *after* the title-only
 accessory fix above - see `_title_accessory_matches()` and
-PROJECT_CONTEXT.md decision #25 for the full reasoning, including why
+PROJECT_CONTEXT.md decision #24 for the full reasoning, including why
 "for" (the opposite meaning - "accessory FOR the product") is
 deliberately *not* treated as a marker, and why the exemption is
 directional (only a match textually *after* "with"/"w" is exempted - an

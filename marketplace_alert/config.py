@@ -39,10 +39,39 @@ class Settings(BaseSettings):
     telegram_max_retries: int = 3
     telegram_retry_base_seconds: float = 2.0
 
+    # Notification outbox (`core/persistence/models.py:PendingNotification`,
+    # `core/notifications/outbox.py`) - decouples scanning/persistence from
+    # Telegram delivery entirely (see PROJECT_CONTEXT.md's outbox decision).
+    # `notification_outbox_batch_size`: how many pending/reclaimed rows one
+    # drain run claims at a time. `notification_lease_seconds`: how long a
+    # claimed (`processing`) row is considered "someone is actively
+    # delivering this" before a later drain run treats it as an abandoned/
+    # crashed claim and reclaims it - comfortably longer than a Telegram
+    # send's own worst-case duration (up to `telegram_max_retries` retries
+    # with backoff), short enough that a genuine crash doesn't leave a
+    # notification stuck for long. `notification_max_attempts`: how many
+    # times total (first attempt + reclaims) a row is retried before it's
+    # marked permanently `failed` rather than retried forever.
+    notification_outbox_batch_size: int = 20
+    notification_lease_seconds: float = 120.0
+    notification_max_attempts: int = 10
+
     # How often the background scanner checks for due saved searches
     # (polling granularity, not a per-search interval - see
     # core/saved_searches/schemas.py for the per-search minimum).
     scheduler_tick_seconds: float = 5.0
+
+    # Whether the Web Service process runs the saved-search scanner
+    # in-process (a background thread, started in `main.py`'s `lifespan`)
+    # or leaves scanning entirely to an external trigger (a Render Cron
+    # Job running `scripts/run_due_scans.py` on a schedule). Defaults to
+    # `True` (today's behavior, and what every existing test/local-dev
+    # setup already assumes) - production sets this to `False` once the
+    # Cron Job is confirmed working, so the Web Service becomes API/
+    # dashboard/mobile-only. See PROJECT_CONTEXT.md's Render-reliability
+    # decision for why: a Render Free Web Service can be suspended during
+    # idle periods, which an in-process background thread cannot survive.
+    run_scanner_in_process: bool = True
 
     # Automatic PostgreSQL migrations at app startup
     # (core/persistence/migrations.py) - added because Render's Free plan

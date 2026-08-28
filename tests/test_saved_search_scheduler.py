@@ -2,18 +2,44 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 from marketplace_alert.connectors.bonanza.connector import BonanzaMarketplaceConnector
 from marketplace_alert.connectors.ebay.connector import EbayMarketplaceConnector
 from marketplace_alert.connectors.etsy.connector import EtsyMarketplaceConnector
 from marketplace_alert.connectors.reverb.connector import ReverbMarketplaceConnector
 from marketplace_alert.core.models.listing import Listing
-from marketplace_alert.core.notifications.base import NotificationError, NotificationProvider
-from marketplace_alert.core.notifications.service import NotificationService
+from marketplace_alert.core.persistence.models import DiscoveredListing, PendingNotification
 from marketplace_alert.core.saved_searches.repository import SavedSearchRepository
 from marketplace_alert.core.saved_searches.runner import SavedSearchRunner
 from marketplace_alert.core.scheduler.guard import SavedSearchRunGuard
 from marketplace_alert.core.scheduler.scanner import BackgroundScanner
+
+
+def _pending_notification_listings(session) -> list[Listing]:
+    """Every notification-outbox row's listing, in enqueue order.
+
+    `SavedSearchRunner` never sends anything directly anymore - a new
+    listing only ever gets a `pending_notifications` row (see that
+    module's docstring). This is the outbox equivalent of what these
+    tests used to check via a fake `NotificationProvider`'s recorded
+    sends - "what would eventually be sent by a later drain run",
+    not "what was sent just now".
+    """
+    stmt = (
+        select(PendingNotification, DiscoveredListing)
+        .join(DiscoveredListing, PendingNotification.discovered_listing_id == DiscoveredListing.id)
+        .order_by(PendingNotification.created_at.asc(), PendingNotification.id.asc())
+    )
+    return [
+        Listing(
+            marketplace=row.marketplace,
+            external_listing_id=row.external_listing_id,
+            title=row.title,
+            listing_url=row.listing_url,
+        )
+        for _, row in session.execute(stmt).all()
+    ]
 
 
 def _listing(marketplace: str = "good", external_id: str = "item-1") -> Listing:
@@ -42,31 +68,6 @@ class BrokenConnector:
 
     def search(self, query: str, filters: dict | None = None) -> list[Listing]:
         raise RuntimeError("simulated connector failure")
-
-
-class RecordingProvider(NotificationProvider):
-    def __init__(self) -> None:
-        self.sent: list[Listing] = []
-
-    @property
-    def is_enabled(self) -> bool:
-        return True
-
-    def send_listing_alert(self, listing: Listing) -> None:
-        self.sent.append(listing)
-
-
-class AlwaysFailingNotificationProvider(NotificationProvider):
-    """A notification provider that always raises, to test that the scheduler
-    and saved-search runner survive a Telegram-side failure (not just a
-    connector-side one)."""
-
-    @property
-    def is_enabled(self) -> bool:
-        return True
-
-    def send_listing_alert(self, listing: Listing) -> None:
-        raise NotificationError("simulated Telegram failure")
 
 
 def test_never_scanned_active_search_is_due(db_session) -> None:
@@ -117,18 +118,15 @@ def test_scanner_runs_due_search_and_notifies_new_listing(session_factory) -> No
     setup_session.commit()
     setup_session.close()
 
-    provider = RecordingProvider()
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider),
         resolve_connector=lambda name: FakeConnector([_listing()]),
     )
     scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
 
     scanner.run_due_searches()
 
-    assert len(provider.sent) == 1
-
     verify_session = session_factory()
+    assert len(_pending_notification_listings(verify_session)) == 1
     saved_search = SavedSearchRepository(verify_session).list_all()[0]
     assert saved_search.last_scanned_at is not None
     verify_session.close()
@@ -142,20 +140,22 @@ def test_scanner_does_not_notify_twice_for_same_listing(session_factory) -> None
     setup_session.commit()
     setup_session.close()
 
-    provider = RecordingProvider()
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider),
         resolve_connector=lambda name: FakeConnector([_listing()]),
     )
     scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
 
     scanner.run_due_searches()
-    assert len(provider.sent) == 1
+
+    verify_session = session_factory()
+    assert len(_pending_notification_listings(verify_session)) == 1
 
     # The interval (60s) hasn't elapsed - an immediate second tick must not
-    # find it due again, so the same listing must not be notified twice.
+    # find it due again, so the same listing must not get a second outbox row.
     scanner.run_due_searches()
-    assert len(provider.sent) == 1
+    verify_session.expire_all()
+    assert len(_pending_notification_listings(verify_session)) == 1
+    verify_session.close()
 
 
 def test_one_failing_saved_search_does_not_stop_others(session_factory) -> None:
@@ -170,22 +170,19 @@ def test_one_failing_saved_search_does_not_stop_others(session_factory) -> None:
     setup_session.commit()
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         return FakeConnector([_listing()]) if marketplace == "good" else BrokenConnector()
 
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+        resolve_connector=resolve_connector
     )
     scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
 
     # Must not raise, even though the "broken" saved search always fails.
     scanner.run_due_searches()
 
-    assert len(provider.sent) == 1
-
     verify_session = session_factory()
+    assert len(_pending_notification_listings(verify_session)) == 1
     verify_repository = SavedSearchRepository(verify_session)
     assert verify_repository.get(good.id).last_scanned_at is not None
     # A within-search connector failure is caught by the runner itself now
@@ -226,28 +223,30 @@ def test_scheduler_searches_every_marketplace_on_one_saved_search(session_factor
     setup_session.commit()
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         return FakeConnector([_listing(marketplace=marketplace, external_id="item-1")])
 
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+        resolve_connector=resolve_connector
     )
     scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
 
     scanner.run_due_searches()
 
+    verify_session = session_factory()
     # Same external_listing_id but different marketplace = two distinct,
     # both-new listings - duplicate detection stays marketplace-specific.
-    assert len(provider.sent) == 2
-    assert {listing.marketplace for listing in provider.sent} == {"good", "also-good"}
+    enqueued = _pending_notification_listings(verify_session)
+    assert len(enqueued) == 2
+    assert {listing.marketplace for listing in enqueued} == {"good", "also-good"}
+    verify_session.close()
 
 
 def test_one_failing_marketplace_does_not_stop_another_in_the_same_search(session_factory) -> None:
     """Within ONE saved search targeting two marketplaces, one failing
     connector must not prevent the other marketplace from being searched,
-    notified, and the saved search still completing (marked scanned)."""
+    enqueued for notification, and the saved search still completing
+    (marked scanned)."""
     setup_session = session_factory()
     created = SavedSearchRepository(setup_session).create(
         query="Charizard", marketplaces=["good", "broken"], scan_interval_seconds=60, is_active=True
@@ -256,22 +255,21 @@ def test_one_failing_marketplace_does_not_stop_another_in_the_same_search(sessio
     saved_search_id = created.id
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         return FakeConnector([_listing(marketplace="good")]) if marketplace == "good" else BrokenConnector()
 
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+        resolve_connector=resolve_connector
     )
 
     run_session = session_factory()
     result = runner.run_by_id(run_session, saved_search_id)
     run_session.commit()
-    run_session.close()
 
-    assert len(provider.sent) == 1
-    assert provider.sent[0].marketplace == "good"
+    enqueued = _pending_notification_listings(run_session)
+    assert len(enqueued) == 1
+    assert enqueued[0].marketplace == "good"
+    run_session.close()
 
     assert result is not None
     by_marketplace = {r.marketplace: r for r in result.results}
@@ -307,24 +305,21 @@ def test_scheduler_survives_a_real_etsy_connector_failure(
     setup_session.commit()
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         if marketplace == "good":
             return FakeConnector([_listing()])
         return EtsyMarketplaceConnector(api_key="fake-key", shared_secret="fake-secret")
 
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+        resolve_connector=resolve_connector
     )
     scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
 
     # Must not raise, even though the real Etsy connector's HTTP call fails.
     scanner.run_due_searches()
 
-    assert len(provider.sent) == 1
-
     verify_session = session_factory()
+    assert len(_pending_notification_listings(verify_session)) == 1
     verify_repository = SavedSearchRepository(verify_session)
     assert verify_repository.get(good.id).last_scanned_at is not None
     assert verify_repository.get(etsy.id).last_scanned_at is not None
@@ -355,9 +350,7 @@ def test_etsy_listing_duplicate_is_not_notified_twice(
     )
     db_session.commit()
 
-    provider = RecordingProvider()
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider),
         resolve_connector=lambda name: EtsyMarketplaceConnector(
             api_key="fake-key", shared_secret="fake-secret"
         ),
@@ -369,7 +362,7 @@ def test_etsy_listing_duplicate_is_not_notified_twice(
     assert first.new_count == 1
     assert second.new_count == 0
     assert second.already_seen_count == 1
-    assert len(provider.sent) == 1
+    assert len(_pending_notification_listings(db_session)) == 1
 
 
 # --- against a real EbayMarketplaceConnector (httpx mocked, no network) ----
@@ -400,24 +393,21 @@ def test_scheduler_survives_a_real_ebay_connector_failure(
     setup_session.commit()
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         if marketplace == "good":
             return FakeConnector([_listing()])
         return _ebay_connector()
 
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+        resolve_connector=resolve_connector
     )
     scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
 
     # Must not raise, even though the real eBay connector's HTTP call fails.
     scanner.run_due_searches()
 
-    assert len(provider.sent) == 1
-
     verify_session = session_factory()
+    assert len(_pending_notification_listings(verify_session)) == 1
     verify_repository = SavedSearchRepository(verify_session)
     assert verify_repository.get(good.id).last_scanned_at is not None
     assert verify_repository.get(ebay.id).last_scanned_at is not None
@@ -458,24 +448,23 @@ def test_etsy_still_runs_if_ebay_fails_in_same_saved_search(
     saved_search_id = created.id
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         if marketplace == "etsy":
             return EtsyMarketplaceConnector(api_key="fake-key", shared_secret="fake-secret")
         return _ebay_connector()
 
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+        resolve_connector=resolve_connector
     )
 
     run_session = session_factory()
     result = runner.run_by_id(run_session, saved_search_id)
     run_session.commit()
-    run_session.close()
 
-    assert len(provider.sent) == 1
-    assert provider.sent[0].marketplace == "etsy"
+    enqueued = _pending_notification_listings(run_session)
+    assert len(enqueued) == 1
+    assert enqueued[0].marketplace == "etsy"
+    run_session.close()
 
     by_marketplace = {r.marketplace: r for r in result.results}
     assert by_marketplace["etsy"].new_count == 1
@@ -517,24 +506,23 @@ def test_ebay_still_runs_if_etsy_fails_in_same_saved_search(
     saved_search_id = created.id
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         if marketplace == "etsy":
             return EtsyMarketplaceConnector(api_key="fake-key", shared_secret="fake-secret")
         return _ebay_connector()
 
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+        resolve_connector=resolve_connector
     )
 
     run_session = session_factory()
     result = runner.run_by_id(run_session, saved_search_id)
     run_session.commit()
-    run_session.close()
 
-    assert len(provider.sent) == 1
-    assert provider.sent[0].marketplace == "ebay"
+    enqueued = _pending_notification_listings(run_session)
+    assert len(enqueued) == 1
+    assert enqueued[0].marketplace == "ebay"
+    run_session.close()
 
     by_marketplace = {r.marketplace: r for r in result.results}
     assert by_marketplace["ebay"].new_count == 1
@@ -567,9 +555,7 @@ def test_ebay_listing_duplicate_is_not_notified_twice(
     )
     db_session.commit()
 
-    provider = RecordingProvider()
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider),
         resolve_connector=lambda name: _ebay_connector(),
     )
 
@@ -579,7 +565,7 @@ def test_ebay_listing_duplicate_is_not_notified_twice(
     assert first.new_count == 1
     assert second.new_count == 0
     assert second.already_seen_count == 1
-    assert len(provider.sent) == 1
+    assert len(_pending_notification_listings(db_session)) == 1
 
 
 def test_same_title_on_etsy_and_ebay_remains_two_separate_listings(
@@ -625,118 +611,65 @@ def test_same_title_on_etsy_and_ebay_remains_two_separate_listings(
     setup_session.commit()
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         if marketplace == "etsy":
             return EtsyMarketplaceConnector(api_key="fake-key", shared_secret="fake-secret")
         return _ebay_connector()
 
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+        resolve_connector=resolve_connector
     )
     scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
 
-    scanner.run_due_searches()
-
-    assert len(provider.sent) == 2
-    assert {listing.marketplace for listing in provider.sent} == {"etsy", "ebay"}
-    assert all(listing.title == "Makita Cordless Drill" for listing in provider.sent)
-
-
-# --- notification (Telegram) failures must not crash the run/scheduler -----
-
-
-def test_notification_failure_does_not_crash_a_manual_run(session_factory) -> None:
-    """A Telegram-side failure (not a connector failure) must not prevent
-    `SavedSearchRunner.run` from completing and reporting the marketplace
-    as successfully searched."""
-    setup_session = session_factory()
-    saved_search = SavedSearchRepository(setup_session).create(
-        query="Charizard", marketplaces=["good"], scan_interval_seconds=60, is_active=True
-    )
-    setup_session.commit()
-    setup_session.close()
-
-    runner = SavedSearchRunner(
-        notification_service=NotificationService(AlwaysFailingNotificationProvider()),
-        resolve_connector=lambda name: FakeConnector([_listing()]),
-    )
-
-    run_session = session_factory()
-    # Must not raise, even though every notification send fails.
-    result = runner.run_by_id(run_session, saved_search.id)
-    run_session.commit()
-    run_session.close()
-
-    assert result is not None
-    assert result.new_count == 1
-    assert result.results[0].error is None  # the search itself succeeded
-
-
-def test_notification_failure_does_not_crash_the_scheduler(session_factory) -> None:
-    """Same as above, but through the full BackgroundScanner tick - and a
-    second, healthy saved search must still run in the same tick."""
-    setup_session = session_factory()
-    repository = SavedSearchRepository(setup_session)
-    failing_notify = repository.create(
-        query="Charizard", marketplaces=["good"], scan_interval_seconds=60, is_active=True
-    )
-    other = repository.create(
-        query="Rolex", marketplaces=["good"], scan_interval_seconds=60, is_active=True
-    )
-    setup_session.commit()
-    setup_session.close()
-
-    runner = SavedSearchRunner(
-        notification_service=NotificationService(AlwaysFailingNotificationProvider()),
-        resolve_connector=lambda name: FakeConnector([_listing()]),
-    )
-    scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
-
-    # Must not raise, even though every notification send fails for both.
     scanner.run_due_searches()
 
     verify_session = session_factory()
-    verify_repository = SavedSearchRepository(verify_session)
-    assert verify_repository.get(failing_notify.id).last_scanned_at is not None
-    assert verify_repository.get(other.id).last_scanned_at is not None
+    enqueued = _pending_notification_listings(verify_session)
+    assert len(enqueued) == 2
+    assert {listing.marketplace for listing in enqueued} == {"etsy", "ebay"}
+    assert all(listing.title == "Makita Cordless Drill" for listing in enqueued)
     verify_session.close()
 
 
-def test_listing_already_marked_seen_is_not_renotified_after_a_prior_notification_failure(
-    db_session,
-) -> None:
-    """The database, not Telegram delivery success, is the source of truth
-    for "already discovered". A listing that was persisted as new during a
-    run where notification failed must NOT be treated as new again on a
-    later run just because it was never successfully delivered."""
+# --- outbox enqueueing: never re-enqueued, never blocks scanning -----------
+#
+# Notification *delivery* (Telegram) is no longer part of this runner at
+# all - see `SavedSearchRunner`'s module docstring. The scheduler/runner
+# tests below only ever check that the *outbox row* was (or wasn't)
+# created; whether it eventually gets delivered, retried, or fails
+# permanently is `core/notifications/outbox.py`'s concern, covered in
+# `tests/test_notification_outbox.py`. This directly replaces two tests
+# that used to simulate a failing `NotificationProvider` to prove a scan
+# survives Telegram going down - that's now a structural guarantee (the
+# runner has no code path that could call a notification provider at
+# all), not something that needs an exception-catching test to prove.
+
+
+def test_listing_already_marked_seen_does_not_get_a_second_outbox_row(db_session) -> None:
+    """The database, not notification delivery, is the source of truth
+    for "already discovered". A listing enqueued once must not get a
+    second `pending_notifications` row just because the same saved search
+    finds it again later."""
     repository = SavedSearchRepository(db_session)
     saved_search = repository.create(
         query="Charizard", marketplaces=["good"], scan_interval_seconds=60, is_active=True
     )
     db_session.commit()
 
-    failing_runner = SavedSearchRunner(
-        notification_service=NotificationService(AlwaysFailingNotificationProvider()),
-        resolve_connector=lambda name: FakeConnector([_listing()]),
-    )
-    first = failing_runner.run(db_session, saved_search)
-    assert first.new_count == 1  # persisted as discovered, even though the alert failed
+    runner = SavedSearchRunner(resolve_connector=lambda name: FakeConnector([_listing()]))
 
-    # A second run, now with a healthy provider and the connector still
-    # returning the exact same listing - it must be reported already-seen,
-    # not new, and must not be notified.
-    working_provider = RecordingProvider()
-    working_runner = SavedSearchRunner(
-        notification_service=NotificationService(working_provider),
-        resolve_connector=lambda name: FakeConnector([_listing()]),
-    )
-    second = working_runner.run(db_session, saved_search)
+    first = runner.run(db_session, saved_search)
+    assert first.new_count == 1
+    assert len(_pending_notification_listings(db_session)) == 1
+
+    # A second run, connector still returning the exact same listing - it
+    # must be reported already-seen, not new, and must not get a second
+    # outbox row.
+    second = runner.run(db_session, saved_search)
 
     assert second.new_count == 0
     assert second.already_seen_count == 1
-    assert working_provider.sent == []
+    assert len(_pending_notification_listings(db_session)) == 1
 
 
 # --- against a real ReverbMarketplaceConnector (httpx mocked, no network) --
@@ -778,24 +711,21 @@ def test_scheduler_survives_a_real_reverb_connector_failure(
     setup_session.commit()
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         if marketplace == "good":
             return FakeConnector([_listing()])
         return _reverb_connector()
 
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+        resolve_connector=resolve_connector
     )
     scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
 
     # Must not raise, even though the real Reverb connector's HTTP call fails.
     scanner.run_due_searches()
 
-    assert len(provider.sent) == 1
-
     verify_session = session_factory()
+    assert len(_pending_notification_listings(verify_session)) == 1
     verify_repository = SavedSearchRepository(verify_session)
     assert verify_repository.get(good.id).last_scanned_at is not None
     assert verify_repository.get(reverb.id).last_scanned_at is not None
@@ -852,8 +782,6 @@ def test_etsy_and_ebay_still_run_if_reverb_fails_in_same_saved_search(
     saved_search_id = created.id
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         if marketplace == "etsy":
             return EtsyMarketplaceConnector(api_key="fake-key", shared_secret="fake-secret")
@@ -862,15 +790,16 @@ def test_etsy_and_ebay_still_run_if_reverb_fails_in_same_saved_search(
         return _reverb_connector()
 
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+        resolve_connector=resolve_connector
     )
 
     run_session = session_factory()
     result = runner.run_by_id(run_session, saved_search_id)
     run_session.commit()
-    run_session.close()
 
-    assert {listing.marketplace for listing in provider.sent} == {"etsy", "ebay"}
+    enqueued = _pending_notification_listings(run_session)
+    assert {listing.marketplace for listing in enqueued} == {"etsy", "ebay"}
+    run_session.close()
 
     by_marketplace = {r.marketplace: r for r in result.results}
     assert by_marketplace["etsy"].new_count == 1
@@ -902,9 +831,8 @@ def test_reverb_listing_duplicate_is_not_notified_twice(
     )
     db_session.commit()
 
-    provider = RecordingProvider()
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=lambda name: _reverb_connector()
+        resolve_connector=lambda name: _reverb_connector()
     )
 
     first = runner.run(db_session, saved_search)
@@ -913,7 +841,7 @@ def test_reverb_listing_duplicate_is_not_notified_twice(
     assert first.new_count == 1
     assert second.new_count == 0
     assert second.already_seen_count == 1
-    assert len(provider.sent) == 1
+    assert len(_pending_notification_listings(db_session)) == 1
 
 
 def test_reverb_and_ebay_ids_are_independent_even_with_the_same_external_id(
@@ -950,21 +878,22 @@ def test_reverb_and_ebay_ids_are_independent_even_with_the_same_external_id(
     setup_session.commit()
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         if marketplace == "ebay":
             return EbayMarketplaceConnector(app_id="fake-app-id", cert_id="fake-cert-id")
         return _reverb_connector()
 
-    runner = SavedSearchRunner(notification_service=NotificationService(provider), resolve_connector=resolve_connector)
+    runner = SavedSearchRunner(resolve_connector=resolve_connector)
     scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
 
     scanner.run_due_searches()
 
-    assert len(provider.sent) == 2
-    assert {listing.marketplace for listing in provider.sent} == {"reverb", "ebay"}
-    assert {listing.external_listing_id for listing in provider.sent} == {"444"}
+    verify_session = session_factory()
+    enqueued = _pending_notification_listings(verify_session)
+    assert len(enqueued) == 2
+    assert {listing.marketplace for listing in enqueued} == {"reverb", "ebay"}
+    assert {listing.external_listing_id for listing in enqueued} == {"444"}
+    verify_session.close()
 
 
 # --- Reverb results go through the same relevance engine as every other
@@ -995,9 +924,7 @@ def test_reverb_results_pass_through_the_relevance_engine(db_session) -> None:
         listing_url="https://reverb.com/item/irrel-1",
     )
 
-    provider = RecordingProvider()
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider),
         resolve_connector=lambda name: FakeConnector([relevant, irrelevant]),
     )
 
@@ -1006,8 +933,9 @@ def test_reverb_results_pass_through_the_relevance_engine(db_session) -> None:
     assert result.results[0].marketplace == "reverb"
     assert result.results[0].new_count == 1
     assert result.results[0].rejected_count == 1
-    assert len(provider.sent) == 1
-    assert provider.sent[0].external_listing_id == "rel-1"
+    enqueued = _pending_notification_listings(db_session)
+    assert len(enqueued) == 1
+    assert enqueued[0].external_listing_id == "rel-1"
 
     # The irrelevant listing was never persisted as discovered either -
     # relevance filtering happens before duplicate detection, not after.
@@ -1066,24 +994,21 @@ def test_scheduler_survives_a_real_bonanza_connector_failure(
     setup_session.commit()
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         if marketplace == "good":
             return FakeConnector([_listing()])
         return _bonanza_connector()
 
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+        resolve_connector=resolve_connector
     )
     scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
 
     # Must not raise, even though the real Bonanza connector's HTTP call fails.
     scanner.run_due_searches()
 
-    assert len(provider.sent) == 1
-
     verify_session = session_factory()
+    assert len(_pending_notification_listings(verify_session)) == 1
     verify_repository = SavedSearchRepository(verify_session)
     assert verify_repository.get(good.id).last_scanned_at is not None
     assert verify_repository.get(bonanza.id).last_scanned_at is not None
@@ -1127,23 +1052,22 @@ def test_other_marketplaces_still_run_if_bonanza_fails_in_the_same_saved_search(
     saved_search_id = created.id
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         if marketplace == "reverb":
             return ReverbMarketplaceConnector(api_token="fake-reverb-token")
         return _bonanza_connector()
 
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=resolve_connector
+        resolve_connector=resolve_connector
     )
 
     run_session = session_factory()
     result = runner.run_by_id(run_session, saved_search_id)
     run_session.commit()
-    run_session.close()
 
-    assert {listing.marketplace for listing in provider.sent} == {"reverb"}
+    enqueued = _pending_notification_listings(run_session)
+    assert {listing.marketplace for listing in enqueued} == {"reverb"}
+    run_session.close()
 
     by_marketplace = {r.marketplace: r for r in result.results}
     assert by_marketplace["reverb"].new_count == 1
@@ -1173,9 +1097,8 @@ def test_bonanza_listing_duplicate_is_not_notified_twice(
     )
     db_session.commit()
 
-    provider = RecordingProvider()
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider), resolve_connector=lambda name: _bonanza_connector()
+        resolve_connector=lambda name: _bonanza_connector()
     )
 
     first = runner.run(db_session, saved_search)
@@ -1184,7 +1107,7 @@ def test_bonanza_listing_duplicate_is_not_notified_twice(
     assert first.new_count == 1
     assert second.new_count == 0
     assert second.already_seen_count == 1
-    assert len(provider.sent) == 1
+    assert len(_pending_notification_listings(db_session)) == 1
 
 
 def test_bonanza_results_pass_through_the_relevance_engine(db_session) -> None:
@@ -1211,9 +1134,7 @@ def test_bonanza_results_pass_through_the_relevance_engine(db_session) -> None:
         listing_url="https://www.bonanza.com/listings/irrel-1",
     )
 
-    provider = RecordingProvider()
     runner = SavedSearchRunner(
-        notification_service=NotificationService(provider),
         resolve_connector=lambda name: FakeConnector([relevant, irrelevant]),
     )
 
@@ -1222,10 +1143,9 @@ def test_bonanza_results_pass_through_the_relevance_engine(db_session) -> None:
     assert result.results[0].marketplace == "bonanza"
     assert result.results[0].new_count == 1
     assert result.results[0].rejected_count == 1
-    assert len(provider.sent) == 1
-    assert provider.sent[0].external_listing_id == "rel-1"
-
-    from marketplace_alert.core.persistence.models import DiscoveredListing
+    enqueued = _pending_notification_listings(db_session)
+    assert len(enqueued) == 1
+    assert enqueued[0].external_listing_id == "rel-1"
 
     assert (
         db_session.query(DiscoveredListing)

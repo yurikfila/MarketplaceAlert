@@ -1400,12 +1400,22 @@ It mirrors the connector pattern exactly: an interface in `core/`, concrete
 providers outside it.
 
 ```
-routes (main.py)
+main.py's legacy, mock-only /scan endpoint  (the ONLY caller left, since decision #25)
     -> NotificationService.notify_new_listings(new_listings: list[Listing])
         -> paced, in order: NotificationProvider.send_listing_alert(listing)
             -> TelegramNotificationProvider -> Telegram Bot API
                (retries its own transient failures internally, bounded)
 ```
+
+Every other path to a real notification - the saved-search scheduler and
+both manual "Run Now" endpoints - no longer calls `NotificationService`
+at all as of decision #25; see "Notification outbox and drain" below for
+what they do instead (enqueue a durable outbox row) and why. Everything
+in this section (`NotificationService`, `TelegramNotificationProvider`,
+the pacing/retry behavior) is still exactly accurate for `/scan`, and is
+also what `core/notifications/outbox.py`'s drain reuses at the single-
+message level (one `send_listing_alert` call, one provider, same retry
+behavior) - only the batching/pacing/transaction shape around it differs.
 
 - **`core/notifications/base.py`** defines `NotificationProvider`
   (`is_enabled` property, `send_listing_alert(listing)`) and
@@ -1427,14 +1437,17 @@ routes (main.py)
     `send_delay_seconds` (default `0.0`, main.py wires in
     `settings.telegram_send_delay_seconds`). Between each listing's send
     (never before the first one, so a single new listing is never
-    artificially delayed) it sleeps that long before continuing - a saved
-    search that discovers 10, 25, or 50 new listings at once sends them
-    spaced out rather than back-to-back. This is a generic pacing knob, not
-    Telegram-specific logic - it lives here rather than in the provider
-    because it governs the gap *between separate listings' sends*, a
-    concern of whoever's looping over the batch, not of a single send
-    itself. See "Why these choices" for why this isn't a persistent
-    background queue/thread.
+    artificially delayed) it sleeps that long before continuing - `/scan`
+    matching 10, 25, or 50 mock listings at once sends them spaced out
+    rather than back-to-back (the only remaining caller of this pacing -
+    see decision #25 and "Notification outbox and drain" below for why
+    the saved-search path no longer uses it: a durable outbox naturally
+    spreads deliveries across whatever interval the drain Cron Job runs
+    on instead). This is a generic pacing knob, not Telegram-specific
+    logic - it lives here rather than in the provider because it governs
+    the gap *between separate listings' sends*, a concern of whoever's
+    looping over the batch, not of a single send itself. See "Why these
+    choices" for why this isn't a persistent background queue/thread.
 - **`notifications/telegram/provider.py`** (`TelegramNotificationProvider`)
   is the only concrete provider so far. It calls the Telegram Bot API's
   `sendMessage` directly via `httpx` — no SDK dependency. It reads
@@ -1475,12 +1488,13 @@ listings `ListingDiscoveryService` classified as new. Already-seen listings
 never reach the notification service at all, so they can never trigger a
 second alert - and this is true regardless of whether a *previous* attempt
 to notify about that listing succeeded or failed: `ListingDiscoveryService`
-persists a listing as discovered *before* `NotificationService` is ever
-called (see `SavedSearchRunner._run_one_marketplace` in "Saved searches and
-background scanning" below), so a Telegram failure - even after every
-retry is exhausted - can never make a listing look "new again" on a later
-scan. The database, not delivery success, is the source of truth for
-"already discovered".
+persists a listing as discovered *before* anything downstream (`/scan`'s
+direct `NotificationService` call, or the saved-search path's
+`NotificationOutboxRepository.enqueue()` - see "Notification outbox and
+drain" below) ever runs, so a Telegram failure - even after every retry
+is exhausted, or every outbox retry attempt - can never make a listing
+look "new again" on a later scan. The database, not delivery success, is
+the source of truth for "already discovered", on both paths.
 
 **Security**: the Telegram bot token is part of the request URL
 (`https://api.telegram.org/bot<TOKEN>/sendMessage`), so
@@ -1508,7 +1522,13 @@ Provider-level tests (`tests/test_telegram_provider.py`) construct their own
 monkeypatches `time.sleep` to record requested durations instead of
 actually pausing, so retry/backoff tests (bounded retry count, exponential
 backoff values, `retry_after` handling) run instantly rather than actually
-waiting seconds per test.
+waiting seconds per test. The saved-search path's own notification
+behavior (enqueueing, claiming, delivering, completing, retrying, lease
+recovery) is no longer exercised through this fixture at all - it's
+covered by `tests/test_notification_outbox.py` instead, plus every
+`SavedSearchRunner`-touching test elsewhere in the suite asserting
+against `PendingNotification` rows rather than a recording provider - see
+"Notification outbox and drain" below.
 
 ## Saved searches and background scanning
 
@@ -1519,10 +1539,16 @@ once - and one saved search can target **multiple marketplaces**.
 ```
 SavedSearchRepository (CRUD, list_due_for_scan)
     <- SavedSearchService (validated CRUD - used by the API routes)
-    <- SavedSearchRunner (per marketplace: search -> dedup -> notify; then mark_scanned)
+    <- SavedSearchRunner (per marketplace: search -> dedup -> enqueue outbox row; then mark_scanned)
         <- POST /saved-searches/{id}/run            (manual, one search, now)
         <- BackgroundScanner._run_one                (automatic, on a tick)
 ```
+
+`SavedSearchRunner` never calls a `NotificationProvider` itself - see
+"Notification outbox and drain" below for what happens to a newly
+discovered listing after this runner enqueues it, and why (decision #25:
+a Render Free web service can be spun down while idle, silently starving
+a scanner thread living inside that same process).
 
 - **`core/saved_searches/models.py`** defines `SavedSearch` (`id`, `query`,
   `is_active`, `scan_interval_seconds`, `created_at`, `updated_at` - bumped
@@ -1569,7 +1595,11 @@ SavedSearchRepository (CRUD, list_due_for_scan)
   marketplaces: for each one, resolve the connector (via an injected
   `resolve_connector` function - never a concrete connector class),
   `connector.search(query)`, feed results through `ListingDiscoveryService`,
-  feed the new ones through `NotificationService` - then, once every
+  then enqueue a `PendingNotification` outbox row (via
+  `NotificationOutboxRepository.enqueue()`) for each listing
+  `ListingDiscoveryService` classified as new (`result.new_listing_ids`) -
+  never a direct `NotificationProvider` call (decision #25; see
+  "Notification outbox and drain" below) - then, once every
   marketplace has been attempted, `SavedSearchRepository.mark_scanned()`
   once for the whole search. Both the manual `POST /saved-searches/{id}/run`
   endpoint and the background scanner call this same class/method - there
@@ -1629,17 +1659,124 @@ one thread or process per saved search:
   two overlapping ticks) at once. The manual endpoint returns `409` if the
   saved search is already running or currently inactive.
 - Started/stopped in `main.py`'s `lifespan` (`_background_scanner.start()`
-  / `.stop()`), alongside `init_db()`. Because it's a background thread
-  with no FastAPI request to hang a `Depends` off, `main.py` binds it to
-  the *real* `NotificationService` and the real `SessionLocal` at startup -
-  it is not overridable per-request like `get_db_session`/
-  `get_notification_service`. Tests never trigger `lifespan` (see "Local
-  persistence" above), so the real thread never starts during `pytest`;
-  scheduler tests construct their own `BackgroundScanner` directly, with a
-  fake connector resolver and a fake notification provider, and call
+  / `.stop()`), alongside `init_db()` - but only when
+  `settings.run_scanner_in_process` is `True` (the default; see
+  "Notification outbox and drain" below and decision #25). Because it's a
+  background thread with no FastAPI request to hang a `Depends` off,
+  `main.py` binds it to the real `SavedSearchRunner` (which enqueues
+  outbox rows, never notifies directly - see above) and the real
+  `SessionLocal` at startup - it is not overridable per-request like
+  `get_db_session`/`get_notification_service`. Tests never trigger
+  `lifespan` (see "Local persistence" above), so the real thread never
+  starts during `pytest`; scheduler tests construct their own
+  `BackgroundScanner` directly, with a fake connector resolver, and call
   `run_due_searches()` synchronously - no real thread, timer, or sleep
   needed to test due-detection, inactive-search exclusion, or one-search-
   fails-without-stopping-others.
+
+## Notification outbox and drain
+
+Decision #25 (see PROJECT_CONTEXT.md) moved saved-search notification
+delivery out of the scan path entirely, after production evidence showed
+some saved searches going hours without a scan on Render's Free web
+service tier - most likely because the in-process `BackgroundScanner`
+thread lives inside a process that idle spin-down can kill outright. The
+fix has two parts: (1) a durable, database-backed outbox, so a
+newly-discovered listing's "needs a notification" fact survives a process
+restart even before anything tries to send it, and (2) running scanning
+and notification delivery as two independent, one-shot processes that
+don't depend on any long-lived thread staying alive between runs.
+
+```
+SavedSearchRunner._run_one_marketplace
+    -> ListingDiscoveryService.process_listings()  (dedup only - no notification awareness)
+    -> NotificationOutboxRepository.enqueue(discovered_listing_id)  (same transaction, same commit)
+
+core/notifications/outbox.py:drain_pending_notifications  (a separate process, on its own schedule)
+    -> claim_due_notifications()      phase 1: SELECT ... FOR UPDATE SKIP LOCKED, commit immediately
+    -> NotificationProvider.send_listing_alert()   phase 2: no DB session/transaction open at all
+    -> complete_notification()        phase 3: short transaction, records sent/pending/failed
+```
+
+- **`core/persistence/models.py`** (`PendingNotification`) is the outbox
+  table: one row per newly-discovered listing that should generate an
+  alert, `discovered_listing_id` `UNIQUE` (the actual dedup guarantee -
+  see below), `status` (`pending` / `processing` / `sent` / `failed`,
+  indexed - every drain claim query filters on it), `attempt_count`,
+  `claimed_at` (doubles as the lease timestamp - no separate
+  `lease_expires_at` column), `last_attempted_at`, `last_error`,
+  `created_at`, `sent_at`.
+- **`core/persistence/notification_outbox.py`** (`NotificationOutboxRepository`)
+  is the only module issuing SQL/ORM queries against `PendingNotification`,
+  same rule as every other repository here.
+  - `enqueue(discovered_listing_id)` - flush only, no commit (same
+    convention as `ListingRepository.save_new()`); the `UNIQUE` constraint
+    is what actually prevents a listing ever getting two outbox rows, not
+    this method checking first.
+  - `claim_batch(limit, lease_seconds)` - the query behind phase 1:
+    `SELECT ... FOR UPDATE SKIP LOCKED`, scoped to `pending_notifications`
+    only (`of=PendingNotification` - never locks the joined
+    `discovered_listings` row a concurrent scan may be writing to),
+    matching rows either genuinely `pending` or `processing` with
+    `claimed_at` older than `lease_seconds` (an abandoned claim from a
+    crashed prior attempt). Moves matched rows to `processing`, stamps
+    `claimed_at`, increments `attempt_count` - does not commit itself; the
+    caller (`claim_due_notifications`) commits immediately, on purpose, so
+    every lock this query took is released before anything below it runs.
+  - `complete(notification_id, success, error, max_attempts)` - the query
+    behind phase 3: `sent` on success, otherwise back to `pending` (retry
+    later) or `failed` (terminal, once `attempt_count >= max_attempts`).
+    A row that no longer exists (e.g. cascade-deleted mid-flight by the
+    historical relevance cleanup script) is silently ignored.
+- **`core/notifications/outbox.py`** is the claim/deliver/complete
+  orchestration - see its module docstring for the full reasoning, in
+  particular:
+  - **Why lock-then-network-call is the one thing this design forbids.**
+    Holding a Postgres row lock (or any open transaction) across a
+    Telegram HTTP call would mean a slow or flaky provider blocks a
+    concurrent scan or another drain run's ability to touch the same
+    table, for however long that network call takes. Phase 1 commits
+    before phase 2 ever starts a delivery attempt, with no exception.
+  - **`drain_pending_notifications(session_factory, provider, batch_size,
+    lease_seconds, max_attempts)`** is the single entrypoint a drain run
+    calls: checks `provider.is_enabled` first (a disabled provider - no
+    Telegram credentials configured, the normal case for local dev - is a
+    configuration state, not a delivery failure, so nothing is claimed at
+    all rather than inflating `attempt_count` for reasons unrelated to
+    the message itself); otherwise claims a batch, then delivers and
+    completes each row one at a time. A delivery failure - `NotificationError`
+    or any other exception - is caught, logged, and recorded; it never
+    stops the rest of the batch or raises out of the drain itself.
+  - **Delivery semantics: at-least-once, not exactly-once - stated
+    plainly, not glossed over.** Dedup before sending is a hard guarantee
+    (the `UNIQUE` constraint). Dedup *of sending itself* is not: a crash
+    between Telegram accepting a message and `complete_notification`'s
+    commit leaves the row `processing`, and the next drain (once its
+    lease expires) will redeliver it - a real, if narrow, duplicate-alert
+    window that cannot be closed without a distributed transaction
+    spanning Postgres and Telegram, which doesn't exist.
+- **`scripts/run_due_scans.py`** and **`scripts/drain_notification_outbox.py`**
+  are the one-shot entrypoints a Render Cron Job runs. Each configures
+  logging, does exactly one pass (`BackgroundScanner.run_due_searches()`
+  once, or `drain_pending_notifications()` once), and exits - `0` if the
+  pass itself completed (even if individual saved searches/notifications
+  failed, since those failures are already isolated and logged), `1` only
+  if the pass itself couldn't run at all (e.g. no database connection).
+  Neither script starts a thread or a loop; the Cron Job's own schedule is
+  what makes them recurring.
+- **`settings.run_scanner_in_process`** (`RUN_SCANNER_IN_PROCESS`, default
+  `True`) gates *only* `BackgroundScanner`'s in-process thread in
+  `main.py`'s `lifespan` - see "Saved searches and background scanning"
+  above. There is no equivalent flag for draining: draining only ever
+  happens via `scripts/drain_notification_outbox.py`, since an in-process
+  drain thread would reintroduce the exact "depends on this process
+  staying alive" problem this whole change removes.
+- **Cutover status**: this is implemented and tested
+  (`tests/test_notification_outbox.py`), but the Render Cron Jobs
+  themselves have not been created, and production still runs with
+  `RUN_SCANNER_IN_PROCESS` at its default (`True`) - see
+  PROJECT_CONTEXT.md's "Things that have NOT yet been implemented" for
+  the exact remaining step.
 
 ## The management dashboard
 
@@ -2040,25 +2177,26 @@ GET  /api/v1/listings          -> ListingRepository.list_recent/count(...)
 - **stdlib logging, JSON-formatted**: "structured logging" without adding a
   dependency; can be swapped for `structlog` later if needed.
 - **Rate-controlled Telegram delivery as a synchronous, paced loop - not a
-  persistent background queue/worker thread**: a burst of many new
-  listings (e.g. a fresh saved search matching dozens of existing items)
-  needs to be sent to Telegram spaced out, not back-to-back, or Telegram's
-  own rate limiting kicks in. A separate always-running queue/worker thread
-  (like `BackgroundScanner`) was considered and deliberately not used: it
-  would decouple "the scan finished" from "the alerts were actually sent",
-  which complicates the manual `/saved-searches/{id}/run` response's
-  meaning and - more importantly - would need thread-safe coordination and
-  a way for tests to deterministically wait for delivery before asserting,
-  for no real benefit at this scale (a single local user, one Telegram
-  chat). Instead, `NotificationService.notify_new_listings` paces sends
-  in-place with a plain `time.sleep` between them, and
-  `TelegramNotificationProvider` retries a single send's own transient
-  failures before giving up - both fully synchronous, both trivially
-  testable by monkeypatching `time.sleep`, and both keeping "notify" mean
-  exactly what it always has: by the time the call returns, every
-  reasonable attempt has been made. If a future scale (many concurrent
-  users, many channels) ever needs real async delivery, that's a
-  reassessment for a later phase, not this one.
+  persistent background queue/worker thread - for the legacy `/scan`
+  endpoint only.** A burst of many new listings (e.g. a fresh saved
+  search matching dozens of existing items) needs to be sent to Telegram
+  spaced out, not back-to-back, or Telegram's own rate limiting kicks in.
+  `NotificationService.notify_new_listings` paces sends in-place with a
+  plain `time.sleep` between them, and `TelegramNotificationProvider`
+  retries a single send's own transient failures before giving up - both
+  fully synchronous, both trivially testable by monkeypatching
+  `time.sleep`. This reasoning still holds for `/scan` (mock-only,
+  never a real marketplace, deliberately left alone by decision #25) but
+  was **deliberately reversed for the saved-search path** once it became
+  the thing standing between production and the reliability decision #25
+  required: at real scale, "the scan finished" and "the alerts were
+  actually sent" needed to decouple after all, specifically so a
+  one-shot Cron Job (which cannot stay alive to finish a paced multi-
+  send loop, and must not block scanning on Telegram being slow) could
+  replace the always-running process the original reasoning here was
+  written against. See "Notification outbox and drain" above for what
+  replaced it there - a durable outbox drained by a completely separate
+  process, not an in-process queue/thread either.
 - **Jinja2 + vanilla JS for the dashboard, not React/a SPA build**: the
   brief was an internal MVP for a non-technical user, not a product
   frontend - a server-rendered page plus `fetch()` calls to the API that

@@ -120,11 +120,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # migration above instead. See database.py's docstring.
     init_db()
     migrate_legacy_marketplace_column(engine)
-    _background_scanner.start()
+    # RUN_SCANNER_IN_PROCESS gates the in-process background thread only -
+    # see config.py's docstring. Default True (local dev, and any
+    # deployment that hasn't yet cut over to the Render Cron Job
+    # architecture); production sets it False once the scan Cron Job is
+    # in place, since a Render Free web service can be spun down mid-scan
+    # (see PROJECT_CONTEXT.md decision #25) and a thread
+    # inside that same process is exactly as vulnerable to that as the
+    # request-handling code around it.
+    if settings.run_scanner_in_process:
+        _background_scanner.start()
     try:
         yield
     finally:
-        _background_scanner.stop()
+        if settings.run_scanner_in_process:
+            _background_scanner.stop()
 
 
 app = FastAPI(
@@ -462,7 +472,6 @@ def delete_saved_search(
 def run_saved_search_now(
     saved_search_id: int,
     session: Session = Depends(get_db_session),
-    notification_service: NotificationService = Depends(get_notification_service),
 ) -> SavedSearchRunResponse:
     """Immediately run one saved search, through the same SavedSearchRunner the
     background scanner uses - no separate scan logic lives here."""
@@ -477,7 +486,7 @@ def run_saved_search_now(
             status_code=status.HTTP_409_CONFLICT, detail="Saved search is already running"
         )
     try:
-        runner = SavedSearchRunner(notification_service=notification_service, resolve_connector=get_connector)
+        runner = SavedSearchRunner(resolve_connector=get_connector)
         result = runner.run(session, saved_search)
     finally:
         _saved_search_run_guard.release(saved_search_id)

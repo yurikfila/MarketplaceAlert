@@ -23,11 +23,10 @@ monkeypatch the mock connector, exactly like the rest of the suite.
 import logging
 
 import pytest
+from sqlalchemy import select
 
 from marketplace_alert.core.models.listing import Listing
-from marketplace_alert.core.notifications.base import NotificationProvider
-from marketplace_alert.core.notifications.service import NotificationService
-from marketplace_alert.core.persistence.models import DiscoveredListing
+from marketplace_alert.core.persistence.models import DiscoveredListing, PendingNotification
 from marketplace_alert.core.relevance import accessories, brands, evaluate_relevance, families
 from marketplace_alert.core.relevance.query import parse_query
 from marketplace_alert.core.relevance.service import filter_relevant_listings
@@ -696,16 +695,24 @@ class FakeConnector:
         return self._listings
 
 
-class RecordingProvider(NotificationProvider):
-    def __init__(self) -> None:
-        self.sent: list[Listing] = []
-
-    @property
-    def is_enabled(self) -> bool:
-        return True
-
-    def send_listing_alert(self, listing: Listing) -> None:
-        self.sent.append(listing)
+def _pending_notification_listings(session) -> list[Listing]:
+    """Every notification-outbox row's listing, in enqueue order - the
+    outbox-based replacement for asserting against a recording provider's
+    `.sent` list, matching tests/test_saved_search_scheduler.py."""
+    stmt = (
+        select(PendingNotification, DiscoveredListing)
+        .join(DiscoveredListing, PendingNotification.discovered_listing_id == DiscoveredListing.id)
+        .order_by(PendingNotification.created_at.asc(), PendingNotification.id.asc())
+    )
+    return [
+        Listing(
+            marketplace=row.marketplace,
+            external_listing_id=row.external_listing_id,
+            title=row.title,
+            listing_url=row.listing_url,
+        )
+        for _, row in session.execute(stmt).all()
+    ]
 
 
 def _mixed_listings() -> list[Listing]:
@@ -724,19 +731,16 @@ def test_scheduled_scan_only_persists_and_notifies_relevant_listings(session_fac
     setup_session.commit()
     setup_session.close()
 
-    provider = RecordingProvider()
-    runner = SavedSearchRunner(
-        notification_service=NotificationService(provider),
-        resolve_connector=lambda name: FakeConnector(_mixed_listings()),
-    )
+    runner = SavedSearchRunner(resolve_connector=lambda name: FakeConnector(_mixed_listings()))
     scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
 
     scanner.run_due_searches()
 
-    assert len(provider.sent) == 1
-    assert provider.sent[0].external_listing_id == "good-drill"
-
     verify_session = session_factory()
+    notified = _pending_notification_listings(verify_session)
+    assert len(notified) == 1
+    assert notified[0].external_listing_id == "good-drill"
+
     persisted_ids = {row.external_listing_id for row in verify_session.query(DiscoveredListing).all()}
     assert persisted_ids == {"good-drill"}
     verify_session.close()
@@ -755,23 +759,19 @@ def test_run_now_counts_reflect_post_filter_results(session_factory) -> None:
     saved_search_id = saved_search.id
     setup_session.close()
 
-    provider = RecordingProvider()
-    runner = SavedSearchRunner(
-        notification_service=NotificationService(provider),
-        resolve_connector=lambda name: FakeConnector(_mixed_listings()),
-    )
+    runner = SavedSearchRunner(resolve_connector=lambda name: FakeConnector(_mixed_listings()))
 
     run_session = session_factory()
     result = runner.run_by_id(run_session, saved_search_id)
     run_session.commit()
-    run_session.close()
 
     assert result is not None
     marketplace_result = result.results[0]
     assert marketplace_result.raw_count == 3
     assert marketplace_result.new_count == 1
     assert marketplace_result.rejected_count == 2
-    assert len(provider.sent) == 1
+    assert len(_pending_notification_listings(run_session)) == 1
+    run_session.close()
 
 
 def test_rejected_listing_is_never_persisted(session_factory) -> None:
@@ -783,10 +783,7 @@ def test_rejected_listing_is_never_persisted(session_factory) -> None:
     saved_search_id = saved_search.id
     setup_session.close()
 
-    runner = SavedSearchRunner(
-        notification_service=NotificationService(RecordingProvider()),
-        resolve_connector=lambda name: FakeConnector(_mixed_listings()),
-    )
+    runner = SavedSearchRunner(resolve_connector=lambda name: FakeConnector(_mixed_listings()))
     run_session = session_factory()
     runner.run_by_id(run_session, saved_search_id)
     run_session.commit()
@@ -812,17 +809,13 @@ def test_rejected_listing_is_never_notified(session_factory) -> None:
     saved_search_id = saved_search.id
     setup_session.close()
 
-    provider = RecordingProvider()
-    runner = SavedSearchRunner(
-        notification_service=NotificationService(provider),
-        resolve_connector=lambda name: FakeConnector(_mixed_listings()),
-    )
+    runner = SavedSearchRunner(resolve_connector=lambda name: FakeConnector(_mixed_listings()))
     run_session = session_factory()
     runner.run_by_id(run_session, saved_search_id)
     run_session.commit()
-    run_session.close()
 
-    notified_ids = {listing.external_listing_id for listing in provider.sent}
+    notified_ids = {listing.external_listing_id for listing in _pending_notification_listings(run_session)}
+    run_session.close()
     assert "bad-holder" not in notified_ids
     assert "bad-brand" not in notified_ids
 
@@ -836,10 +829,7 @@ def test_duplicate_detection_still_works_for_relevant_listings_after_filtering(s
     saved_search_id = saved_search.id
     setup_session.close()
 
-    runner = SavedSearchRunner(
-        notification_service=NotificationService(RecordingProvider()),
-        resolve_connector=lambda name: FakeConnector(_mixed_listings()),
-    )
+    runner = SavedSearchRunner(resolve_connector=lambda name: FakeConnector(_mixed_listings()))
 
     first_session = session_factory()
     first_result = runner.run_by_id(first_session, saved_search_id)
@@ -878,18 +868,19 @@ def test_one_failing_marketplace_does_not_affect_relevance_filtering_in_another(
     setup_session.commit()
     setup_session.close()
 
-    provider = RecordingProvider()
-
     def resolve_connector(marketplace: str):
         return FakeConnector(_mixed_listings()) if marketplace == "good" else BrokenConnector()
 
-    runner = SavedSearchRunner(notification_service=NotificationService(provider), resolve_connector=resolve_connector)
+    runner = SavedSearchRunner(resolve_connector=resolve_connector)
     scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
 
     scanner.run_due_searches()
 
-    assert len(provider.sent) == 1
-    assert provider.sent[0].external_listing_id == "good-drill"
+    verify_session = session_factory()
+    notified = _pending_notification_listings(verify_session)
+    verify_session.close()
+    assert len(notified) == 1
+    assert notified[0].external_listing_id == "good-drill"
 
 
 # =====================================================================
@@ -941,8 +932,12 @@ def test_scan_endpoint_does_not_persist_rejected_listings(
 
 
 def test_legacy_run_now_endpoint_filters_irrelevant_listings(
-    client, fake_notification_provider, monkeypatch: pytest.MonkeyPatch
+    client, db_session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The legacy manual-run endpoint no longer sends synchronously - a
+    relevant listing gets an outbox row instead (see SavedSearchRunner's
+    module docstring); an irrelevant one gets neither persisted nor
+    enqueued."""
     import marketplace_alert.main as main_module
 
     monkeypatch.setattr(main_module, "get_connector", lambda name: FakeConnector(_mixed_listings()))
@@ -960,12 +955,14 @@ def test_legacy_run_now_endpoint_filters_irrelevant_listings(
     assert result["new_count"] == 1
     assert result["raw_count"] == 3
     assert result["rejected_count"] == 2
-    assert len(fake_notification_provider.sent_listings) == 1
-    assert fake_notification_provider.sent_listings[0].external_listing_id == "good-drill"
+
+    notified = _pending_notification_listings(db_session)
+    assert len(notified) == 1
+    assert notified[0].external_listing_id == "good-drill"
 
 
 def test_mobile_run_now_endpoint_filters_irrelevant_listings(
-    client, fake_notification_provider, monkeypatch: pytest.MonkeyPatch
+    client, db_session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import marketplace_alert.api.v1.saved_searches as saved_searches_module
 
@@ -985,5 +982,7 @@ def test_mobile_run_now_endpoint_filters_irrelevant_listings(
     assert outcome["raw_count"] == 3
     assert outcome["rejected_count"] == 2
     assert body["total_new_count"] == 1
-    assert len(fake_notification_provider.sent_listings) == 1
-    assert fake_notification_provider.sent_listings[0].external_listing_id == "good-drill"
+
+    notified = _pending_notification_listings(db_session)
+    assert len(notified) == 1
+    assert notified[0].external_listing_id == "good-drill"

@@ -1288,6 +1288,97 @@ marketplace connector yet.
       rejected), matching every other rule in this module's stated
       design goal of staying marketplace/category-agnostic.
 
+25. **Render-reliability architecture change (2026-08-28): moved off "one
+    always-running process does everything" after production evidence
+    showed saved searches going unscanned for hours at a time.** A
+    production-readiness audit (read-only) found some active saved
+    searches going ~21 hours without a scan while others kept running
+    normally. Root-cause investigation (also read-only - repository
+    inspection plus targeted Render log searches for `Background scanner
+    tick failed`, `failed during scheduled run`, and `Waiting %.1fs
+    before next notification send`, all zero matches) could not prove
+    the exact trigger, but ruled out an in-code exception (nothing was
+    ever thrown/caught to explain a stall) and converged on Render Free
+    web-service idle spin-down as the most likely mechanism: the
+    background scanner is a thread inside the same process a spun-down
+    instance kills entirely, so any saved search whose next-due tick
+    lands during a spin-down window is silently skipped until the next
+    request wakes the instance back up. This is a platform/architecture
+    problem, not a scheduler logic bug - no code defect was found or
+    fixed.
+    - **New architecture: two independent Render Cron Jobs, a scan job
+      and a drain job, each a one-shot process the platform starts fresh
+      on its own schedule** - never relying on any process staying alive
+      between ticks. `scripts/run_due_scans.py` runs every currently-due
+      saved search once and exits; `scripts/drain_notification_outbox.py`
+      claims and delivers one batch of pending notifications and exits.
+      Render Cron Jobs guarantee at most one run active at a time per
+      job (the platform delays, never skips or overlaps, the next
+      scheduled run) - confirmed from Render's own documentation, kept
+      explicitly separate from this repository's own evidence throughout
+      the design discussion.
+    - **A synchronous "scan, then notify" call inside one process is no
+      longer safe for a one-shot Cron Job**, so notification delivery was
+      split out into a durable, PostgreSQL-backed outbox
+      (`PendingNotification`, `core/persistence/notification_outbox.py`)
+      instead of the prior in-memory `NotificationService.notify_new_
+      listings()` call on the saved-search path. `SavedSearchRunner`
+      (`core/saved_searches/runner.py`) now only ever enqueues an outbox
+      row per newly-discovered listing, in the same transaction as the
+      listing's own insert (via `ListingDiscoveryService.process_listings()`
+      returning parallel `new_listing_ids`) - it never calls a
+      `NotificationProvider` itself anymore. This is the one behavior
+      change on the scan path; `main.py`'s legacy, mock-only `/scan`
+      endpoint is deliberately untouched (still calls `NotificationService`
+      synchronously) since it never touches a real marketplace and was
+      never part of the reliability problem.
+    - **Claim/deliver/complete, not "select and send in one transaction"**:
+      a PostgreSQL row lock (`SELECT ... FOR UPDATE SKIP LOCKED`, scoped
+      to `pending_notifications` only) is held only long enough to move a
+      batch from `pending` (or an abandoned `processing` row past its
+      lease) to `processing` and commit - released *before* any Telegram
+      network call. Delivery then happens with no database session or
+      transaction open at all. A short, separate transaction per row
+      records the outcome afterward (`sent`, or back to `pending`/
+      `failed` once `notification_max_attempts` is reached). See
+      `core/notifications/outbox.py`'s module docstring for the full
+      design and `PendingNotification`'s docstring for the schema.
+    - **Delivery semantics are explicitly at-least-once, not
+      exactly-once, and this is documented rather than hidden**: dedup is
+      a hard guarantee, enforced once, before a notification ever exists
+      (`UNIQUE` constraint on `discovered_listing_id`) - but a crash
+      between Telegram accepting a message and the outcome-recording
+      commit is a real, unavoidable window (no distributed transaction
+      spans Postgres and Telegram) where the *next* drain would re-send
+      the same message. `tests/test_notification_outbox.py` proves this
+      window is real (not just a documented possibility) by simulating a
+      crash in exactly that spot and showing the listing is genuinely
+      delivered twice - and proves every other tested path (normal
+      completion, a claim abandoned before delivery ever started, a
+      permanently failing row) does not leak a duplicate.
+    - **`RUN_SCANNER_IN_PROCESS` (default `True`) gates only
+      `BackgroundScanner`'s in-process thread** in `main.py`'s `lifespan`
+      - added so local development and any deployment that hasn't cut
+      over to the Cron Job architecture yet keep working exactly as
+      before, unchanged. Production is intended to set this `False` once
+      the scan Cron Job is created, so the web service process no longer
+      runs a scanner thread that a spin-down could silently kill. There
+      is deliberately no equivalent in-process flag for draining -
+      draining only ever happens via `scripts/drain_notification_outbox.py`,
+      run by the drain Cron Job; introducing an in-process drain thread
+      would reintroduce exactly the "alive process" dependency this
+      change removes.
+    - **All new code (migration, model, repository, orchestration,
+      entrypoint scripts, `RUN_SCANNER_IN_PROCESS` wiring) was written,
+      tested (`tests/test_notification_outbox.py`, plus every existing
+      test touching `SavedSearchRunner` updated for the new enqueue-not-
+      notify behavior), and verified against the full backend suite
+      locally.** The Render Cron Jobs themselves have not been created,
+      `RUN_SCANNER_IN_PROCESS` has not been set to `False` in production,
+      and nothing has been pushed or deployed as part of this change -
+      see "Things that have NOT yet been implemented" below for exactly
+      what cutover step remains.
+
 ## Things that have NOT yet been implemented
 
 - Any marketplace beyond mock/Etsy/eBay/Reverb/Bonanza. Nine additional
@@ -1464,6 +1555,17 @@ marketplace connector yet.
     documented single-item lookup endpoint). Bonanza does not - no
     confirmed single-item endpoint exists, and it's moot today since
     Bonanza has never been live.
+- **The Render Cron Job cutover (decision #25) has not happened yet.**
+  The notification outbox, the claim/deliver/complete drain
+  orchestration, and both one-shot entrypoint scripts
+  (`scripts/run_due_scans.py`, `scripts/drain_notification_outbox.py`)
+  are implemented and tested, but: no Render Cron Job has actually been
+  created for either script, production's `RUN_SCANNER_IN_PROCESS` has
+  not been set to `False` (the in-process `BackgroundScanner` thread is
+  still what runs in production today), and none of this change has been
+  pushed or deployed. Production is still running the same
+  single-process architecture decision #25 diagnosed as unreliable,
+  until a human completes the cutover in Render's dashboard.
 
 ## How to keep this file useful
 

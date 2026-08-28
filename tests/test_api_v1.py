@@ -10,8 +10,10 @@ real background scanner never starts during these tests either.
 
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import select
+
 from marketplace_alert.config import settings
-from marketplace_alert.core.persistence.models import DiscoveredListing
+from marketplace_alert.core.persistence.models import DiscoveredListing, PendingNotification
 
 
 def _create(client, **overrides):
@@ -257,7 +259,7 @@ def test_update_saved_search_rejects_invalid_marketplace(client) -> None:
 # --- manual run ----------------------------------------------------------
 
 
-def test_manual_run_returns_structured_mobile_response(client, fake_notification_provider) -> None:
+def test_manual_run_returns_structured_mobile_response(client, db_session) -> None:
     created = _create(client, query="Maccabi", marketplaces=["mock"]).json()
 
     response = client.post(f"/api/v1/saved-searches/{created['id']}/run")
@@ -272,10 +274,10 @@ def test_manual_run_returns_structured_mobile_response(client, fake_notification
     assert body["marketplaces"]["mock"]["error"] is None
     assert body["total_new_count"] == 1
     assert body["total_already_seen_count"] == 0
-    # Proves the /api/v1 run endpoint shares the same NotificationService
-    # override as the legacy endpoint (dependencies.py singleton sharing) -
-    # if it didn't, this would have attempted a real Telegram call instead.
-    assert len(fake_notification_provider.sent_listings) == 1
+    # The manual run no longer sends synchronously - it enqueues a
+    # notification-outbox row instead (see SavedSearchRunner's module
+    # docstring); delivery is core/notifications/outbox.py's concern.
+    assert len(db_session.execute(select(PendingNotification)).scalars().all()) == 1
 
 
 def test_manual_run_not_found(client) -> None:

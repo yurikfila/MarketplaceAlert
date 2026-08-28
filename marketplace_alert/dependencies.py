@@ -24,19 +24,28 @@ from marketplace_alert.core.scheduler.guard import SavedSearchRunGuard
 from marketplace_alert.notifications.telegram.provider import TelegramNotificationProvider
 
 # The concrete provider (Telegram) is chosen here, once, at startup - every
-# caller (legacy routes, /api/v1 routes, the background scanner) only ever
-# depends on the NotificationProvider interface. Disabled automatically if
-# credentials are missing (see TelegramNotificationProvider). The provider
-# retries its own transient failures (429/5xx/timeout, bounded, with
-# backoff); the service paces sends between separate listings - see both
-# modules' docstrings.
+# caller only ever depends on the NotificationProvider interface. Disabled
+# automatically if credentials are missing (see TelegramNotificationProvider).
+# The provider retries its own transient failures (429/5xx/timeout, bounded,
+# with backoff); see that module's docstring.
+#
+# Exposed as its own module-level singleton (`notification_provider`,
+# distinct from `notification_service` below) so `scripts/drain_notification
+# _outbox.py` can use it directly for outbox delivery - the scan path
+# (`SavedSearchRunner`) no longer sends notifications at all, only
+# `NotificationService.notify_new_listings()`'s remaining caller (`main.py`'s
+# legacy, mock-only `/scan` endpoint) and `get_notification_service()`'s
+# `is_enabled` status checks still go through the service wrapper - see
+# PROJECT_CONTEXT.md decision #25 for why the scan path and
+# delivery were split.
+notification_provider = TelegramNotificationProvider(
+    bot_token=settings.telegram_bot_token,
+    chat_id=settings.telegram_chat_id,
+    max_retries=settings.telegram_max_retries,
+    retry_base_seconds=settings.telegram_retry_base_seconds,
+)
 notification_service = NotificationService(
-    TelegramNotificationProvider(
-        bot_token=settings.telegram_bot_token,
-        chat_id=settings.telegram_chat_id,
-        max_retries=settings.telegram_max_retries,
-        retry_base_seconds=settings.telegram_retry_base_seconds,
-    ),
+    notification_provider,
     send_delay_seconds=settings.telegram_send_delay_seconds,
 )
 
@@ -55,14 +64,11 @@ def get_saved_search_service(session: Session = Depends(get_db_session)) -> Save
     return SavedSearchService(session, is_marketplace_supported=is_marketplace_supported)
 
 
-# Bound to the real notification service, since the background scanner runs
-# in a thread with no per-request Depends to pull a (possibly test-faked)
-# one from. Resolves connectors only through get_connector - never imports
-# a concrete connector class itself.
-saved_search_runner = SavedSearchRunner(
-    notification_service=notification_service,
-    resolve_connector=get_connector,
-)
+# Resolves connectors only through get_connector - never imports a concrete
+# connector class itself. No notification dependency at all (see runner.py's
+# module docstring) - a newly-discovered listing only ever gets an outbox
+# row here, never a direct send.
+saved_search_runner = SavedSearchRunner(resolve_connector=get_connector)
 
 # Shared between the scheduler, the legacy manual /run endpoint, and the
 # /api/v1 manual run endpoint, so the same saved search can never be

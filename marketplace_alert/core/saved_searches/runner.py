@@ -1,11 +1,20 @@
-"""Runs one saved search end-to-end: search -> dedup -> notify -> bookkeeping.
+"""Runs one saved search end-to-end: search -> dedup -> enqueue -> bookkeeping.
 
 The single place this logic lives - used by both the manual
 `POST /saved-searches/{id}/run` endpoint and the background scanner, so the
 two paths can never drift apart (see ARCHITECTURE.md). Depends on
 `MarketplaceConnector` only through an injected resolver function (never a
-concrete connector class), plus `ListingDiscoveryService` and
-`NotificationService` - the same dependencies /scan already uses.
+concrete connector class), plus `ListingDiscoveryService`.
+
+**Never sends a Telegram notification directly** - a newly-discovered
+listing gets a `pending_notifications` outbox row (`NotificationOutboxRepository
+.enqueue()`), in the same transaction as the listing itself, and nothing
+more. Actual delivery is a completely separate process
+(`core/notifications/outbox.py`'s `drain_pending_notifications()`, run by
+its own Cron Job) - this runner never waits for it, never imports
+`NotificationService`, and a Telegram outage cannot slow down or fail a
+scan. See PROJECT_CONTEXT.md decision #25 for why this changed from the
+previous synchronous-send design.
 
 A saved search now targets one or more marketplaces
 (`SavedSearch.marketplaces`). Each is searched independently: **resilience
@@ -28,7 +37,7 @@ from dataclasses import dataclass, field
 from sqlalchemy.orm import Session
 
 from marketplace_alert.core.connectors.base import MarketplaceConnector, MarketplaceConnectorError
-from marketplace_alert.core.notifications.service import NotificationService
+from marketplace_alert.core.persistence.notification_outbox import NotificationOutboxRepository
 from marketplace_alert.core.persistence.service import ListingDiscoveryService
 from marketplace_alert.core.relevance import filter_relevant_listings
 from marketplace_alert.core.saved_searches.models import SavedSearch
@@ -77,10 +86,8 @@ class SavedSearchRunner:
 
     def __init__(
         self,
-        notification_service: NotificationService,
         resolve_connector: Callable[[str], MarketplaceConnector],
     ) -> None:
-        self._notification_service = notification_service
         self._resolve_connector = resolve_connector
 
     def run(self, session: Session, saved_search: SavedSearch) -> SavedSearchRunResult:
@@ -131,7 +138,9 @@ class SavedSearchRunner:
         discovery_result = ListingDiscoveryService(session).process_listings(
             filter_result.relevant_listings, saved_search_id=saved_search.id
         )
-        self._notification_service.notify_new_listings(discovery_result.new_listings)
+        outbox = NotificationOutboxRepository(session)
+        for listing_id in discovery_result.new_listing_ids:
+            outbox.enqueue(listing_id)
 
         logger.info(
             "Saved search %s / %s: %d new, %d already seen (%d raw, %d rejected as not relevant)",

@@ -23,16 +23,11 @@ from marketplace_alert.api.v1.schemas import (
     SavedSearchUpdate,
 )
 from marketplace_alert.connectors.registry import get_connector
-from marketplace_alert.core.notifications.service import NotificationService
 from marketplace_alert.core.persistence.database import get_db_session
 from marketplace_alert.core.saved_searches.repository import SavedSearchRepository
 from marketplace_alert.core.saved_searches.runner import SavedSearchRunner
 from marketplace_alert.core.saved_searches.service import SavedSearchService, UnsupportedMarketplaceError
-from marketplace_alert.dependencies import (
-    get_notification_service,
-    get_saved_search_service,
-    saved_search_run_guard,
-)
+from marketplace_alert.dependencies import get_saved_search_service, saved_search_run_guard
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +118,6 @@ def delete_saved_search(
 def run_saved_search_now(
     saved_search_id: int,
     session: Session = Depends(get_db_session),
-    notification_service: NotificationService = Depends(get_notification_service),
 ) -> SavedSearchRunResult:
     saved_search = SavedSearchRepository(session).get(saved_search_id)
     if saved_search is None:
@@ -136,12 +130,12 @@ def run_saved_search_now(
             status_code=status.HTTP_409_CONFLICT, detail="Saved search is already running"
         )
     try:
-        # A fresh runner per request, bound to the *injected* (possibly
-        # test-faked) notification_service - same pattern the legacy
-        # endpoint uses, deliberately not the shared dependencies.py
-        # singleton runner (which is bound to the real Telegram provider
-        # and would bypass test isolation).
-        runner = SavedSearchRunner(notification_service=notification_service, resolve_connector=get_connector)
+        # A fresh runner per request - same pattern the legacy endpoint
+        # uses, deliberately not the shared dependencies.py singleton
+        # runner. No notification dependency to inject at all anymore
+        # (see SavedSearchRunner's module docstring) - a manual run only
+        # ever enqueues outbox rows, the same as a scheduled one.
+        runner = SavedSearchRunner(resolve_connector=get_connector)
         result = runner.run(session, saved_search)
     finally:
         saved_search_run_guard.release(saved_search_id)

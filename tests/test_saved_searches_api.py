@@ -1,7 +1,6 @@
-from marketplace_alert.core.models.listing import Listing
-from marketplace_alert.core.notifications.base import NotificationError, NotificationProvider
-from marketplace_alert.core.notifications.service import NotificationService
-from marketplace_alert.main import app, get_notification_service
+from sqlalchemy import select
+
+from marketplace_alert.core.persistence.models import PendingNotification
 
 
 def _create(client, **overrides):
@@ -181,7 +180,13 @@ def test_edit_saved_search_rejects_unsupported_marketplace(client) -> None:
     assert response.status_code == 422
 
 
-def test_manual_run_sends_notification_for_new_listing(client, fake_notification_provider) -> None:
+def test_manual_run_sends_notification_for_new_listing(client, db_session) -> None:
+    """"Run Now" no longer sends synchronously - a new listing gets a
+    notification-outbox row instead (see SavedSearchRunner's module
+    docstring). Delivery, and surviving a Telegram-side failure, is
+    core/notifications/outbox.py's concern - structurally, this endpoint
+    can no longer be affected by a notification provider failure at all,
+    since it never calls one."""
     created = _create(client, query="Maccabi").json()
 
     response = client.post(f"/saved-searches/{created['id']}/run")
@@ -190,35 +195,7 @@ def test_manual_run_sends_notification_for_new_listing(client, fake_notification
     assert body["saved_search_id"] == created["id"]
     assert body["new_count"] == 1
     assert body["already_seen_count"] == 0
-    assert len(fake_notification_provider.sent_listings) == 1
-
-    updated = client.get(f"/saved-searches/{created['id']}").json()
-    assert updated["last_scanned_at"] is not None
-
-
-def test_manual_run_survives_a_notification_provider_failure(client) -> None:
-    """A Telegram-side failure must not turn "Run Now" into a 500 - the
-    search itself still succeeds and is still reported/marked scanned."""
-
-    class FailingProvider(NotificationProvider):
-        @property
-        def is_enabled(self) -> bool:
-            return True
-
-        def send_listing_alert(self, listing: Listing) -> None:
-            raise NotificationError("simulated failure")
-
-    app.dependency_overrides[get_notification_service] = lambda: NotificationService(FailingProvider())
-    try:
-        created = _create(client, query="Maccabi").json()
-        response = client.post(f"/saved-searches/{created['id']}/run")
-    finally:
-        app.dependency_overrides.pop(get_notification_service, None)
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["new_count"] == 1
-    assert body["already_seen_count"] == 0
+    assert len(db_session.execute(select(PendingNotification)).scalars().all()) == 1
 
     updated = client.get(f"/saved-searches/{created['id']}").json()
     assert updated["last_scanned_at"] is not None

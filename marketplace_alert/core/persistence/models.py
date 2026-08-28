@@ -8,7 +8,7 @@ tell new from already-seen.
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, ForeignKey, String, UniqueConstraint
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from marketplace_alert.core.persistence.database import Base
@@ -157,3 +157,87 @@ class DiscoveredListing(Base):
     # marketplace becomes configured.
     metadata_backfill_status: Mapped[str | None] = mapped_column(String, nullable=True)
     metadata_backfill_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# `PendingNotification.status` values - see `core/notifications/outbox.py`
+# for the full claim/deliver/complete design these values support.
+NOTIFICATION_STATUS_PENDING = "pending"
+NOTIFICATION_STATUS_PROCESSING = "processing"
+NOTIFICATION_STATUS_SENT = "sent"
+NOTIFICATION_STATUS_FAILED = "failed"
+
+
+class PendingNotification(Base):
+    """The notification outbox: one row per newly-discovered listing that
+    should generate a Telegram alert, created in the *same* transaction as
+    the listing itself (see `ListingDiscoveryService.process_listings()`),
+    so scanning/persistence never has to wait for - or even know about -
+    actual delivery. A completely separate process (`core/notifications
+    /outbox.py`'s `drain_pending_notifications()`) claims, delivers, and
+    completes rows independently, on its own schedule.
+
+    Delivery guarantee is explicitly **at-least-once, not exactly-once**:
+    PostgreSQL can guarantee this row's bookkeeping is crash-safe, but it
+    cannot make the same guarantee jointly with an external system
+    (Telegram) - there is an unavoidable crash window between Telegram
+    successfully receiving a message and this row being marked `sent`
+    where a retry would send a genuine duplicate message. See
+    `core/notifications/outbox.py`'s module docstring for the full
+    reasoning and why this window is kept as small as practical rather
+    than eliminated (it cannot be eliminated without a distributed
+    transaction spanning Postgres and Telegram, which does not exist).
+
+    Deduplication *before* sending - "never queue the same listing's
+    notification twice" - is a hard guarantee: enforced by the `UNIQUE`
+    constraint on `discovered_listing_id` below, not just by callers
+    happening to only enqueue once.
+    """
+
+    __tablename__ = "pending_notifications"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # The dedup guarantee - a listing can only ever have one outbox row,
+    # enforced by the database, not just by `ListingDiscoveryService`
+    # only ever enqueueing on first discovery. `ondelete="CASCADE"`: if
+    # the listing itself is ever removed (e.g. by the historical
+    # relevance cleanup script), an unsent notification about it is
+    # meaningless and should go with it.
+    discovered_listing_id: Mapped[int] = mapped_column(
+        ForeignKey("discovered_listings.id", ondelete="CASCADE", name="fk_pending_notifications_discovered_listing_id"),
+        nullable=False,
+        unique=True,
+    )
+
+    # Indexed - every drain run's claim query filters on this column
+    # (`WHERE status = 'pending' OR (status = 'processing' AND ...)`),
+    # a known, constant access pattern from day one - unlike
+    # `metadata_backfill_status` (deliberately left unindexed, see that
+    # column's docstring), this index is justified up front, not
+    # deferred pending evidence.
+    status: Mapped[str] = mapped_column(String, nullable=False, default=NOTIFICATION_STATUS_PENDING, index=True)
+
+    # Incremented every time a row is claimed (first attempt or a
+    # lease-timeout reclaim after a crash) - see `outbox.py`'s claim
+    # phase. Gates `NOTIFICATION_STATUS_FAILED` once
+    # `settings.notification_max_attempts` is reached, so a message that
+    # reliably crashes the sender (a "poison pill") can't be retried
+    # forever.
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Set when a row moves to `processing` (claimed). A row still
+    # `processing` with `claimed_at` older than
+    # `settings.notification_lease_seconds` is treated as an
+    # abandoned/crashed claim and becomes eligible for reclamation by a
+    # later drain run - see `outbox.py`'s claim query. Doubles as the
+    # lease timestamp; no separate `lease_expires_at` column - one fewer
+    # field to keep the schema as small as possible.
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    last_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

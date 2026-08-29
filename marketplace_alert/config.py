@@ -1,7 +1,45 @@
 """Application configuration, loaded from environment variables / .env."""
 
-from pydantic import field_validator
+import secrets
+import threading
+
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Minimum accepted length for an explicitly-provided JWT_SECRET_KEY - not a
+# real entropy measurement, just a cheap guard against an obviously-weak
+# placeholder value ("changeme", "secret", ...) ever being accepted. 32
+# matches PyJWT's own documented minimum recommended HMAC key length for
+# HS256 (RFC 7518 §3.2) - confirmed directly: PyJWT emits its own
+# `InsecureKeyLengthWarning` below this length.
+_MIN_JWT_SECRET_LENGTH = 32
+
+# Module-level, not per-`Settings`-instance: exactly one ephemeral secret
+# per Python process, generated lazily on first use (see
+# `_get_or_create_ephemeral_jwt_secret_key`), never one per `Settings()`
+# call. A token signed with one instance's secret must still verify
+# against another instance's secret within the same process - this is what
+# makes that true.
+_ephemeral_jwt_secret_key: str | None = None
+_ephemeral_jwt_secret_key_lock = threading.Lock()
+
+
+def _get_or_create_ephemeral_jwt_secret_key() -> str:
+    """Return this process's ephemeral JWT secret, creating it on first call.
+
+    Double-checked locking: the lock is only ever taken on the first call
+    (when the module-level cache is still `None`) - every call after that
+    hits the fast, lock-free path. Never persisted anywhere (not written to
+    disk, `.env`, or the environment) - it exists only as this module-level
+    Python value for the lifetime of the process, and a fresh one is
+    generated the next time the process starts.
+    """
+    global _ephemeral_jwt_secret_key
+    if _ephemeral_jwt_secret_key is None:
+        with _ephemeral_jwt_secret_key_lock:
+            if _ephemeral_jwt_secret_key is None:
+                _ephemeral_jwt_secret_key = secrets.token_urlsafe(64)
+    return _ephemeral_jwt_secret_key
 
 
 class Settings(BaseSettings):
@@ -165,6 +203,102 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
+
+    # --- Authentication (JWT access token + rotated refresh token) ---
+    #
+    # `jwt_secret_key` signs/verifies access tokens (HS256 - one backend
+    # both issues and verifies tokens, so there's no reason for asymmetric
+    # keys). Deliberately left unset here, with no literal default value at
+    # all: `_require_or_generate_jwt_secret_key` below is the one place
+    # that decides what happens when it's missing, and the decision is not
+    # "fall back to something" - see that validator's docstring. Never log
+    # this value, and never accept a hard-coded value here or anywhere else
+    # - only from the environment.
+    jwt_secret_key: str | None = None
+
+    # Access tokens are short-lived by design - minimizes the exposure
+    # window if one leaks. A client silently exchanges an expired one for a
+    # new one via its refresh token rather than being logged out.
+    access_token_expire_minutes: int = 30
+
+    # Refresh tokens are long-lived but revocable (stored hashed, rotated on
+    # every use - not implemented until a later phase, this is just the TTL
+    # config for it). 30 days balances "doesn't force a mobile user to
+    # re-login constantly" against "a lost/forgotten device's token doesn't
+    # stay valid forever."
+    refresh_token_expire_days: int = 30
+
+    # Password-reset tokens are short-lived and single-use - long enough for
+    # someone to receive and act on a reset link, short enough that a
+    # leaked link (e.g. via a proxy log) stops being useful quickly. Email
+    # delivery itself is a separate, later phase (this backend cannot send
+    # email yet) - this setting exists now so the token/TTL model can be
+    # built and tested ahead of that, per the approved authentication
+    # design.
+    password_reset_token_expire_minutes: int = 30
+
+    # Brute-force login protection (Phase 2 - `core/auth/service.py`,
+    # `User.failed_login_attempts`/`locked_until`). After this many
+    # consecutive wrong-password attempts against one account, further
+    # login/refresh attempts are rejected outright (password correctness
+    # never even checked) until the lockout window passes - a DB-backed
+    # counter, no new infrastructure (e.g. Redis) needed at this scale.
+    # Deliberately per-account only, not per-IP, in this phase - see
+    # AuthService's module docstring for that tradeoff.
+    max_failed_login_attempts: int = 5
+    account_lockout_minutes: float = 15.0
+
+    @model_validator(mode="after")
+    def _require_or_generate_jwt_secret_key(self) -> "Settings":
+        """Decide what a missing `JWT_SECRET_KEY` means - and never guess.
+
+        Gated on `database_url`, not `environment`: this codebase already
+        uses "is `DATABASE_URL` set?" as its one existing, reliable signal
+        for "is this a real deployment, not local SQLite dev?" (see
+        `core/persistence/database.py`'s docstring) - production
+        (including Render) always has it set, so reusing that signal means
+        this check is correctly strict there without depending on a second,
+        easy-to-forget variable (`ENVIRONMENT`) also being set correctly.
+        `environment` itself stays purely descriptive/log-only, unchanged.
+
+        - Provided and long enough: used as-is.
+        - Provided but too short: rejected outright, in every environment -
+          a deliberately weak or placeholder value is exactly the "insecure
+          default" this exists to prevent, and there's no legitimate reason
+          a real secret would ever be this short.
+        - Missing, and `DATABASE_URL` is set (any real deployment): fails
+          fast at startup with a clear error, the same "don't start in a
+          broken/insecure state" philosophy already used for the
+          migration-lock startup check. There is no insecure fallback here
+          - this is the whole point of this validator.
+        - Missing, and `DATABASE_URL` is unset (local SQLite dev, or the
+          test suite): every `Settings` instance in this process shares one
+          ephemeral secret (`_get_or_create_ephemeral_jwt_secret_key` -
+          generated once per process, not once per instance, so a token
+          signed via one instance still verifies via another), so no
+          `.env` entry is required to run the app or the tests locally. It
+          is never persisted and a fresh one is generated the next time the
+          process starts - sessions simply don't survive a restart, which
+          is an acceptable, expected local-dev tradeoff, never an
+          acceptable production one.
+        """
+        if self.jwt_secret_key:
+            if len(self.jwt_secret_key) < _MIN_JWT_SECRET_LENGTH:
+                raise ValueError(
+                    f"JWT_SECRET_KEY must be at least {_MIN_JWT_SECRET_LENGTH} characters. "
+                    'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(64))"'
+                )
+            return self
+
+        if self.database_url:
+            raise ValueError(
+                "JWT_SECRET_KEY is required whenever DATABASE_URL is set (i.e. any real "
+                "deployment, including production) - there is no insecure default. "
+                'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(64))"'
+            )
+
+        self.jwt_secret_key = _get_or_create_ephemeral_jwt_secret_key()
+        return self
 
 
 settings = Settings()

@@ -24,6 +24,7 @@ from marketplace_alert.core.persistence.database import Base, create_db_engine, 
 # Import every module that defines a table, purely for the side effect of
 # registering it on Base.metadata - autogenerate can only see tables whose
 # model module has actually been imported somewhere.
+import marketplace_alert.core.auth.models  # noqa: F401
 import marketplace_alert.core.persistence.models  # noqa: F401
 import marketplace_alert.core.saved_searches.models  # noqa: F401
 

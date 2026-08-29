@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.persistence.models import BACKFILL_STATUS_FAILED, DiscoveredListing
+from marketplace_alert.core.saved_searches.models import SavedSearch
 
 ListingSort = Literal["newest", "oldest", "price_asc", "price_desc"]
 
@@ -315,6 +316,47 @@ class ListingRepository:
             row.metadata_backfill_status = None
             row.metadata_backfill_attempted_at = None
         return len(rows)
+
+    # --- Ownership-scoped variant (groundwork for the route-protection
+    # phase - see PROJECT_CONTEXT.md's authentication design decision).
+    # Not yet called by any route - `list_recent`/`count` above remain
+    # exactly what `GET /api/v1/listings` uses, unscoped, until a later
+    # cutover phase.
+
+    def list_recent_owned(
+        self, *, user_id: int, limit: int, offset: int, sort: ListingSort = "newest"
+    ) -> list[DiscoveredListing]:
+        """Listings attributable to a saved search this user owns -
+        joins `discovered_by_saved_search_id -> saved_searches.id` and
+        filters on `saved_searches.user_id`. An `INNER JOIN`, not a
+        `LEFT JOIN`, deliberately: a listing with `discovered_by_saved_
+        search_id IS NULL` has no row to join to at all and is dropped
+        automatically, and a listing whose discovering search itself has
+        `user_id IS NULL` (not yet cutover-attributed to anyone) fails
+        the `user_id ==` filter too - both cases correctly excluded from
+        every user's scoped view, never shown to anyone until a real
+        owner is established.
+        """
+        stmt = (
+            select(DiscoveredListing)
+            .join(SavedSearch, DiscoveredListing.discovered_by_saved_search_id == SavedSearch.id)
+            .where(SavedSearch.user_id == user_id)
+            .order_by(*self._sort_clause(sort))
+            .limit(limit)
+            .offset(offset)
+        )
+        return list(self._session.execute(stmt).scalars().all())
+
+    def count_owned(self, *, user_id: int) -> int:
+        """Total rows `list_recent_owned` would return across every page,
+        for pagination metadata - same join/filter, no limit/offset/sort."""
+        stmt = (
+            select(func.count())
+            .select_from(DiscoveredListing)
+            .join(SavedSearch, DiscoveredListing.discovered_by_saved_search_id == SavedSearch.id)
+            .where(SavedSearch.user_id == user_id)
+        )
+        return self._session.execute(stmt).scalar_one()
 
     def list_all(self) -> list[DiscoveredListing]:
         """Every discovered listing, unpaginated - for maintenance operations

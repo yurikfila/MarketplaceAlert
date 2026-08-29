@@ -18,7 +18,7 @@ persisted yet (see `api/v1/listings.py`).
 
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 # Reused as-is - the mobile saved-search contract this task asks for
 # (id/query/marketplaces/is_active/scan_interval_seconds/created_at/
@@ -42,6 +42,12 @@ __all__ = [
     "SavedSearchRunResult",
     "ListingOut",
     "ListingListResponse",
+    "SignupRequest",
+    "LoginRequest",
+    "RefreshRequest",
+    "TokenPairOut",
+    "UserPublic",
+    "AuthResponse",
 ]
 
 
@@ -152,3 +158,87 @@ class ListingListResponse(BaseModel):
     limit: int
     offset: int
     total_count: int
+
+
+# --- Authentication (`/api/v1/auth/*`) --------------------------------
+#
+# See `core/auth/service.py`'s `AuthService` for the actual business
+# logic - every schema below is a thin request/response shape around it;
+# none of them are built via `from_attributes` (see this module's own
+# docstring) - `api/v1/auth.py` constructs each one field-by-field, so a
+# new `User`/`RefreshToken` column can never leak into a response just by
+# existing on the model.
+
+
+class SignupRequest(BaseModel):
+    """`POST /api/v1/auth/signup` request body.
+
+    `password`'s minimum length is basic input sanity (nothing shorter
+    could plausibly be a real password) - not a full password-strength
+    policy, which is out of this phase's scope.
+    """
+
+    email: str = Field(min_length=1)
+    password: str = Field(min_length=8)
+
+
+class LoginRequest(BaseModel):
+    """`POST /api/v1/auth/login` request body. Deliberately no minimum
+    length on `password` here (unlike `SignupRequest`) - an existing
+    credential is either right or wrong, and that's `AuthService.login()`'s
+    job to decide; there's nothing to validate about its shape up front."""
+
+    email: str
+    password: str
+
+
+class RefreshRequest(BaseModel):
+    """`POST /api/v1/auth/refresh` and `POST /api/v1/auth/logout` both
+    take just the opaque refresh token - the same request shape, reused
+    rather than duplicated."""
+
+    refresh_token: str = Field(min_length=1)
+
+
+class TokenPairOut(BaseModel):
+    """What `signup`, `login`, and `refresh` all return. `token_type` is
+    the conventional OAuth2-style bearer-token hint - harmless to include
+    and matches what most HTTP client libraries/mobile auth tooling
+    already expect to find on a token response."""
+
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class UserPublic(BaseModel):
+    """The only user-shaped data any `/api/v1/auth/*` response ever
+    returns - deliberately just `id`/`email`/`created_at`. Never
+    `password_hash`, never `failed_login_attempts`/`locked_until`, never
+    `is_active` - none of that is this API's business to expose, and
+    listing exactly these three fields here (rather than reaching for
+    `from_attributes`) means a new, more sensitive `User` column added
+    later can't silently start being serialized.
+    """
+
+    id: int
+    email: str
+    created_at: datetime
+
+    @field_validator("created_at")
+    @classmethod
+    def ensure_utc(cls, value: datetime) -> datetime:
+        # SQLite drops tzinfo on round-trip even for DateTime(timezone=True)
+        # columns; every value written is UTC - same rule as ListingOut/
+        # SavedSearchRead.
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
+
+class AuthResponse(BaseModel):
+    """`POST /api/v1/auth/signup` and `POST /api/v1/auth/login` both
+    return the same shape: who you are, plus a fresh token pair."""
+
+    user: UserPublic
+    tokens: TokenPairOut

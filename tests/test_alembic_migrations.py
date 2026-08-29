@@ -11,14 +11,18 @@ i.e. the baseline genuinely represents the current model schema.
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import inspect
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import sessionmaker
 
 from marketplace_alert.config import settings
 from marketplace_alert.core.persistence.database import Base, create_db_engine
 
 # Importing these registers every table on Base.metadata, same as alembic/env.py does.
+import marketplace_alert.core.auth.models  # noqa: F401
 import marketplace_alert.core.persistence.models  # noqa: F401
 import marketplace_alert.core.saved_searches.models  # noqa: F401
 
@@ -251,3 +255,228 @@ def test_stamp_head_on_a_pre_existing_database_succeeds_without_altering_tables(
     finally:
         engine.dispose()
     assert {"discovered_listings", "saved_searches", "saved_search_marketplaces", "alembic_version"} <= tables
+
+
+# --- Authentication tables (Phase 1 of the approved authentication design) -
+
+
+def test_upgrade_head_creates_the_authentication_tables(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "alembic_auth_tables_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        tables = set(inspect(engine).get_table_names())
+    finally:
+        engine.dispose()
+
+    for table_name in ("users", "refresh_tokens", "password_reset_tokens"):
+        assert table_name in tables
+
+
+def test_users_table_columns_and_nullability(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "alembic_users_columns_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        columns = {col["name"]: col for col in inspect(engine).get_columns("users")}
+    finally:
+        engine.dispose()
+
+    for column_name in ("id", "email", "password_hash", "is_active", "created_at", "updated_at"):
+        assert column_name in columns
+    assert not columns["email"]["nullable"]
+    assert not columns["password_hash"]["nullable"]
+
+
+def test_users_table_has_no_redundant_plain_unique_constraint_on_email(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case-insensitive expression index (tested below) is the only
+    uniqueness mechanism on this column - a plain, case-sensitive
+    `UNIQUE(email)` table constraint would be fully redundant once it
+    exists, and is deliberately not also present."""
+    db_path = tmp_path / "alembic_users_no_plain_unique_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        unique_constraints = inspect(engine).get_unique_constraints("users")
+    finally:
+        engine.dispose()
+
+    assert unique_constraints == []
+
+
+def test_users_table_has_a_case_insensitive_unique_index_on_email(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ix_users_email_lower` (`UNIQUE` on `lower(email)`) is what actually
+    enforces "no two accounts share an email, regardless of case."
+
+    SQLAlchemy's SQLite dialect cannot reflect an expression-based index
+    at all (`Inspector.get_indexes()` silently returns `[]` for it, with
+    only a `SAWarning` as a clue - confirmed directly; this is a real
+    SQLite-reflection limitation, not a bug in this migration) - so this
+    is verified two ways instead: the index's own DDL, read directly from
+    SQLite's `sqlite_master` (ground truth, independent of
+    SQLAlchemy's reflection support), and its actual enforcement
+    behavior via real inserts - the property that actually matters.
+    """
+    db_path = tmp_path / "alembic_users_email_lower_index_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            row = conn.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'ix_users_email_lower'"
+            ).fetchone()
+            assert row is not None
+            assert "UNIQUE" in row[0].upper()
+            assert "LOWER(EMAIL)" in row[0].upper()
+
+        session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)()
+        try:
+            session.execute(
+                sa.text(
+                    "INSERT INTO users (email, password_hash, is_active, created_at, updated_at) "
+                    "VALUES ('user@example.com', 'hash', 1, '2026-01-01', '2026-01-01')"
+                )
+            )
+            session.commit()
+
+            with pytest.raises(IntegrityError):
+                session.execute(
+                    sa.text(
+                        "INSERT INTO users (email, password_hash, is_active, created_at, updated_at) "
+                        "VALUES ('USER@example.com', 'hash', 1, '2026-01-01', '2026-01-01')"
+                    )
+                )
+                session.commit()
+            session.rollback()
+        finally:
+            session.close()
+    finally:
+        engine.dispose()
+
+
+def test_refresh_tokens_table_has_expected_columns_fk_and_unique_token_hash(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "alembic_refresh_tokens_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        columns = {col["name"] for col in inspector.get_columns("refresh_tokens")}
+        unique_constraints = inspector.get_unique_constraints("refresh_tokens")
+        index_names = {idx["name"] for idx in inspector.get_indexes("refresh_tokens")}
+        foreign_keys = inspector.get_foreign_keys("refresh_tokens")
+    finally:
+        engine.dispose()
+
+    for column_name in ("id", "user_id", "token_hash", "issued_at", "expires_at", "revoked_at"):
+        assert column_name in columns
+    assert any(uc["column_names"] == ["token_hash"] for uc in unique_constraints)
+    assert "ix_refresh_tokens_user_id" in index_names
+
+    assert len(foreign_keys) == 1
+    fk = foreign_keys[0]
+    assert fk["referred_table"] == "users"
+    assert fk["constrained_columns"] == ["user_id"]
+    assert fk["options"].get("ondelete") == "CASCADE"
+
+
+def test_password_reset_tokens_table_has_expected_columns_fk_and_unique_token_hash(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "alembic_password_reset_tokens_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        columns = {col["name"] for col in inspector.get_columns("password_reset_tokens")}
+        unique_constraints = inspector.get_unique_constraints("password_reset_tokens")
+        index_names = {idx["name"] for idx in inspector.get_indexes("password_reset_tokens")}
+        foreign_keys = inspector.get_foreign_keys("password_reset_tokens")
+    finally:
+        engine.dispose()
+
+    for column_name in ("id", "user_id", "token_hash", "created_at", "expires_at", "used_at"):
+        assert column_name in columns
+    assert any(uc["column_names"] == ["token_hash"] for uc in unique_constraints)
+    assert "ix_password_reset_tokens_user_id" in index_names
+
+    assert len(foreign_keys) == 1
+    fk = foreign_keys[0]
+    assert fk["referred_table"] == "users"
+    assert fk["constrained_columns"] == ["user_id"]
+    assert fk["options"].get("ondelete") == "CASCADE"
+
+
+def test_upgrade_head_adds_nullable_indexed_user_id_to_saved_searches(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`saved_searches.user_id` must be nullable (Phase 1 - no user exists
+    yet to attribute pre-existing rows to; a later cutover backfills it
+    and only then is it made `NOT NULL`), indexed, and a foreign key to
+    `users.id` with `ON DELETE CASCADE`."""
+    db_path = tmp_path / "alembic_saved_search_user_id_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        columns = {col["name"]: col for col in inspector.get_columns("saved_searches")}
+        index_names = {idx["name"] for idx in inspector.get_indexes("saved_searches")}
+        foreign_keys = inspector.get_foreign_keys("saved_searches")
+    finally:
+        engine.dispose()
+
+    assert "user_id" in columns
+    assert columns["user_id"]["nullable"] is True
+    assert "ix_saved_searches_user_id" in index_names
+
+    user_fks = [fk for fk in foreign_keys if fk["referred_table"] == "users"]
+    assert len(user_fks) == 1
+    assert user_fks[0]["constrained_columns"] == ["user_id"]
+    assert user_fks[0]["options"].get("ondelete") == "CASCADE"
+
+
+def test_downgrade_from_head_removes_the_authentication_tables_and_column(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "alembic_auth_downgrade_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+    command.downgrade(cfg, "163ae88ffc55")  # one revision before the auth tables
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        tables = set(inspect(engine).get_table_names())
+        saved_search_columns = {col["name"] for col in inspect(engine).get_columns("saved_searches")}
+    finally:
+        engine.dispose()
+
+    for table_name in ("users", "refresh_tokens", "password_reset_tokens"):
+        assert table_name not in tables
+    assert "user_id" not in saved_search_columns

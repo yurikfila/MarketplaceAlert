@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from marketplace_alert.config import settings
 from marketplace_alert.connectors.registry import get_connector, is_marketplace_supported
+from marketplace_alert.core.auth.service import AuthService
 from marketplace_alert.core.notifications.service import NotificationService
 from marketplace_alert.core.persistence.database import get_db_session
 from marketplace_alert.core.saved_searches.runner import SavedSearchRunner
@@ -62,6 +63,25 @@ def get_notification_service() -> NotificationService:
 def get_saved_search_service(session: Session = Depends(get_db_session)) -> SavedSearchService:
     """FastAPI dependency: validated saved-search CRUD, wired to the real connector registry."""
     return SavedSearchService(session, is_marketplace_supported=is_marketplace_supported)
+
+
+def get_auth_service(session: Session = Depends(get_db_session)) -> AuthService:
+    """FastAPI dependency: a fresh `AuthService` per request, wired from
+    `settings` - see `core/auth/service.py` for why this is constructed
+    fresh (not a shared singleton like `notification_service` above):
+    it's scoped to one request's `Session`, same as
+    `get_saved_search_service`. `core/auth/dependencies.py`'s
+    `get_current_user` also depends on this, for `/api/v1/auth/me` and
+    any later route that needs to know who's calling.
+    """
+    return AuthService(
+        session,
+        secret_key=settings.jwt_secret_key,
+        access_token_expire_minutes=settings.access_token_expire_minutes,
+        refresh_token_expire_days=settings.refresh_token_expire_days,
+        max_failed_login_attempts=settings.max_failed_login_attempts,
+        account_lockout_minutes=settings.account_lockout_minutes,
+    )
 
 
 # Resolves connectors only through get_connector - never imports a concrete

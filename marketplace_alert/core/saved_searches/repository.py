@@ -44,6 +44,36 @@ class SavedSearchRepository:
         stmt = select(SavedSearch).order_by(SavedSearch.id)
         return list(self._session.execute(stmt).scalars().all())
 
+    # --- Ownership-scoped variants (groundwork for the route-protection
+    # phase - see PROJECT_CONTEXT.md's authentication design decision).
+    # Not yet called by any route; `get`/`list_all`/`update`/`delete`
+    # above are unchanged and remain what every current route uses.
+
+    def get_owned(self, saved_search_id: int, *, user_id: int) -> SavedSearch | None:
+        """Like `get`, but returns `None` for a saved search that exists
+        but belongs to a different user - not a distinguishable "exists
+        but forbidden" result, deliberately: a future route calling this
+        must 404, never 403, for someone else's saved search (matching
+        this project's approved authentication design - see the "not
+        found, not forbidden" requirement)."""
+        stmt = select(SavedSearch).where(SavedSearch.id == saved_search_id, SavedSearch.user_id == user_id)
+        return self._session.execute(stmt).scalar_one_or_none()
+
+    def list_owned(self, *, user_id: int) -> list[SavedSearch]:
+        stmt = select(SavedSearch).where(SavedSearch.user_id == user_id).order_by(SavedSearch.id)
+        return list(self._session.execute(stmt).scalars().all())
+
+    def delete_owned(self, saved_search_id: int, *, user_id: int) -> bool:
+        """Like `delete`, but only deletes a row this user actually owns -
+        a nonexistent id, or one owned by someone else, both return
+        `False` without touching anything, indistinguishably."""
+        saved_search = self.get_owned(saved_search_id, user_id=user_id)
+        if saved_search is None:
+            return False
+        self._session.delete(saved_search)
+        self._session.flush()
+        return True
+
     def update(
         self,
         saved_search: SavedSearch,

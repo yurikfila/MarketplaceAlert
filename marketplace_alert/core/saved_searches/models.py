@@ -39,6 +39,23 @@ class SavedSearch(Base):
     # Set the first time this saved search is scanned; None until then.
     last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Who owns this saved search - added ahead of multi-tenancy actually
+    # being enforced (see PROJECT_CONTEXT.md's authentication design
+    # decision). Nullable for now: every row that already exists in
+    # production predates this column and has no user to point at yet - a
+    # one-time cutover backfill (a later phase) attributes existing rows
+    # to a bootstrap account, after which a follow-up migration makes this
+    # `NOT NULL`. Nothing in this codebase reads or writes this column yet
+    # - ownership isn't enforced anywhere until the route-protection phase.
+    # Indexed - "list this user's saved searches" is a known, foreseeable
+    # access pattern from day one, same reasoning as this table's other
+    # indexed foreign key (`DiscoveredListing.discovered_by_saved_search_id`).
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE", name="fk_saved_searches_user_id"),
+        nullable=True,
+        index=True,
+    )
+
     # Raw association rows - repository.py is the only place that touches
     # this list directly. Everything above it reads `.marketplaces` (a
     # plain list[str]) instead. `delete-orphan` means deleting a

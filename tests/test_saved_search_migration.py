@@ -26,6 +26,13 @@ def _build_legacy_database(db_path) -> None:
     (`index=True`) - omitting it here previously let this test pass while
     the real migration failed against the real database, since SQLite's
     DROP COLUMN doesn't clean up indexes on the dropped column by itself.
+
+    Includes `user_id` (nullable, left unset - `NULL` for every row): by
+    the time this hand-written migration ever actually runs at startup, the
+    Alembic migration that added this column has already run first (see
+    `main.py`'s `lifespan` ordering) - a real legacy database has this
+    column already, just unpopulated, same as every other pre-cutover row
+    (see PROJECT_CONTEXT.md's authentication design decision).
     """
     conn = sqlite3.connect(db_path)
     conn.execute(
@@ -39,6 +46,7 @@ def _build_legacy_database(db_path) -> None:
             created_at DATETIME NOT NULL,
             updated_at DATETIME NOT NULL,
             last_scanned_at DATETIME,
+            user_id INTEGER,
             PRIMARY KEY (id)
         )
         """

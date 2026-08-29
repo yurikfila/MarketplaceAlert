@@ -27,6 +27,14 @@ from marketplace_alert.connectors.registry import (
     is_marketplace_supported,
     list_supported_marketplaces,
 )
+# Imported purely for the side effect of registering `users` on
+# Base.metadata before init_db()/Base.metadata.create_all() runs below -
+# no code in this file uses it directly yet (Phase 1 is schema only), but
+# saved_searches.models.SavedSearch.user_id's foreign key can't be
+# resolved during local SQLite table creation unless this module has been
+# imported first. Same reason alembic/env.py imports every model module
+# explicitly.
+import marketplace_alert.core.auth.models  # noqa: F401
 from marketplace_alert.core.logging_config import configure_logging
 from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.notifications.service import NotificationService

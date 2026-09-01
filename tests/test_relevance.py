@@ -473,6 +473,19 @@ def test_fender_stratocaster_search_rejects_guitar_parts_and_accessories(title: 
     assert result.rejected_reason == "accessory_without_core_product_match"
 
 
+def test_fender_stratocaster_search_rejects_an_accessory_kit() -> None:
+    """Real false positive: a listing whose title explicitly labels itself
+    an accessory kit ("Fender Stratocaster Accessory Kit Parchment") was
+    being kept, since none of the pre-existing accessory terms (pickguard,
+    pickup, neck, body, case, ...) matched "accessory kit" itself - the
+    listing sailed through on brand + bare "stratocaster" overlap alone.
+    "accessory kit" is now its own registered accessory phrase (see
+    accessories.py), caught by the same title-only accessory penalty."""
+    result = evaluate_relevance("Fender Stratocaster", _listing("Fender Stratocaster Accessory Kit Parchment"))
+    assert result.is_relevant is False
+    assert result.rejected_reason == "accessory_without_core_product_match"
+
+
 def test_fender_stratocaster_search_accepts_a_complete_guitar() -> None:
     result = evaluate_relevance("Fender Stratocaster", _listing("Fender American Professional II Stratocaster"))
     assert result.is_relevant is True
@@ -545,6 +558,26 @@ def test_fender_stratocaster_search_accepts_a_complete_guitar_with_included_feat
     title-only accessory fix: 'with'/'w/' immediately before an accessory
     term marks it as a described feature of the complete guitar, not the
     item being sold - see PROJECT_CONTEXT.md decision #24."""
+    result = evaluate_relevance("Fender Stratocaster", _listing(title))
+    assert result.is_relevant is True
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Fender Fender Stratocaster w/Pau Ferro Neck MIM Stratocaster",
+        "Fender Standard Stratocaster with Billy Corgan Pickups",
+        "Fender Stratocaster Hardtail with 3-Bolt Neck, Rosewood Fretboard",
+        "FENDER FENDER STRATOCASTER WALNUT de 1972",
+        "Fender Masterbuilt John English Stratocaster",
+        "Iron Maiden signature Stratocaster",
+    ],
+)
+def test_fender_stratocaster_search_still_accepts_complete_guitars_after_the_accessory_kit_fix(title: str) -> None:
+    """Non-regression check for the "accessory kit" fix above: none of
+    these complete-guitar titles contain "accessory" or "kit" at all, so
+    the new accessory phrase must never affect them - confirmed explicitly
+    rather than left implied."""
     result = evaluate_relevance("Fender Stratocaster", _listing(title))
     assert result.is_relevant is True
 

@@ -79,6 +79,16 @@ def _register_default_accessory_terms() -> None:
         "strap",
         "stand",
         "manual",
+        # A title that explicitly labels itself an "accessory kit" (e.g.
+        # "Fender Stratocaster Accessory Kit Parchment") is unambiguous -
+        # the listing is naming its own category, not describing an
+        # included part of a complete instrument. Deliberately the two-word
+        # phrase, not bare "kit": a real product is routinely sold "as a
+        # kit" (see the drill-kit exemption above), so "kit" alone would
+        # reintroduce exactly the over-broad-single-word false-rejection
+        # pattern this module already fixed once - "accessory kit" together
+        # is not that ambiguous.
+        "accessory kit",
     ):
         register_accessory_term(term)
 

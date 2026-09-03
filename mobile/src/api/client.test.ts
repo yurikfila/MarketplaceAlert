@@ -5,7 +5,7 @@
  * this app never talks to directly anyway).
  */
 
-import { apiRequest, ApiError } from './client';
+import { apiRequest, ApiError, setAccessToken, setUnauthorizedHandler } from './client';
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -189,5 +189,151 @@ describe('apiRequest', () => {
     await apiRequest('/status');
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * Auth-header attachment and the single-flight refresh-and-retry mechanism.
+ * Kept in its own describe block (own fetch/token/handler teardown) so it
+ * can't leak `currentAccessToken`/`onUnauthorized` module state into the
+ * unauthenticated tests above.
+ */
+describe('apiRequest - authenticated requests and refresh', () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    setAccessToken(null);
+    setUnauthorizedHandler(null);
+    jest.restoreAllMocks();
+  });
+
+  it('attaches an Authorization header when an access token is set', async () => {
+    setAccessToken('abc123');
+    const fetchMock = jest.fn().mockResolvedValue(jsonResponse(200, { status: 'ok' }));
+    global.fetch = fetchMock;
+
+    await apiRequest('/status');
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect((init.headers as Record<string, string>).Authorization).toBe('Bearer abc123');
+  });
+
+  it('sends no Authorization header when no access token is set', async () => {
+    const fetchMock = jest.fn().mockResolvedValue(jsonResponse(200, { status: 'ok' }));
+    global.fetch = fetchMock;
+
+    await apiRequest('/status');
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect((init.headers as Record<string, string>).Authorization).toBeUndefined();
+  });
+
+  it('concurrent 401s trigger exactly one refresh request', async () => {
+    setAccessToken('expired-token');
+    const unauthorizedHandler = jest.fn().mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      setAccessToken('new-token');
+      return 'new-token';
+    });
+    setUnauthorizedHandler(unauthorizedHandler);
+
+    const fetchMock = jest.fn().mockImplementation((_url: string, init: RequestInit) => {
+      const headers = init.headers as Record<string, string>;
+      if (headers.Authorization === 'Bearer expired-token') {
+        return Promise.resolve(jsonResponse(401, { detail: 'Invalid or expired token' }));
+      }
+      return Promise.resolve(jsonResponse(200, { status: 'ok' }));
+    });
+    global.fetch = fetchMock;
+
+    const results = await Promise.all([
+      apiRequest<{ status: string }>('/one'),
+      apiRequest<{ status: string }>('/two'),
+      apiRequest<{ status: string }>('/three'),
+    ]);
+
+    expect(results).toEqual([{ status: 'ok' }, { status: 'ok' }, { status: 'ok' }]);
+    expect(unauthorizedHandler).toHaveBeenCalledTimes(1);
+  });
+
+  it('a failed refresh fails all waiters cleanly with their original 401, calling the refresh handler once', async () => {
+    setAccessToken('expired-token');
+    const unauthorizedHandler = jest.fn().mockResolvedValue(null);
+    setUnauthorizedHandler(unauthorizedHandler);
+
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(401, { detail: 'Invalid or expired token' }));
+
+    const results = await Promise.allSettled([apiRequest('/one'), apiRequest('/two')]);
+
+    expect(results[0].status).toBe('rejected');
+    expect(results[1].status).toBe('rejected');
+    if (results[0].status === 'rejected') {
+      expect(results[0].reason).toBeInstanceOf(ApiError);
+      expect((results[0].reason as ApiError).status).toBe(401);
+    }
+    expect(unauthorizedHandler).toHaveBeenCalledTimes(1);
+  });
+
+  it('a successful refresh retries the original request exactly once with the new token', async () => {
+    setAccessToken('expired-token');
+    setUnauthorizedHandler(
+      jest.fn().mockImplementation(async () => {
+        setAccessToken('new-token');
+        return 'new-token';
+      }),
+    );
+
+    const fetchMock = jest
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(401, { detail: 'Invalid or expired token' }))
+      .mockResolvedValueOnce(jsonResponse(200, { status: 'ok' }));
+    global.fetch = fetchMock;
+
+    const result = await apiRequest<{ status: string }>('/status');
+
+    expect(result).toEqual({ status: 'ok' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const secondCallHeaders = fetchMock.mock.calls[1][1].headers as Record<string, string>;
+    expect(secondCallHeaders.Authorization).toBe('Bearer new-token');
+  });
+
+  it('never attempts a refresh for a request made without an access token', async () => {
+    const unauthorizedHandler = jest.fn().mockResolvedValue('should-not-be-used');
+    setUnauthorizedHandler(unauthorizedHandler);
+
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(401, { detail: 'Incorrect email or password' }));
+
+    await expect(apiRequest('/auth/login', { method: 'POST', body: {} })).rejects.toMatchObject({ status: 401 });
+    expect(unauthorizedHandler).not.toHaveBeenCalled();
+  });
+
+  it('never attempts a refresh for a skipAuthRefresh request, even on 401 with a token set', async () => {
+    setAccessToken('expired-token');
+    const unauthorizedHandler = jest.fn().mockResolvedValue('new-token');
+    setUnauthorizedHandler(unauthorizedHandler);
+
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(401, { detail: 'Invalid or expired refresh token' }));
+
+    await expect(
+      apiRequest('/auth/refresh', { method: 'POST', body: { refresh_token: 'x' }, skipAuthRefresh: true }),
+    ).rejects.toMatchObject({ status: 401 });
+    expect(unauthorizedHandler).not.toHaveBeenCalled();
+  });
+
+  it('retries at most once - a still-401 response after refresh is surfaced, not retried again', async () => {
+    setAccessToken('expired-token');
+    setUnauthorizedHandler(
+      jest.fn().mockImplementation(async () => {
+        setAccessToken('new-token');
+        return 'new-token';
+      }),
+    );
+
+    const fetchMock = jest.fn().mockResolvedValue(jsonResponse(401, { detail: 'Invalid or expired token' }));
+    global.fetch = fetchMock;
+
+    await expect(apiRequest('/status')).rejects.toMatchObject({ status: 401 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

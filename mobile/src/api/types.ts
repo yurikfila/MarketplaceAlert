@@ -122,3 +122,40 @@ export interface ListListingsParams {
   new_since?: string;
   sort?: ListingSort;
 }
+
+/** `GET /api/v1/auth/me` response, and the `user` field of `AuthResponse` -
+ * deliberately minimal, mirroring the backend's `UserPublic` schema
+ * exactly (marketplace_alert/api/v1/schemas.py) - never a password hash,
+ * never account-lockout state, nothing beyond what the backend itself
+ * ever returns. */
+export interface UserPublic {
+  id: number;
+  email: string;
+  created_at: string;
+}
+
+/** What POST /auth/signup, /auth/login, and /auth/refresh all return -
+ * mirrors the backend's `TokenPairOut`. */
+export interface TokenPair {
+  access_token: string;
+  refresh_token: string;
+  token_type: string;
+}
+
+/** POST /api/v1/auth/signup and POST /api/v1/auth/login response - mirrors the backend's `AuthResponse`. */
+export interface AuthResponse {
+  user: UserPublic;
+  tokens: TokenPair;
+}
+
+/** POST /api/v1/auth/signup body. */
+export interface SignupInput {
+  email: string;
+  password: string;
+}
+
+/** POST /api/v1/auth/login body. */
+export interface LoginInput {
+  email: string;
+  password: string;
+}

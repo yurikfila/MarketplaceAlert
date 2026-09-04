@@ -921,9 +921,14 @@ def test_one_failing_marketplace_does_not_affect_relevance_filtering_in_another(
 # =====================================================================
 
 
-def test_scan_endpoint_filters_irrelevant_listings_before_persistence_and_notification(
-    client, fake_notification_provider, monkeypatch: pytest.MonkeyPatch, with_legacy_routes_enabled
+def test_scan_endpoint_filters_irrelevant_listings_before_persistence(
+    client, monkeypatch: pytest.MonkeyPatch, with_legacy_routes_enabled
 ) -> None:
+    """`/scan` no longer attempts Telegram delivery at all (see main.py's
+    `scan()` - it predates saved searches/ownership entirely and has no
+    per-user destination to resolve, and per-user routing's security rule
+    forbids a global fallback) - this test now only covers what's still
+    true: relevance filtering happens before persistence/counting."""
     import marketplace_alert.main as main_module
 
     monkeypatch.setattr(main_module, "_mock_connector", FakeConnector(_mixed_listings()))
@@ -936,8 +941,6 @@ def test_scan_endpoint_filters_irrelevant_listings_before_persistence_and_notifi
     assert [listing["external_listing_id"] for listing in body["new_listings"]] == ["good-drill"]
     assert body["raw_count"] == 3
     assert body["rejected_count"] == 2
-    assert len(fake_notification_provider.sent_listings) == 1
-    assert fake_notification_provider.sent_listings[0].external_listing_id == "good-drill"
 
 
 def test_scan_endpoint_does_not_persist_rejected_listings(

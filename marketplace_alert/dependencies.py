@@ -26,22 +26,23 @@ from marketplace_alert.notifications.telegram.provider import TelegramNotificati
 
 # The concrete provider (Telegram) is chosen here, once, at startup - every
 # caller only ever depends on the NotificationProvider interface. Disabled
-# automatically if credentials are missing (see TelegramNotificationProvider).
-# The provider retries its own transient failures (429/5xx/timeout, bounded,
-# with backoff); see that module's docstring.
+# automatically if the bot token is missing (see TelegramNotificationProvider -
+# it no longer holds a chat id at all, per-user routing resolves that per
+# notification, see core/notifications/outbox.py). The provider retries its
+# own transient failures (429/5xx/timeout, bounded, with backoff); see that
+# module's docstring.
 #
 # Exposed as its own module-level singleton (`notification_provider`,
 # distinct from `notification_service` below) so `scripts/drain_notification
 # _outbox.py` can use it directly for outbox delivery - the scan path
-# (`SavedSearchRunner`) no longer sends notifications at all, only
-# `NotificationService.notify_new_listings()`'s remaining caller (`main.py`'s
-# legacy, mock-only `/scan` endpoint) and `get_notification_service()`'s
-# `is_enabled` status checks still go through the service wrapper - see
-# PROJECT_CONTEXT.md decision #25 for why the scan path and
-# delivery were split.
+# (`SavedSearchRunner`) no longer sends notifications at all. The legacy,
+# mock-only `/scan` endpoint (`main.py`) no longer attempts Telegram delivery
+# either, as of per-user notification routing - it has no owning user to
+# resolve a destination for, and this provider never falls back to a global
+# default. `get_notification_service()`'s `is_enabled` status check (now
+# "is the bot token configured") is the service wrapper's only remaining use.
 notification_provider = TelegramNotificationProvider(
     bot_token=settings.telegram_bot_token,
-    chat_id=settings.telegram_chat_id,
     max_retries=settings.telegram_max_retries,
     retry_base_seconds=settings.telegram_retry_base_seconds,
 )

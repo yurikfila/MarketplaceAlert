@@ -1,8 +1,20 @@
-"""Notification service: sends alerts for newly discovered listings.
+"""Notification service: sends alerts for newly discovered listings to one
+explicit destination.
 
 Works with `Listing` objects and a `NotificationProvider` only - it never
 imports Telegram (or any other concrete provider) directly. `main.py` wires
 the concrete provider in; this service doesn't know or care which one it got.
+
+**No destination of its own.** This service has no per-listing routing
+concept - `notify_new_listings` sends an entire batch to the single
+`destination` its caller supplies, explicitly, every call (see
+`core/notifications/base.py`'s `NotificationProvider.send_listing_alert`).
+It never reads a global default. The real, per-user-aware production
+delivery path is `core/notifications/outbox.py`'s drain loop, which
+resolves a distinct destination for each notification individually; this
+service exists only for the legacy, single-batch, single-destination use
+case (historically the `/scan` endpoint - see `main.py`, which no longer
+has a legitimate destination to supply and so no longer calls this).
 
 **Delivery pacing under bursts**: a single scan can discover many new
 listings at once (e.g. a fresh saved search matching dozens of existing
@@ -42,12 +54,15 @@ class NotificationService:
         """Whether the underlying provider is configured (e.g. for status displays)."""
         return self._provider.is_enabled
 
-    def notify_new_listings(self, listings: list[Listing]) -> None:
-        """Alert on each new listing, in order, paced between sends. Never raises.
+    def notify_new_listings(self, listings: list[Listing], destination: str) -> None:
+        """Alert on each new listing, in order, paced between sends, all to
+        `destination`. Never raises.
 
         A failure to notify about one listing must never stop the rest of a
         batch from being attempted, and must never surface as a failure to
-        the caller (a saved-search run or the scheduler).
+        the caller (a saved-search run or the scheduler). `destination`
+        must be supplied explicitly by the caller every time - see this
+        module's docstring.
         """
         if not listings:
             return
@@ -71,7 +86,7 @@ class NotificationService:
                 "Notification queued for %s listing %s", listing.marketplace, listing.external_listing_id
             )
             try:
-                self._provider.send_listing_alert(listing)
+                self._provider.send_listing_alert(listing, destination)
             except NotificationError:
                 logger.exception(
                     "Failed to send notification for %s listing %s",

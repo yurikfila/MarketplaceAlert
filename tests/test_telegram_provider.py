@@ -37,12 +37,14 @@ def sleep_calls(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 def _provider(**overrides: object) -> TelegramNotificationProvider:
     kwargs: dict[str, object] = {
         "bot_token": "fake-token",
-        "chat_id": "12345",
         "max_retries": 3,
         "retry_base_seconds": 2.0,
     }
     kwargs.update(overrides)
     return TelegramNotificationProvider(**kwargs)
+
+
+_DESTINATION = "12345"
 
 
 def test_message_includes_title_marketplace_price_location_and_url() -> None:
@@ -63,16 +65,32 @@ def test_message_omits_price_and_location_when_absent() -> None:
     assert "Location" not in message
 
 
-def test_missing_credentials_disable_provider_and_raise_on_send() -> None:
-    provider = TelegramNotificationProvider(bot_token=None, chat_id=None)
+def test_missing_bot_token_disables_provider_and_raises_on_send() -> None:
+    provider = TelegramNotificationProvider(bot_token=None)
     assert provider.is_enabled is False
     with pytest.raises(NotificationError):
-        provider.send_listing_alert(_listing())
+        provider.send_listing_alert(_listing(), _DESTINATION)
 
 
-def test_partial_credentials_disable_provider() -> None:
-    assert TelegramNotificationProvider(bot_token="fake-token", chat_id=None).is_enabled is False
-    assert TelegramNotificationProvider(bot_token=None, chat_id="12345").is_enabled is False
+def test_bot_token_present_enables_provider() -> None:
+    """The provider holds no chat destination of its own (see this
+    module's docstring/security rule) - `is_enabled` reflects only
+    whether the bot token is configured."""
+    assert TelegramNotificationProvider(bot_token="fake-token").is_enabled is True
+
+
+def test_send_without_a_destination_raises_and_never_calls_telegram(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A caller must never invoke this with an empty destination - see
+    `core/notifications/outbox.py`'s "SECURITY RULE"; this is a defensive
+    backstop, never expected to actually fire in production."""
+    calls = {"count": 0}
+    monkeypatch.setattr(httpx, "post", lambda url, json, timeout: calls.__setitem__("count", calls["count"] + 1))
+
+    provider = _provider()
+    with pytest.raises(NotificationError):
+        provider.send_listing_alert(_listing(), "")
+
+    assert calls["count"] == 0
 
 
 def test_successful_send_posts_to_telegram_api(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -89,7 +107,7 @@ def test_successful_send_posts_to_telegram_api(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(httpx, "post", fake_post)
 
     provider = _provider()
-    provider.send_listing_alert(_listing())
+    provider.send_listing_alert(_listing(), _DESTINATION)
 
     assert captured["url"] == "https://api.telegram.org/botfake-token/sendMessage"
     assert captured["json"]["chat_id"] == "12345"
@@ -103,7 +121,7 @@ def test_http_error_status_raises_notification_error(monkeypatch: pytest.MonkeyP
     )
     provider = _provider()
     with pytest.raises(NotificationError):
-        provider.send_listing_alert(_listing())
+        provider.send_listing_alert(_listing(), _DESTINATION)
 
 
 def test_telegram_level_error_raises_notification_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,7 +134,7 @@ def test_telegram_level_error_raises_notification_error(monkeypatch: pytest.Monk
     )
     provider = _provider()
     with pytest.raises(NotificationError):
-        provider.send_listing_alert(_listing())
+        provider.send_listing_alert(_listing(), _DESTINATION)
 
 
 def test_network_failure_raises_notification_error_not_crash(
@@ -129,7 +147,7 @@ def test_network_failure_raises_notification_error_not_crash(
 
     provider = _provider()
     with pytest.raises(NotificationError):
-        provider.send_listing_alert(_listing())
+        provider.send_listing_alert(_listing(), _DESTINATION)
 
 
 # --- retry: transient failures ------------------------------------------
@@ -147,7 +165,7 @@ def test_timeout_is_retried_then_succeeds(monkeypatch: pytest.MonkeyPatch, sleep
     monkeypatch.setattr(httpx, "post", fake_post)
 
     provider = _provider(max_retries=3, retry_base_seconds=1.0)
-    provider.send_listing_alert(_listing())  # must not raise
+    provider.send_listing_alert(_listing(), _DESTINATION)  # must not raise
 
     assert attempts["count"] == 3
     assert sleep_calls == [1.0, 2.0]  # exponential: base, 2x base
@@ -165,7 +183,7 @@ def test_connection_failure_is_retried(monkeypatch: pytest.MonkeyPatch, sleep_ca
     monkeypatch.setattr(httpx, "post", fake_post)
 
     provider = _provider(max_retries=3, retry_base_seconds=1.0)
-    provider.send_listing_alert(_listing())
+    provider.send_listing_alert(_listing(), _DESTINATION)
 
     assert attempts["count"] == 2
     assert sleep_calls == [1.0]
@@ -183,7 +201,7 @@ def test_http_500_is_retried_then_succeeds(monkeypatch: pytest.MonkeyPatch, slee
     monkeypatch.setattr(httpx, "post", fake_post)
 
     provider = _provider(max_retries=3, retry_base_seconds=1.5)
-    provider.send_listing_alert(_listing())
+    provider.send_listing_alert(_listing(), _DESTINATION)
 
     assert attempts["count"] == 2
     assert sleep_calls == [1.5]
@@ -204,7 +222,7 @@ def test_other_5xx_statuses_are_retried(
     monkeypatch.setattr(httpx, "post", fake_post)
 
     provider = _provider(max_retries=2, retry_base_seconds=0.5)
-    provider.send_listing_alert(_listing())
+    provider.send_listing_alert(_listing(), _DESTINATION)
 
     assert attempts["count"] == 2
 
@@ -225,7 +243,7 @@ def test_http_429_waits_for_telegrams_retry_after(
     # A large exponential-backoff base to prove retry_after (7s) wins over
     # the backoff formula (which would otherwise wait retry_base_seconds).
     provider = _provider(max_retries=3, retry_base_seconds=100.0)
-    provider.send_listing_alert(_listing())
+    provider.send_listing_alert(_listing(), _DESTINATION)
 
     assert attempts["count"] == 2
     assert sleep_calls == [7.0]
@@ -245,7 +263,7 @@ def test_http_429_falls_back_to_backoff_without_retry_after(
     monkeypatch.setattr(httpx, "post", fake_post)
 
     provider = _provider(max_retries=3, retry_base_seconds=3.0)
-    provider.send_listing_alert(_listing())
+    provider.send_listing_alert(_listing(), _DESTINATION)
 
     assert sleep_calls == [3.0]
 
@@ -264,7 +282,7 @@ def test_retries_are_bounded_then_raises(monkeypatch: pytest.MonkeyPatch, sleep_
 
     provider = _provider(max_retries=3, retry_base_seconds=0.1)
     with pytest.raises(NotificationError):
-        provider.send_listing_alert(_listing())
+        provider.send_listing_alert(_listing(), _DESTINATION)
 
     # 1 initial attempt + 3 retries = 4 total attempts, never more.
     assert attempts["count"] == 4
@@ -282,7 +300,7 @@ def test_zero_max_retries_means_a_single_attempt(monkeypatch: pytest.MonkeyPatch
 
     provider = _provider(max_retries=0)
     with pytest.raises(NotificationError):
-        provider.send_listing_alert(_listing())
+        provider.send_listing_alert(_listing(), _DESTINATION)
 
     assert attempts["count"] == 1
 
@@ -301,7 +319,7 @@ def test_permanent_400_does_not_retry(monkeypatch: pytest.MonkeyPatch, sleep_cal
 
     provider = _provider(max_retries=3)
     with pytest.raises(NotificationError):
-        provider.send_listing_alert(_listing())
+        provider.send_listing_alert(_listing(), _DESTINATION)
 
     assert attempts["count"] == 1
     assert sleep_calls == []
@@ -318,7 +336,7 @@ def test_permanent_401_invalid_bot_token_does_not_retry(monkeypatch: pytest.Monk
 
     provider = _provider(max_retries=3)
     with pytest.raises(NotificationError):
-        provider.send_listing_alert(_listing())
+        provider.send_listing_alert(_listing(), _DESTINATION)
 
     assert attempts["count"] == 1
 
@@ -336,7 +354,7 @@ def test_permanent_ok_false_response_does_not_retry(monkeypatch: pytest.MonkeyPa
 
     provider = _provider(max_retries=3)
     with pytest.raises(NotificationError):
-        provider.send_listing_alert(_listing())
+        provider.send_listing_alert(_listing(), _DESTINATION)
 
     assert attempts["count"] == 1
 
@@ -347,11 +365,9 @@ def test_permanent_ok_false_response_does_not_retry(monkeypatch: pytest.MonkeyPa
 def test_credentials_never_appear_in_a_raised_error_message(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(httpx, "post", lambda url, json, timeout: httpx.Response(500))
 
-    provider = _provider(
-        bot_token="super-secret-bot-token", chat_id="super-secret-chat-id", max_retries=1, retry_base_seconds=0.1
-    )
+    provider = _provider(bot_token="super-secret-bot-token", max_retries=1, retry_base_seconds=0.1)
     with pytest.raises(NotificationError) as exc_info:
-        provider.send_listing_alert(_listing())
+        provider.send_listing_alert(_listing(), "super-secret-chat-id")
 
     message = str(exc_info.value)
     assert "super-secret-bot-token" not in message
@@ -363,12 +379,10 @@ def test_credentials_never_logged_during_retries(
 ) -> None:
     monkeypatch.setattr(httpx, "post", lambda url, json, timeout: httpx.Response(500))
 
-    provider = _provider(
-        bot_token="super-secret-bot-token", chat_id="super-secret-chat-id", max_retries=2, retry_base_seconds=0.1
-    )
+    provider = _provider(bot_token="super-secret-bot-token", max_retries=2, retry_base_seconds=0.1)
     with caplog.at_level("DEBUG"):
         with pytest.raises(NotificationError):
-            provider.send_listing_alert(_listing())
+            provider.send_listing_alert(_listing(), "super-secret-chat-id")
 
     log_text = "\n".join(record.getMessage() for record in caplog.records)
     assert "super-secret-bot-token" not in log_text

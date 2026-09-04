@@ -166,6 +166,30 @@ NOTIFICATION_STATUS_PROCESSING = "processing"
 NOTIFICATION_STATUS_SENT = "sent"
 NOTIFICATION_STATUS_FAILED = "failed"
 
+# Distinct, matchable `last_error` sentinels for the two reasons a
+# notification can go undelivered with no Telegram call ever made - see
+# `core/notifications/outbox.py`'s "SECURITY RULE" docstring section for
+# the full reasoning. Defined here, next to `NOTIFICATION_STATUS_*`,
+# because `NotificationOutboxRepository.claim_batch()`'s throttle
+# predicate (this module) and the drain loop
+# (`core/notifications/outbox.py`) both need to match against the exact
+# same string - one shared constant avoids duplicating it, or having this
+# persistence module import from the higher-level outbox module.
+#
+# - AWAITING_DESTINATION_CONFIG ("Case A"): the owning user is fully
+#   resolved (a real saved search, a real owner) but hasn't configured -
+#   or has cleared - a Telegram destination yet. Plausibly temporary:
+#   never counted against `notification_max_attempts` (see `claim_batch`
+#   and `complete` below) and retried indefinitely, throttled by
+#   `settings.notification_no_destination_retry_seconds` rather than
+#   reclaimed on every drain cycle.
+# - OWNER_UNRESOLVED ("Case B"): ownership/provenance itself cannot be
+#   established (no discovering saved search, a deleted saved search, or
+#   a saved search with no owner) - not something waiting will ever fix.
+#   Keeps the existing bounded-retry-then-`failed` behavior.
+NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG = "Owning user has not configured a Telegram destination yet"
+NOTIFICATION_ERROR_OWNER_UNRESOLVED = "Notification owner could not be resolved"
+
 
 class PendingNotification(Base):
     """The notification outbox: one row per newly-discovered listing that
@@ -222,7 +246,11 @@ class PendingNotification(Base):
     # phase. Gates `NOTIFICATION_STATUS_FAILED` once
     # `settings.notification_max_attempts` is reached, so a message that
     # reliably crashes the sender (a "poison pill") can't be retried
-    # forever.
+    # forever. A claim later found to be Case A
+    # (`NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG`) has this
+    # increment undone in `NotificationOutboxRepository.complete()` -
+    # waiting for the user to configure a destination is not a genuine
+    # delivery attempt, so it must never count towards that limit.
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     # Set when a row moves to `processing` (claimed). A row still

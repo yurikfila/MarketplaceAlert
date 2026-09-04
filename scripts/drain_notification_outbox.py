@@ -52,16 +52,19 @@ def main() -> int:
             batch_size=settings.notification_outbox_batch_size,
             lease_seconds=settings.notification_lease_seconds,
             max_attempts=settings.notification_max_attempts,
+            no_destination_retry_seconds=settings.notification_no_destination_retry_seconds,
         )
     except Exception:
         logger.exception("drain_notification_outbox: drain pass failed")
         return 1
 
     logger.info(
-        "drain_notification_outbox: claimed=%d sent=%d failed=%d",
+        "drain_notification_outbox: claimed=%d sent=%d failed=%d awaiting_config=%d unresolved_owner=%d",
         result.claimed_count,
         result.sent_count,
         result.failed_count,
+        result.awaiting_destination_config_count,
+        result.unresolved_owner_count,
     )
     return 0
 

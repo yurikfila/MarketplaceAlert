@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.persistence.models import (
+    NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG,
     NOTIFICATION_STATUS_FAILED,
     NOTIFICATION_STATUS_PENDING,
     NOTIFICATION_STATUS_PROCESSING,
@@ -31,10 +32,19 @@ class ClaimedNotification:
     """One claimed outbox row, with everything needed to attempt delivery
     already read out into plain values - never a live ORM object, since by
     the time this is used the claiming session has already committed (see
-    `NotificationOutboxRepository.claim_batch`'s docstring)."""
+    `NotificationOutboxRepository.claim_batch`'s docstring).
+
+    `discovered_by_saved_search_id` is carried through so the drain loop
+    (`core/notifications/outbox.py`) can resolve which user owns this
+    notification - the same column `claim_batch` already joins against, so
+    capturing it here costs nothing extra. `None` means "no discovering
+    search" (e.g. a legacy `/scan`-discovered listing) - a notification
+    that can never be routed to anyone, see that module's "SECURITY RULE".
+    """
 
     notification_id: int
     listing: Listing
+    discovered_by_saved_search_id: int | None
 
 
 class NotificationOutboxRepository:
@@ -60,12 +70,29 @@ class NotificationOutboxRepository:
         self._session.flush()
         return row
 
-    def claim_batch(self, *, limit: int, lease_seconds: float) -> list[ClaimedNotification]:
+    def claim_batch(
+        self, *, limit: int, lease_seconds: float, no_destination_retry_seconds: float
+    ) -> list[ClaimedNotification]:
         """Claims up to `limit` rows eligible for delivery - either
         genuinely `pending`, or `processing` with a `claimed_at` older
         than `lease_seconds` (an abandoned claim, e.g. the process that
         claimed it crashed before completing - see this module's and
         `core/notifications/outbox.py`'s docstrings).
+
+        A `pending` row whose *previous* completion was Case A
+        (`last_error == NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG` -
+        the owner is real but hasn't configured a Telegram destination
+        yet) is additionally throttled: it's only eligible once
+        `last_attempted_at` is at least `no_destination_retry_seconds`
+        old. Without this, such a row would otherwise be reclaimed on
+        every single drain cycle forever, since it's deliberately never
+        allowed to reach `failed` (see `complete()` below) - see
+        `core/notifications/outbox.py`'s "SECURITY RULE" section. A row
+        that has never been attempted (`last_attempted_at IS NULL`) or
+        whose last outcome was anything else (a genuine provider failure,
+        or Case B's `NOTIFICATION_ERROR_OWNER_UNRESOLVED`) is unaffected
+        by this predicate - only Case A is throttled; every other retry
+        path keeps its existing immediate-reclaim behavior unchanged.
 
         `FOR UPDATE SKIP LOCKED`, scoped to `pending_notifications` only
         (`of=PendingNotification` - never locks the joined
@@ -82,12 +109,20 @@ class NotificationOutboxRepository:
         """
         now = datetime.now(timezone.utc)
         lease_cutoff = now - timedelta(seconds=lease_seconds)
+        no_destination_cutoff = now - timedelta(seconds=no_destination_retry_seconds)
 
         stmt = (
             select(PendingNotification, DiscoveredListing)
             .join(DiscoveredListing, PendingNotification.discovered_listing_id == DiscoveredListing.id)
             .where(
-                (PendingNotification.status == NOTIFICATION_STATUS_PENDING)
+                (
+                    (PendingNotification.status == NOTIFICATION_STATUS_PENDING)
+                    & (
+                        (PendingNotification.last_error != NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG)
+                        | (PendingNotification.last_attempted_at.is_(None))
+                        | (PendingNotification.last_attempted_at <= no_destination_cutoff)
+                    )
+                )
                 | (
                     (PendingNotification.status == NOTIFICATION_STATUS_PROCESSING)
                     & (PendingNotification.claimed_at < lease_cutoff)
@@ -105,7 +140,11 @@ class NotificationOutboxRepository:
             notification.claimed_at = now
             notification.attempt_count += 1
             claimed.append(
-                ClaimedNotification(notification_id=notification.id, listing=_to_listing(listing_row))
+                ClaimedNotification(
+                    notification_id=notification.id,
+                    listing=_to_listing(listing_row),
+                    discovered_by_saved_search_id=listing_row.discovered_by_saved_search_id,
+                )
             )
         self._session.flush()
         return claimed
@@ -129,6 +168,16 @@ class NotificationOutboxRepository:
         `ondelete="CASCADE"` while a delivery attempt was in flight) is
         silently ignored rather than raising - there is nothing left to
         record an outcome against.
+
+        Case A (`error == NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG`)
+        is handled distinctly from every other failure: `claim_batch()`
+        already incremented `attempt_count` before this outcome was
+        known, but waiting for the user to configure a destination is
+        not a genuine delivery attempt, so that increment is undone here
+        and the row is always sent back to `pending` regardless of
+        `max_attempts` - it must never become terminally `failed` solely
+        because Telegram isn't configured yet. See `core/notifications/
+        outbox.py`'s "SECURITY RULE" section.
         """
         row = self._session.get(PendingNotification, notification_id)
         if row is None:
@@ -140,6 +189,10 @@ class NotificationOutboxRepository:
             row.status = NOTIFICATION_STATUS_SENT
             row.sent_at = now
             row.last_error = None
+        elif error == NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG:
+            row.attempt_count = max(0, row.attempt_count - 1)
+            row.last_error = error
+            row.status = NOTIFICATION_STATUS_PENDING
         else:
             row.last_error = error
             row.status = NOTIFICATION_STATUS_FAILED if row.attempt_count >= max_attempts else NOTIFICATION_STATUS_PENDING

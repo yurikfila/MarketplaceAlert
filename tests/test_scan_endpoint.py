@@ -1,10 +1,5 @@
 import pytest
 
-from marketplace_alert.core.models.listing import Listing
-from marketplace_alert.core.notifications.base import NotificationError, NotificationProvider
-from marketplace_alert.core.notifications.service import NotificationService
-from marketplace_alert.main import app, get_notification_service
-
 
 @pytest.fixture(autouse=True)
 def _legacy_routes_enabled(with_legacy_routes_enabled) -> None:
@@ -57,37 +52,21 @@ def test_search_endpoint_stays_stateless_alongside_scan(client) -> None:
     assert first_search[0]["external_listing_id"] == second_search[0]["external_listing_id"] == "mock-001"
 
 
-def test_scan_sends_notification_for_first_discovery(client, fake_notification_provider) -> None:
-    response = client.get("/scan", params={"q": "Maccabi"})
-    assert response.status_code == 200
-    assert len(fake_notification_provider.sent_listings) == 1
-    assert fake_notification_provider.sent_listings[0].external_listing_id == "mock-001"
-
-
-def test_scan_does_not_notify_for_already_seen_listing(client, fake_notification_provider) -> None:
-    client.get("/scan", params={"q": "Maccabi"})
-    fake_notification_provider.sent_listings.clear()
-
-    response = client.get("/scan", params={"q": "Maccabi"})
-    assert response.status_code == 200
-    assert response.json()["new_count"] == 0
+def test_scan_no_longer_sends_telegram_notifications_first_or_repeat_request(
+    client, fake_notification_provider
+) -> None:
+    """`/scan` predates saved searches/ownership entirely - a listing it
+    discovers has no owning user to resolve a per-user destination for,
+    and per-user notification routing's security rule forbids falling
+    back to the legacy global `TELEGRAM_CHAT_ID` at runtime (see
+    `core/notifications/outbox.py`'s "SECURITY RULE"). True for a first
+    discovery and for an already-seen repeat alike - never sends either way."""
+    first = client.get("/scan", params={"q": "Maccabi"})
+    assert first.status_code == 200
+    assert first.json()["new_count"] == 1
     assert fake_notification_provider.sent_listings == []
 
-
-def test_scan_survives_notification_provider_failure(client) -> None:
-    class FailingProvider(NotificationProvider):
-        @property
-        def is_enabled(self) -> bool:
-            return True
-
-        def send_listing_alert(self, listing: Listing) -> None:
-            raise NotificationError("simulated failure")
-
-    app.dependency_overrides[get_notification_service] = lambda: NotificationService(FailingProvider())
-
-    response = client.get("/scan", params={"q": "Maccabi"})
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["new_count"] == 1
-    assert len(body["new_listings"]) == 1
+    second = client.get("/scan", params={"q": "Maccabi"})
+    assert second.status_code == 200
+    assert second.json()["new_count"] == 0
+    assert fake_notification_provider.sent_listings == []

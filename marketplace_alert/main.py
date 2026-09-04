@@ -410,23 +410,26 @@ class ScanResult(BaseModel):
 def scan(
     q: str,
     session: Session = Depends(get_db_session),
-    notification_service: NotificationService = Depends(get_notification_service),
 ) -> ScanResult:
-    """TEMPORARY endpoint: stateful search + duplicate detection + alerts.
+    """TEMPORARY endpoint: stateful search + duplicate detection.
 
     Unlike /search, this persists every listing it sees and only returns
     the ones that are new since the last scan. Running the same query
-    again immediately should return no new listings. A Telegram alert is
-    sent for each new listing (never for already-seen ones); a failure to
-    notify never fails the scan itself. Results are filtered for
-    relevance (see `core/relevance/`) before duplicate detection, so an
-    irrelevant listing is never persisted, counted, or notified about -
-    the same shared filtering path saved searches use.
+    again immediately should return no new listings. Results are filtered
+    for relevance (see `core/relevance/`) before duplicate detection, so
+    an irrelevant listing is never persisted or counted - the same shared
+    filtering path saved searches use.
+
+    **No longer sends a Telegram alert.** This endpoint predates saved
+    searches/ownership entirely - a listing it discovers has no owning
+    user to resolve a per-user destination for, and per-user notification
+    routing's security rule forbids falling back to the legacy global
+    `TELEGRAM_CHAT_ID` at runtime (see `core/notifications/outbox.py`'s
+    "SECURITY RULE"). Persistence/dedup behavior is unaffected.
     """
     listings = _mock_connector.search(q)
     filter_result = filter_relevant_listings(query=q, listings=listings, marketplace="mock")
     result = ListingDiscoveryService(session).process_listings(filter_result.relevant_listings)
-    notification_service.notify_new_listings(result.new_listings)
     return ScanResult(
         query=q,
         new_listings=result.new_listings,

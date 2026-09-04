@@ -94,6 +94,21 @@ class Settings(BaseSettings):
     notification_lease_seconds: float = 120.0
     notification_max_attempts: int = 10
 
+    # A "Case A" no-destination row (owner resolved, but no Telegram
+    # destination configured yet - see `core/persistence/models.py:
+    # NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG` and
+    # `core/notifications/outbox.py`'s "SECURITY RULE" section) is never
+    # counted against `notification_max_attempts`, so without a separate
+    # throttle it would otherwise be reclaimed on every single drain
+    # cycle forever. This is that throttle: such a row is only eligible
+    # for reclaim once its `last_attempted_at` is at least this many
+    # seconds old. 900s (15 minutes) is comfortably longer than any
+    # plausible drain cadence (so it actually stops the hot-reclaim
+    # loop) while still being short enough that a user who configures
+    # Telegram shortly after signing up sees their backlog delivered
+    # promptly, not after a multi-hour wait.
+    notification_no_destination_retry_seconds: float = 900.0
+
     # How often the background scanner checks for due saved searches
     # (polling granularity, not a per-search interval - see
     # core/saved_searches/schemas.py for the per-search minimum).

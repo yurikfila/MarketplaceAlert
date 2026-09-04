@@ -75,7 +75,7 @@ class FakeNotificationProvider(NotificationProvider):
     def is_enabled(self) -> bool:
         return True
 
-    def send_listing_alert(self, listing: Listing) -> None:
+    def send_listing_alert(self, listing: Listing, destination: str) -> None:
         self.sent_listings.append(listing)
 
 

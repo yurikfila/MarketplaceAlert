@@ -16,6 +16,7 @@ impossible to accidentally forget that several `ListingOut` fields aren't
 persisted yet (see `api/v1/listings.py`).
 """
 
+import re
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field, field_validator
@@ -242,3 +243,44 @@ class AuthResponse(BaseModel):
 
     user: UserPublic
     tokens: TokenPairOut
+
+
+# --- Notification preferences (`/api/v1/notification-preferences/me`) --
+#
+# Always "me" - see `api/v1/notification_preferences.py`. No `user_id`
+# field on either schema, ever - ownership is derived exclusively from
+# the bearer token, never accepted from the client.
+
+
+class NotificationPreferenceRead(BaseModel):
+    """`GET .../me` response. `telegram_chat_id` is `None` both when no
+    preference row exists yet at all, and when one exists but has no
+    chat id configured - the API deliberately doesn't distinguish those
+    two cases; both mean "nothing will be delivered right now"."""
+
+    telegram_chat_id: str | None
+
+
+_TELEGRAM_CHAT_ID_PATTERN = r"-?\d+"
+
+
+class NotificationPreferenceUpdate(BaseModel):
+    """`PUT .../me` request body. `telegram_chat_id: null` (or an empty/
+    blank string, normalized the same way) clears it - an explicit,
+    supported way to opt back out, not an error."""
+
+    telegram_chat_id: str | None = None
+
+    @field_validator("telegram_chat_id")
+    @classmethod
+    def validate_telegram_chat_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if not re.fullmatch(_TELEGRAM_CHAT_ID_PATTERN, stripped):
+            raise ValueError(
+                "telegram_chat_id must be a Telegram chat id - digits, optionally prefixed with '-' (for a group chat)"
+            )
+        return stripped

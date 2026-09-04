@@ -6,6 +6,17 @@ Implements `NotificationProvider` (see
 `main.py` (which wires the concrete provider up at startup) should ever
 import this module directly.
 
+**No stored chat destination.** This provider holds only `bot_token` -
+never a chat id. Per-user notification routing (see `core/notifications/
+outbox.py`) resolves the destination for each notification independently
+and passes it into `send_listing_alert()` explicitly; this provider must
+never fall back to any default of its own. The one narrow exception is
+the one-time production migration/backfill script (`scripts/backfill_
+notification_preference.py`), which reads the legacy global
+`TELEGRAM_CHAT_ID` directly from settings - never through this class -
+purely as the *source value* for seeding one specific existing user's
+preference row, never as a runtime fallback.
+
 **Delivery robustness under bursts**: a saved search can discover many new
 listings in one scan, and sending them all back-to-back risks Telegram's
 own rate limiting (HTTP 429) or transient 5xx/timeout failures. This
@@ -64,23 +75,22 @@ def format_listing_message(listing: Listing) -> str:
 class TelegramNotificationProvider(NotificationProvider):
     """Sends listing alerts to a Telegram chat via a bot.
 
-    Reads the bot token and chat ID from the values passed in (main.py
-    wires these from ``settings``, which loads them from the environment /
-    ``.env`` - never hard-coded). If either is missing, the provider is
-    disabled: `is_enabled` is False and callers must skip it rather than
-    calling `send_listing_alert`.
+    Reads the bot token from the value passed in (main.py wires it from
+    ``settings``, which loads it from the environment / ``.env`` - never
+    hard-coded). If it's missing, the provider is disabled: `is_enabled`
+    is False and callers must skip it rather than calling
+    `send_listing_alert`. The destination chat is never part of this
+    class's own state - see this module's docstring.
     """
 
     def __init__(
         self,
         bot_token: str | None,
-        chat_id: str | None,
         timeout: float = 10.0,
         max_retries: int = 3,
         retry_base_seconds: float = 2.0,
     ) -> None:
         self._bot_token = bot_token
-        self._chat_id = chat_id
         self._timeout = timeout
         # A negative config value would otherwise turn into "retry forever
         # backwards" nonsense or a negative sleep - clamp to a sane floor
@@ -88,27 +98,32 @@ class TelegramNotificationProvider(NotificationProvider):
         self._max_retries = max(0, max_retries)
         self._retry_base_seconds = max(0.0, retry_base_seconds)
         if not self.is_enabled:
-            logger.warning(
-                "Telegram notifications disabled: TELEGRAM_BOT_TOKEN and/or "
-                "TELEGRAM_CHAT_ID are not set"
-            )
+            logger.warning("Telegram notifications disabled: TELEGRAM_BOT_TOKEN is not set")
 
     @property
     def is_enabled(self) -> bool:
-        return bool(self._bot_token) and bool(self._chat_id)
+        return bool(self._bot_token)
 
-    def send_listing_alert(self, listing: Listing) -> None:
-        """Send one alert, retrying transient failures up to `max_retries` times.
+    def send_listing_alert(self, listing: Listing, destination: str) -> None:
+        """Send one alert to `destination`, retrying transient failures up
+        to `max_retries` times.
 
         Raises `NotificationError` only once every attempt has been
         exhausted (transient failure) or immediately for a permanent one -
-        the caller (`NotificationService`) doesn't need to know which.
+        the caller (`NotificationService`, or `core/notifications/outbox
+        .py`'s drain loop) doesn't need to know which. Also raises
+        immediately, before any network call, if `destination` is falsy -
+        this provider never guesses or falls back (see module docstring);
+        a caller with nothing to pass here must not call this method at
+        all.
         """
         if not self.is_enabled:
             raise NotificationError("Telegram provider is not configured")
+        if not destination:
+            raise NotificationError("No notification destination provided")
 
         url = f"{_TELEGRAM_API_BASE}/bot{self._bot_token}/sendMessage"
-        payload = {"chat_id": self._chat_id, "text": format_listing_message(listing)}
+        payload = {"chat_id": destination, "text": format_listing_message(listing)}
         total_attempts = self._max_retries + 1
 
         for attempt in range(1, total_attempts + 1):

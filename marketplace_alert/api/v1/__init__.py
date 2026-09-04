@@ -15,7 +15,7 @@ Adding /api/v1/* is purely additive: nothing under `/`, `/health`,
 
 from fastapi import APIRouter
 
-from marketplace_alert.api.v1 import auth, listings, marketplaces, saved_searches, status
+from marketplace_alert.api.v1 import auth, listings, marketplaces, notification_preferences, saved_searches, status
 
 router = APIRouter(prefix="/api/v1")
 router.include_router(status.router)
@@ -23,3 +23,4 @@ router.include_router(marketplaces.router)
 router.include_router(saved_searches.router)
 router.include_router(listings.router)
 router.include_router(auth.router)
+router.include_router(notification_preferences.router)

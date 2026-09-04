@@ -23,6 +23,7 @@ from marketplace_alert.core.persistence.database import Base, create_db_engine
 
 # Importing these registers every table on Base.metadata, same as alembic/env.py does.
 import marketplace_alert.core.auth.models  # noqa: F401
+import marketplace_alert.core.notifications.models  # noqa: F401
 import marketplace_alert.core.persistence.models  # noqa: F401
 import marketplace_alert.core.saved_searches.models  # noqa: F401
 
@@ -480,3 +481,59 @@ def test_downgrade_from_head_removes_the_authentication_tables_and_column(
     for table_name in ("users", "refresh_tokens", "password_reset_tokens"):
         assert table_name not in tables
     assert "user_id" not in saved_search_columns
+
+
+def test_upgrade_head_creates_notification_preferences_table(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "alembic_notification_preferences_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        columns = {col["name"] for col in inspector.get_columns("notification_preferences")}
+        index_names_and_unique = {
+            idx["name"]: idx["unique"] for idx in inspector.get_indexes("notification_preferences")
+        }
+        foreign_keys = inspector.get_foreign_keys("notification_preferences")
+    finally:
+        engine.dispose()
+
+    for column_name in ("id", "user_id", "telegram_chat_id", "created_at", "updated_at"):
+        assert column_name in columns
+
+    # user_id is both the uniqueness guarantee and the lookup key - one
+    # UNIQUE index serves both, matching the model exactly (see this
+    # migration's own docstring for why there's no separate, redundant
+    # non-unique index or UniqueConstraint alongside it).
+    assert index_names_and_unique.get("ix_notification_preferences_user_id")  # 1 on SQLite, True on Postgres
+
+    assert len(foreign_keys) == 1
+    fk = foreign_keys[0]
+    assert fk["referred_table"] == "users"
+    assert fk["constrained_columns"] == ["user_id"]
+    assert fk["options"].get("ondelete") == "CASCADE"
+
+
+def test_downgrade_one_revision_removes_only_notification_preferences(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Downgrading exactly one revision (this migration's own) must remove
+    `notification_preferences` and nothing else - `users`/`saved_searches`
+    (and every other table) must be untouched."""
+    db_path = tmp_path / "alembic_notification_preferences_downgrade_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+    command.downgrade(cfg, "d363f3f9d06c")  # one revision before notification_preferences
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        tables = set(inspect(engine).get_table_names())
+    finally:
+        engine.dispose()
+
+    assert "notification_preferences" not in tables
+    for table_name in ("users", "saved_searches", "discovered_listings", "refresh_tokens"):
+        assert table_name in tables

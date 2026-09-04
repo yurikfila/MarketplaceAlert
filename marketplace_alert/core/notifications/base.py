@@ -35,8 +35,16 @@ class NotificationProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def send_listing_alert(self, listing: Listing) -> None:
-        """Send an alert for one newly discovered listing.
+    def send_listing_alert(self, listing: Listing, destination: str) -> None:
+        """Send an alert for one newly discovered listing to `destination`.
+
+        `destination` is always supplied explicitly by the caller (e.g. a
+        resolved per-user Telegram chat id) - no provider implementation
+        may fall back to a stored/global default of its own. A caller
+        that has no destination to give must never call this method at
+        all (see `core/notifications/outbox.py`'s module docstring
+        "SECURITY RULE") - there is no sentinel value that means "use
+        something else instead".
 
         Raises `NotificationError` on failure (network error, API error
         response, etc). Never called when `is_enabled` is False.

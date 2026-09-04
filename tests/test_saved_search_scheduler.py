@@ -132,6 +132,46 @@ def test_scanner_runs_due_search_and_notifies_new_listing(session_factory) -> No
     verify_session.close()
 
 
+def test_scanner_runs_due_searches_belonging_to_multiple_different_users(session_factory) -> None:
+    """The scheduler must remain fully unscoped - see the ownership-
+    enforcement phase's scheduler requirement: it processes every due
+    saved search regardless of which user (or no user at all) owns it,
+    since `list_due_for_scan`/`run_by_id` never go through the HTTP layer
+    or `get_current_user` at all."""
+    from marketplace_alert.core.auth.models import User
+
+    setup_session = session_factory()
+    user_a = User(email="scheduler-a@example.com", password_hash="irrelevant-hash")
+    user_b = User(email="scheduler-b@example.com", password_hash="irrelevant-hash")
+    setup_session.add_all([user_a, user_b])
+    setup_session.commit()
+
+    repo = SavedSearchRepository(setup_session)
+    search_a = repo.create(
+        query="A's search", marketplaces=["good"], scan_interval_seconds=60, is_active=True, user_id=user_a.id
+    )
+    search_b = repo.create(
+        query="B's search", marketplaces=["good"], scan_interval_seconds=60, is_active=True, user_id=user_b.id
+    )
+    search_unowned = repo.create(
+        query="Unowned search", marketplaces=["good"], scan_interval_seconds=60, is_active=True
+    )
+    setup_session.commit()
+    setup_session.close()
+
+    runner = SavedSearchRunner(resolve_connector=lambda name: FakeConnector([_listing()]))
+    scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
+
+    scanner.run_due_searches()
+
+    verify_session = session_factory()
+    scanned_ids = {
+        s.id for s in SavedSearchRepository(verify_session).list_all() if s.last_scanned_at is not None
+    }
+    assert scanned_ids == {search_a.id, search_b.id, search_unowned.id}
+    verify_session.close()
+
+
 def test_scanner_does_not_notify_twice_for_same_listing(session_factory) -> None:
     setup_session = session_factory()
     SavedSearchRepository(setup_session).create(

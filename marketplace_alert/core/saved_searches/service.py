@@ -40,13 +40,14 @@ class SavedSearchService:
         # method's docstring.
         self._runner = SavedSearchRunner(resolve_connector=resolve_connector) if resolve_connector is not None else None
 
-    def create(self, data: SavedSearchCreate) -> SavedSearch:
+    def create(self, data: SavedSearchCreate, *, user_id: int | None = None) -> SavedSearch:
         self._validate_marketplaces(data.marketplaces)
         return self._repository.create(
             query=data.query,
             marketplaces=data.marketplaces,
             scan_interval_seconds=data.scan_interval_seconds,
             is_active=data.is_active,
+            user_id=user_id,
         )
 
     def get(self, saved_search_id: int) -> SavedSearch | None:

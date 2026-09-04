@@ -10,7 +10,16 @@ fixture's FakeNotificationProvider).
 
 from datetime import datetime, timezone
 
+import pytest
+
 from marketplace_alert.core.persistence.models import DiscoveredListing
+
+
+@pytest.fixture(autouse=True)
+def _legacy_routes_enabled(with_legacy_routes_enabled) -> None:
+    """The whole file is about the legacy `GET /listings` dashboard page,
+    which is now opt-in-disabled by default - see config.py's
+    `legacy_routes_enabled` docstring."""
 
 
 def _insert_listing(db_session, *, marketplace="mock", external_id="a", title="Item", **overrides) -> DiscoveredListing:

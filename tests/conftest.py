@@ -36,6 +36,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from marketplace_alert.config import settings
 from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.notifications.base import NotificationProvider
 from marketplace_alert.core.notifications.service import NotificationService
@@ -102,6 +103,18 @@ def db_session(session_factory: sessionmaker) -> Iterator[Session]:
         yield session
     finally:
         session.close()
+
+
+@pytest.fixture()
+def with_legacy_routes_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opt-in, per-test, for the legacy unauthenticated dashboard/CRUD/
+    search/scan surface (`GET /`, `GET /listings`, `/search`, `/scan`,
+    `/saved-searches*`) - see config.py's `legacy_routes_enabled`
+    docstring. Production defaults this to `False`; a test that
+    genuinely exercises that surface requests this fixture explicitly,
+    isolated via `monkeypatch` (auto-reverted after the test), rather
+    than the default itself being weakened to keep such tests passing."""
+    monkeypatch.setattr(settings, "legacy_routes_enabled", True)
 
 
 @pytest.fixture()

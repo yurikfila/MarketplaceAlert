@@ -189,7 +189,19 @@ app.mount("/static", StaticFiles(directory=_BASE_DIR / "static"), name="static")
 app.include_router(api_v1_router)
 
 
-@app.get("/", response_class=HTMLResponse)
+def _require_legacy_routes_enabled() -> None:
+    """Gate for every route in this file's legacy, unauthenticated surface
+    (the dashboard, its backing `/saved-searches*` CRUD/run routes, and the
+    temporary `/search`/`/scan` endpoints) - see `settings.legacy_routes_
+    enabled`'s docstring in config.py for why this exists. A plain 404,
+    not a redirect or an explanatory error body - "disabled" reads to a
+    caller identically to "never existed", never as "an admin surface is
+    here but you're not allowed in"."""
+    if not settings.legacy_routes_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+
+@app.get("/", response_class=HTMLResponse, dependencies=[Depends(_require_legacy_routes_enabled)])
 def dashboard(
     request: Request,
     service: SavedSearchService = Depends(get_saved_search_service),
@@ -274,7 +286,7 @@ def _format_price(price: float | None, currency: str | None) -> str | None:
     return f"{currency.upper()} {formatted_number}" if currency else formatted_number
 
 
-@app.get("/listings", response_class=HTMLResponse)
+@app.get("/listings", response_class=HTMLResponse, dependencies=[Depends(_require_legacy_routes_enabled)])
 def listings_page(
     request: Request,
     marketplace: str | None = None,
@@ -372,7 +384,7 @@ def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/search")
+@app.get("/search", dependencies=[Depends(_require_legacy_routes_enabled)])
 def search(q: str) -> list[Listing]:
     """TEMPORARY endpoint: search the mock marketplace connector.
 
@@ -394,7 +406,7 @@ class ScanResult(BaseModel):
     rejected_count: int = 0
 
 
-@app.get("/scan")
+@app.get("/scan", dependencies=[Depends(_require_legacy_routes_enabled)])
 def scan(
     q: str,
     session: Session = Depends(get_db_session),
@@ -425,7 +437,9 @@ def scan(
     )
 
 
-@app.post("/saved-searches", status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/saved-searches", status_code=status.HTTP_201_CREATED, dependencies=[Depends(_require_legacy_routes_enabled)]
+)
 def create_saved_search(
     data: SavedSearchCreate, service: SavedSearchService = Depends(get_saved_search_service)
 ) -> SavedSearchRead:
@@ -436,14 +450,14 @@ def create_saved_search(
     return SavedSearchRead.model_validate(saved_search)
 
 
-@app.get("/saved-searches")
+@app.get("/saved-searches", dependencies=[Depends(_require_legacy_routes_enabled)])
 def list_saved_searches(
     service: SavedSearchService = Depends(get_saved_search_service),
 ) -> list[SavedSearchRead]:
     return [SavedSearchRead.model_validate(s) for s in service.list_all()]
 
 
-@app.get("/saved-searches/{saved_search_id}")
+@app.get("/saved-searches/{saved_search_id}", dependencies=[Depends(_require_legacy_routes_enabled)])
 def get_saved_search(
     saved_search_id: int, service: SavedSearchService = Depends(get_saved_search_service)
 ) -> SavedSearchRead:
@@ -453,7 +467,7 @@ def get_saved_search(
     return SavedSearchRead.model_validate(saved_search)
 
 
-@app.patch("/saved-searches/{saved_search_id}")
+@app.patch("/saved-searches/{saved_search_id}", dependencies=[Depends(_require_legacy_routes_enabled)])
 def update_saved_search(
     saved_search_id: int,
     data: SavedSearchUpdate,
@@ -468,7 +482,11 @@ def update_saved_search(
     return SavedSearchRead.model_validate(saved_search)
 
 
-@app.delete("/saved-searches/{saved_search_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete(
+    "/saved-searches/{saved_search_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(_require_legacy_routes_enabled)],
+)
 def delete_saved_search(
     saved_search_id: int, service: SavedSearchService = Depends(get_saved_search_service)
 ) -> None:
@@ -476,7 +494,7 @@ def delete_saved_search(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Saved search not found")
 
 
-@app.post("/saved-searches/{saved_search_id}/run")
+@app.post("/saved-searches/{saved_search_id}/run", dependencies=[Depends(_require_legacy_routes_enabled)])
 def run_saved_search_now(
     saved_search_id: int,
     session: Session = Depends(get_db_session),

@@ -25,12 +25,23 @@ class SavedSearchRepository:
         self._session = session
 
     def create(
-        self, *, query: str, marketplaces: list[str], scan_interval_seconds: int, is_active: bool
+        self,
+        *,
+        query: str,
+        marketplaces: list[str],
+        scan_interval_seconds: int,
+        is_active: bool,
+        user_id: int | None = None,
     ) -> SavedSearch:
+        """`user_id` defaults to `None` (unowned) so every existing caller
+        that predates ownership enforcement - tests, the legacy dashboard
+        route - is unaffected. The protected `/api/v1` route is the one
+        caller that now always passes the authenticated user's id."""
         saved_search = SavedSearch(
             query=query,
             scan_interval_seconds=scan_interval_seconds,
             is_active=is_active,
+            user_id=user_id,
             marketplace_links=[SavedSearchMarketplace(marketplace_name=m) for m in marketplaces],
         )
         self._session.add(saved_search)

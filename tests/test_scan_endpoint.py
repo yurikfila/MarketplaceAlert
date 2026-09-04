@@ -1,7 +1,16 @@
+import pytest
+
 from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.notifications.base import NotificationError, NotificationProvider
 from marketplace_alert.core.notifications.service import NotificationService
 from marketplace_alert.main import app, get_notification_service
+
+
+@pytest.fixture(autouse=True)
+def _legacy_routes_enabled(with_legacy_routes_enabled) -> None:
+    """The whole file is about the legacy `/scan`/`/search` surface,
+    which is now opt-in-disabled by default - see config.py's
+    `legacy_routes_enabled` docstring."""
 
 
 def test_scan_first_request_returns_new_listing(client) -> None:

@@ -922,7 +922,7 @@ def test_one_failing_marketplace_does_not_affect_relevance_filtering_in_another(
 
 
 def test_scan_endpoint_filters_irrelevant_listings_before_persistence_and_notification(
-    client, fake_notification_provider, monkeypatch: pytest.MonkeyPatch
+    client, fake_notification_provider, monkeypatch: pytest.MonkeyPatch, with_legacy_routes_enabled
 ) -> None:
     import marketplace_alert.main as main_module
 
@@ -941,7 +941,7 @@ def test_scan_endpoint_filters_irrelevant_listings_before_persistence_and_notifi
 
 
 def test_scan_endpoint_does_not_persist_rejected_listings(
-    client, db_session, monkeypatch: pytest.MonkeyPatch
+    client, db_session, monkeypatch: pytest.MonkeyPatch, with_legacy_routes_enabled
 ) -> None:
     import marketplace_alert.main as main_module
 
@@ -965,7 +965,7 @@ def test_scan_endpoint_does_not_persist_rejected_listings(
 
 
 def test_legacy_run_now_endpoint_filters_irrelevant_listings(
-    client, db_session, monkeypatch: pytest.MonkeyPatch
+    client, db_session, monkeypatch: pytest.MonkeyPatch, with_legacy_routes_enabled
 ) -> None:
     """The legacy manual-run endpoint no longer sends synchronously - a
     relevant listing gets an outbox row instead (see SavedSearchRunner's
@@ -1000,6 +1000,11 @@ def test_mobile_run_now_endpoint_filters_irrelevant_listings(
     import marketplace_alert.api.v1.saved_searches as saved_searches_module
 
     monkeypatch.setattr(saved_searches_module, "get_connector", lambda name: FakeConnector(_mixed_listings()))
+
+    signup = client.post(
+        "/api/v1/auth/signup", json={"email": "relevance-tests@example.com", "password": "a-strong-password"}
+    )
+    client.headers["Authorization"] = f"Bearer {signup.json()['tokens']['access_token']}"
 
     created = client.post(
         "/api/v1/saved-searches",

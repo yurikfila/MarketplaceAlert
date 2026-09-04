@@ -10,16 +10,45 @@ real background scanner never starts during these tests either.
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy import select
 
 from marketplace_alert.config import settings
 from marketplace_alert.core.persistence.models import DiscoveredListing, PendingNotification
 
 
+@pytest.fixture(autouse=True)
+def _authenticated(client) -> dict:
+    """Every `/api/v1` saved-search and listings route now requires
+    authentication and ownership - sign up one real user per test and
+    attach its access token to every request the `client` fixture makes
+    for the rest of this test, rather than adding an `Authorization`
+    header to each individual call site. Harmless for the handful of
+    tests in this file that don't need auth (status/marketplaces) -
+    those routes simply ignore the header. Returns the signed-up user
+    body, for tests that need the id.
+    """
+    signup = client.post(
+        "/api/v1/auth/signup", json={"email": "api-v1-tests@example.com", "password": "a-strong-password"}
+    )
+    body = signup.json()
+    client.headers["Authorization"] = f"Bearer {body['tokens']['access_token']}"
+    return body["user"]
+
+
 def _create(client, **overrides):
     body = {"query": "Pokemon", "marketplaces": ["mock"], "scan_interval_seconds": 60, "is_active": True}
     body.update(overrides)
     return client.post("/api/v1/saved-searches", json=body)
+
+
+@pytest.fixture()
+def owned_saved_search_id(client, _authenticated) -> int:
+    """One saved search owned by `_authenticated`'s user - for listings
+    tests that just need some real, owned saved search to attribute a
+    manually-inserted listing to (via `_insert_listing`'s
+    `saved_search_id`), without caring about its query/marketplaces."""
+    return _create(client).json()["id"]
 
 
 # --- GET /api/v1/status -----------------------------------------------
@@ -358,21 +387,22 @@ def test_listings_empty_when_nothing_discovered(client) -> None:
     assert body["total_count"] == 0
 
 
-def test_listings_returns_discovered_rows_via_scan(client) -> None:
+def test_listings_via_legacy_scan_are_invisible_since_they_have_no_owning_search(
+    client, with_legacy_routes_enabled
+) -> None:
+    """`/scan` (mock-only, legacy - see PART 3) never attributes a
+    discovered listing to any saved search. Once `/api/v1/listings` is
+    ownership-scoped (an `INNER JOIN` through `discovered_by_saved_
+    search_id -> saved_searches.user_id`), a listing with no owning
+    search can never appear for anyone, regardless of who's asking - the
+    intended behavior (see PART 6), not a regression."""
     scan_response = client.get("/scan", params={"q": "Maccabi"})
     assert scan_response.json()["new_count"] == 1
 
     response = client.get("/api/v1/listings")
     assert response.status_code == 200
-    body = response.json()
-    assert body["total_count"] == 1
-    item = body["items"][0]
-    assert item["marketplace"] == "mock"
-    assert item["external_listing_id"] == "mock-001"
-    assert item["title"] == "Maccabi Tel Aviv Vintage Football Shirt"
-    assert item["listing_url"]
-    assert item["first_discovered_at"]
-    assert item["last_seen_at"]
+    assert response.json()["total_count"] == 0
+    assert response.json()["items"] == []
 
 
 def test_listings_persists_and_returns_product_fields_from_the_connector(client) -> None:
@@ -380,8 +410,12 @@ def test_listings_persists_and_returns_product_fields_from_the_connector(client)
     from whatever the connector actually returned at discovery time - the
     mock connector's "Maccabi" fixture has real values for every one of
     these, so they must round-trip through persistence and the API,
-    never come back null just because the field CAN be null in general."""
-    client.get("/scan", params={"q": "Maccabi"})
+    never come back null just because the field CAN be null in general.
+    Discovered via an owned saved-search run (not `/scan`, which never
+    attributes ownership and so is invisible via this now-scoped route -
+    see the test above)."""
+    created = _create(client, query="Maccabi", marketplaces=["mock"]).json()
+    client.post(f"/api/v1/saved-searches/{created['id']}/run")
 
     item = client.get("/api/v1/listings").json()["items"][0]
     assert item["price"] == 45.0
@@ -393,15 +427,20 @@ def test_listings_persists_and_returns_product_fields_from_the_connector(client)
     # The mock connector never sets Listing.created_at - genuinely absent,
     # not a bug - must stay null rather than falling back to something else.
     assert item["source_created_at"] is None
-    # /scan is the legacy, saved-search-independent endpoint - never
-    # attributed to any saved search.
-    assert item["saved_search_id"] is None
+    assert item["saved_search_id"] == created["id"]
 
 
-def test_listings_saved_search_id_is_null_for_fields_a_connector_did_not_return(client, db_session) -> None:
+def test_listings_optional_fields_stay_null_when_a_connector_did_not_provide_them(
+    client, db_session, owned_saved_search_id
+) -> None:
     """A field genuinely absent from a connector's response must stay
-    `null` end to end - never defaulted to 0/""/a guessed value."""
-    _insert_listing(db_session, marketplace="mock", external_id="bare", title="Bare listing")
+    `null` end to end - never defaulted to 0/""/a guessed value.
+    Attributed to an owned saved search so the row is visible at all
+    under ownership scoping - unrelated to what this test actually
+    checks (which optional fields stay null)."""
+    _insert_listing(
+        db_session, marketplace="mock", external_id="bare", title="Bare listing", saved_search_id=owned_saved_search_id
+    )
 
     item = client.get("/api/v1/listings").json()["items"][0]
     assert item["price"] is None
@@ -411,7 +450,7 @@ def test_listings_saved_search_id_is_null_for_fields_a_connector_did_not_return(
     assert item["condition"] is None
     assert item["image_url"] is None
     assert item["source_created_at"] is None
-    assert item["saved_search_id"] is None
+    assert item["saved_search_id"] == owned_saved_search_id
 
 
 def test_listings_records_which_saved_search_first_discovered_a_row(client) -> None:
@@ -427,20 +466,24 @@ def test_listings_records_which_saved_search_first_discovered_a_row(client) -> N
 
 
 def test_listings_filter_by_saved_search_id(client, db_session) -> None:
-    _insert_listing(db_session, marketplace="mock", external_id="a", title="A", saved_search_id=1)
-    _insert_listing(db_session, marketplace="mock", external_id="b", title="B", saved_search_id=2)
+    search_a = _create(client, query="Search A").json()["id"]
+    search_b = _create(client, query="Search B").json()["id"]
+    _insert_listing(db_session, marketplace="mock", external_id="a", title="A", saved_search_id=search_a)
+    _insert_listing(db_session, marketplace="mock", external_id="b", title="B", saved_search_id=search_b)
     _insert_listing(db_session, marketplace="mock", external_id="c", title="C", saved_search_id=None)
 
-    body = client.get("/api/v1/listings", params={"saved_search_id": 1}).json()
+    body = client.get("/api/v1/listings", params={"saved_search_id": search_a}).json()
     assert body["total_count"] == 1
     assert body["items"][0]["external_listing_id"] == "a"
 
 
-def test_listings_saved_search_id_matching_nothing_returns_empty_not_404(client, db_session) -> None:
+def test_listings_saved_search_id_matching_nothing_returns_empty_not_404(
+    client, db_session, owned_saved_search_id
+) -> None:
     """A filter value that matches no rows is a normal empty result, not
     an error - this endpoint never validates that the id refers to an
     existing saved search, only that it's structurally a positive int."""
-    _insert_listing(db_session, marketplace="mock", external_id="a", title="A", saved_search_id=1)
+    _insert_listing(db_session, marketplace="mock", external_id="a", title="A", saved_search_id=owned_saved_search_id)
 
     response = client.get("/api/v1/listings", params={"saved_search_id": 999999})
     assert response.status_code == 200
@@ -453,11 +496,11 @@ def test_listings_rejects_malformed_saved_search_id(client) -> None:
     assert client.get("/api/v1/listings", params={"saved_search_id": "not-a-number"}).status_code == 422
 
 
-def test_listings_filter_by_price_range(client, db_session) -> None:
-    _insert_listing(db_session, marketplace="mock", external_id="cheap", title="Cheap", price=10.0)
-    _insert_listing(db_session, marketplace="mock", external_id="mid", title="Mid", price=50.0)
-    _insert_listing(db_session, marketplace="mock", external_id="pricey", title="Pricey", price=500.0)
-    _insert_listing(db_session, marketplace="mock", external_id="unknown", title="No price", price=None)
+def test_listings_filter_by_price_range(client, db_session, owned_saved_search_id) -> None:
+    _insert_listing(db_session, marketplace="mock", external_id="cheap", title="Cheap", price=10.0, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="mid", title="Mid", price=50.0, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="pricey", title="Pricey", price=500.0, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="unknown", title="No price", price=None, saved_search_id=owned_saved_search_id)
 
     body = client.get("/api/v1/listings", params={"min_price": 20, "max_price": 100}).json()
     assert {item["external_listing_id"] for item in body["items"]} == {"mid"}
@@ -478,40 +521,45 @@ def test_listings_rejects_negative_price_bounds(client) -> None:
     assert client.get("/api/v1/listings", params={"max_price": -5}).status_code == 422
 
 
-def test_listings_filter_by_currency_is_case_insensitive(client, db_session) -> None:
-    _insert_listing(db_session, marketplace="mock", external_id="usd", title="USD item", currency="USD")
-    _insert_listing(db_session, marketplace="mock", external_id="eur", title="EUR item", currency="EUR")
+def test_listings_filter_by_currency_is_case_insensitive(client, db_session, owned_saved_search_id) -> None:
+    _insert_listing(db_session, marketplace="mock", external_id="usd", title="USD item", currency="USD", saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="eur", title="EUR item", currency="EUR", saved_search_id=owned_saved_search_id)
 
     body = client.get("/api/v1/listings", params={"currency": "usd"}).json()
     assert {item["external_listing_id"] for item in body["items"]} == {"usd"}
 
 
-def test_listings_filter_by_condition_is_exact_case_insensitive_match(client, db_session) -> None:
-    _insert_listing(db_session, marketplace="mock", external_id="new1", title="New item", condition="New")
-    _insert_listing(db_session, marketplace="mock", external_id="used1", title="Used item", condition="Used")
+def test_listings_filter_by_condition_is_exact_case_insensitive_match(client, db_session, owned_saved_search_id) -> None:
+    _insert_listing(db_session, marketplace="mock", external_id="new1", title="New item", condition="New", saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="used1", title="Used item", condition="Used", saved_search_id=owned_saved_search_id)
     _insert_listing(
-        db_session, marketplace="mock", external_id="renewed1", title="Renewed item", condition="Certified Renewed"
+        db_session,
+        marketplace="mock",
+        external_id="renewed1",
+        title="Renewed item",
+        condition="Certified Renewed",
+        saved_search_id=owned_saved_search_id,
     )
 
     body = client.get("/api/v1/listings", params={"condition": "new"}).json()
     assert {item["external_listing_id"] for item in body["items"]} == {"new1"}
 
 
-def test_listings_filter_by_location_is_case_insensitive_substring(client, db_session) -> None:
-    _insert_listing(db_session, marketplace="mock", external_id="tlv", title="Tel Aviv item", location="Tel Aviv, Israel")
-    _insert_listing(db_session, marketplace="mock", external_id="nyc", title="NYC item", location="New York, NY")
+def test_listings_filter_by_location_is_case_insensitive_substring(client, db_session, owned_saved_search_id) -> None:
+    _insert_listing(db_session, marketplace="mock", external_id="tlv", title="Tel Aviv item", location="Tel Aviv, Israel", saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="nyc", title="NYC item", location="New York, NY", saved_search_id=owned_saved_search_id)
 
     body = client.get("/api/v1/listings", params={"location": "israel"}).json()
     assert {item["external_listing_id"] for item in body["items"]} == {"tlv"}
 
 
-def test_listings_filter_by_discovered_time_window(client, db_session) -> None:
+def test_listings_filter_by_discovered_time_window(client, db_session, owned_saved_search_id) -> None:
     old = datetime.now(timezone.utc) - timedelta(days=3)
     mid = datetime.now(timezone.utc) - timedelta(days=1)
     recent = datetime.now(timezone.utc) - timedelta(minutes=5)
-    _insert_listing(db_session, marketplace="mock", external_id="old", title="Old", first_discovered_at=old)
-    _insert_listing(db_session, marketplace="mock", external_id="mid", title="Mid", first_discovered_at=mid)
-    _insert_listing(db_session, marketplace="mock", external_id="recent", title="Recent", first_discovered_at=recent)
+    _insert_listing(db_session, marketplace="mock", external_id="old", title="Old", first_discovered_at=old, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="mid", title="Mid", first_discovered_at=mid, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="recent", title="Recent", first_discovered_at=recent, saved_search_id=owned_saved_search_id)
 
     after = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
     body = client.get("/api/v1/listings", params={"discovered_after": after}).json()
@@ -522,11 +570,11 @@ def test_listings_filter_by_discovered_time_window(client, db_session) -> None:
     assert {item["external_listing_id"] for item in body["items"]} == {"old"}
 
 
-def test_listings_new_since_is_equivalent_to_discovered_after(client, db_session) -> None:
+def test_listings_new_since_is_equivalent_to_discovered_after(client, db_session, owned_saved_search_id) -> None:
     old = datetime.now(timezone.utc) - timedelta(hours=2)
     recent = datetime.now(timezone.utc) - timedelta(minutes=1)
-    _insert_listing(db_session, marketplace="mock", external_id="old", title="Old", first_discovered_at=old)
-    _insert_listing(db_session, marketplace="mock", external_id="recent", title="Recent", first_discovered_at=recent)
+    _insert_listing(db_session, marketplace="mock", external_id="old", title="Old", first_discovered_at=old, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="recent", title="Recent", first_discovered_at=recent, saved_search_id=owned_saved_search_id)
 
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
     body = client.get("/api/v1/listings", params={"new_since": cutoff}).json()
@@ -536,29 +584,29 @@ def test_listings_new_since_is_equivalent_to_discovered_after(client, db_session
 # --- listings: sort ------------------------------------------------------
 
 
-def test_listings_sort_oldest_first(client, db_session) -> None:
+def test_listings_sort_oldest_first(client, db_session, owned_saved_search_id) -> None:
     older = datetime.now(timezone.utc) - timedelta(hours=2)
     newer = datetime.now(timezone.utc) - timedelta(minutes=1)
-    _insert_listing(db_session, marketplace="mock", external_id="old", title="Old", first_discovered_at=older)
-    _insert_listing(db_session, marketplace="mock", external_id="new", title="New", first_discovered_at=newer)
+    _insert_listing(db_session, marketplace="mock", external_id="old", title="Old", first_discovered_at=older, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="new", title="New", first_discovered_at=newer, saved_search_id=owned_saved_search_id)
 
     body = client.get("/api/v1/listings", params={"sort": "oldest"}).json()
     assert [item["external_listing_id"] for item in body["items"]] == ["old", "new"]
 
 
-def test_listings_sort_price_asc_puts_null_price_last(client, db_session) -> None:
-    _insert_listing(db_session, marketplace="mock", external_id="mid", title="Mid", price=50.0)
-    _insert_listing(db_session, marketplace="mock", external_id="cheap", title="Cheap", price=10.0)
-    _insert_listing(db_session, marketplace="mock", external_id="unknown", title="Unknown", price=None)
+def test_listings_sort_price_asc_puts_null_price_last(client, db_session, owned_saved_search_id) -> None:
+    _insert_listing(db_session, marketplace="mock", external_id="mid", title="Mid", price=50.0, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="cheap", title="Cheap", price=10.0, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="unknown", title="Unknown", price=None, saved_search_id=owned_saved_search_id)
 
     body = client.get("/api/v1/listings", params={"sort": "price_asc"}).json()
     assert [item["external_listing_id"] for item in body["items"]] == ["cheap", "mid", "unknown"]
 
 
-def test_listings_sort_price_desc_puts_null_price_last(client, db_session) -> None:
-    _insert_listing(db_session, marketplace="mock", external_id="mid", title="Mid", price=50.0)
-    _insert_listing(db_session, marketplace="mock", external_id="pricey", title="Pricey", price=500.0)
-    _insert_listing(db_session, marketplace="mock", external_id="unknown", title="Unknown", price=None)
+def test_listings_sort_price_desc_puts_null_price_last(client, db_session, owned_saved_search_id) -> None:
+    _insert_listing(db_session, marketplace="mock", external_id="mid", title="Mid", price=50.0, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="pricey", title="Pricey", price=500.0, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="unknown", title="Unknown", price=None, saved_search_id=owned_saved_search_id)
 
     body = client.get("/api/v1/listings", params={"sort": "price_desc"}).json()
     assert [item["external_listing_id"] for item in body["items"]] == ["pricey", "mid", "unknown"]
@@ -569,11 +617,11 @@ def test_listings_rejects_invalid_sort(client) -> None:
     assert response.status_code == 422
 
 
-def test_listings_default_sort_is_newest(client, db_session) -> None:
+def test_listings_default_sort_is_newest(client, db_session, owned_saved_search_id) -> None:
     older = datetime.now(timezone.utc) - timedelta(hours=1)
     newer = datetime.now(timezone.utc)
-    _insert_listing(db_session, marketplace="mock", external_id="old", title="Old", first_discovered_at=older)
-    _insert_listing(db_session, marketplace="mock", external_id="new", title="New", first_discovered_at=newer)
+    _insert_listing(db_session, marketplace="mock", external_id="old", title="Old", first_discovered_at=older, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="new", title="New", first_discovered_at=newer, saved_search_id=owned_saved_search_id)
 
     body = client.get("/api/v1/listings").json()
     assert [item["external_listing_id"] for item in body["items"]] == ["new", "old"]
@@ -582,18 +630,18 @@ def test_listings_default_sort_is_newest(client, db_session) -> None:
 # --- listings: pagination metadata reflects the filtered set, not the whole table ---
 
 
-def test_listings_total_count_reflects_active_filters(client, db_session) -> None:
-    _insert_listing(db_session, marketplace="mock", external_id="a", title="A", price=10.0)
-    _insert_listing(db_session, marketplace="mock", external_id="b", title="B", price=999.0)
+def test_listings_total_count_reflects_active_filters(client, db_session, owned_saved_search_id) -> None:
+    _insert_listing(db_session, marketplace="mock", external_id="a", title="A", price=10.0, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="b", title="B", price=999.0, saved_search_id=owned_saved_search_id)
 
     body = client.get("/api/v1/listings", params={"max_price": 100}).json()
     assert body["total_count"] == 1
 
 
-def test_listings_pagination_limit_and_offset(client, db_session) -> None:
-    _insert_listing(db_session, marketplace="mock", external_id="a", title="Item A")
-    _insert_listing(db_session, marketplace="mock", external_id="b", title="Item B")
-    _insert_listing(db_session, marketplace="mock", external_id="c", title="Item C")
+def test_listings_pagination_limit_and_offset(client, db_session, owned_saved_search_id) -> None:
+    _insert_listing(db_session, marketplace="mock", external_id="a", title="Item A", saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="b", title="Item B", saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="c", title="Item C", saved_search_id=owned_saved_search_id)
 
     first_page = client.get("/api/v1/listings", params={"limit": 2, "offset": 0}).json()
     assert len(first_page["items"]) == 2
@@ -611,19 +659,19 @@ def test_listings_pagination_limit_and_offset(client, db_session) -> None:
     assert first_ids | second_ids == {"a", "b", "c"}
 
 
-def test_listings_sorted_newest_first(client, db_session) -> None:
+def test_listings_sorted_newest_first(client, db_session, owned_saved_search_id) -> None:
     older = datetime.now(timezone.utc) - timedelta(hours=2)
     newer = datetime.now(timezone.utc) - timedelta(minutes=1)
-    _insert_listing(db_session, marketplace="mock", external_id="old", title="Old", first_discovered_at=older)
-    _insert_listing(db_session, marketplace="mock", external_id="new", title="New", first_discovered_at=newer)
+    _insert_listing(db_session, marketplace="mock", external_id="old", title="Old", first_discovered_at=older, saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="mock", external_id="new", title="New", first_discovered_at=newer, saved_search_id=owned_saved_search_id)
 
     body = client.get("/api/v1/listings").json()
     assert [item["external_listing_id"] for item in body["items"]] == ["new", "old"]
 
 
-def test_listings_filter_by_marketplace(client, db_session) -> None:
-    _insert_listing(db_session, marketplace="mock", external_id="m1", title="Mock item")
-    _insert_listing(db_session, marketplace="etsy", external_id="e1", title="Etsy item")
+def test_listings_filter_by_marketplace(client, db_session, owned_saved_search_id) -> None:
+    _insert_listing(db_session, marketplace="mock", external_id="m1", title="Mock item", saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="etsy", external_id="e1", title="Etsy item", saved_search_id=owned_saved_search_id)
 
     response = client.get("/api/v1/listings", params={"marketplace": "etsy"})
     assert response.status_code == 200
@@ -638,10 +686,10 @@ def test_listings_rejects_invalid_marketplace_filter(client) -> None:
     assert response.status_code == 422
 
 
-def test_listings_filter_by_multiple_marketplaces(client, db_session) -> None:
-    _insert_listing(db_session, marketplace="mock", external_id="m1", title="Mock item")
-    _insert_listing(db_session, marketplace="etsy", external_id="e1", title="Etsy item")
-    _insert_listing(db_session, marketplace="ebay", external_id="eb1", title="eBay item")
+def test_listings_filter_by_multiple_marketplaces(client, db_session, owned_saved_search_id) -> None:
+    _insert_listing(db_session, marketplace="mock", external_id="m1", title="Mock item", saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="etsy", external_id="e1", title="Etsy item", saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="ebay", external_id="eb1", title="eBay item", saved_search_id=owned_saved_search_id)
 
     response = client.get("/api/v1/listings", params=[("marketplaces", "mock"), ("marketplaces", "etsy")])
     assert response.status_code == 200
@@ -657,9 +705,9 @@ def test_listings_rejects_invalid_marketplace_in_plural_filter(client) -> None:
     assert response.status_code == 422
 
 
-def test_listings_plural_marketplaces_absent_does_not_restrict_results(client, db_session) -> None:
-    _insert_listing(db_session, marketplace="mock", external_id="m1", title="Mock item")
-    _insert_listing(db_session, marketplace="etsy", external_id="e1", title="Etsy item")
+def test_listings_plural_marketplaces_absent_does_not_restrict_results(client, db_session, owned_saved_search_id) -> None:
+    _insert_listing(db_session, marketplace="mock", external_id="m1", title="Mock item", saved_search_id=owned_saved_search_id)
+    _insert_listing(db_session, marketplace="etsy", external_id="e1", title="Etsy item", saved_search_id=owned_saved_search_id)
 
     body = client.get("/api/v1/listings").json()
     assert body["total_count"] == 2
@@ -686,7 +734,7 @@ def test_error_responses_never_include_stack_traces(client) -> None:
     assert "site-packages" not in body_text
 
 
-def test_existing_legacy_routes_still_work_alongside_v1(client) -> None:
+def test_existing_legacy_routes_still_work_alongside_v1(client, with_legacy_routes_enabled) -> None:
     """Adding /api/v1 must not remove or break the existing surface."""
     created = _create(client, query="Legacy check").json()
     assert client.get("/").status_code == 200

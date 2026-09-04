@@ -73,6 +73,8 @@ from sqlalchemy.orm import Session
 
 from marketplace_alert.api.v1.schemas import ListingListResponse, ListingOut
 from marketplace_alert.connectors.registry import is_marketplace_supported
+from marketplace_alert.core.auth.dependencies import get_current_user
+from marketplace_alert.core.auth.models import User
 from marketplace_alert.core.persistence.database import get_db_session
 from marketplace_alert.core.persistence.models import DiscoveredListing
 from marketplace_alert.core.persistence.repository import ListingRepository, ListingSort
@@ -139,6 +141,7 @@ def list_listings(
         None, description="Alias for discovered_after - listings discovered at or after this time."
     ),
     sort: ListingSort = Query("newest", description="newest | oldest | price_asc | price_desc"),
+    current_user: User = Depends(get_current_user),
     session: Session = Depends(get_db_session),
 ) -> ListingListResponse:
     if marketplace is not None and not is_marketplace_supported(marketplace):
@@ -173,8 +176,10 @@ def list_listings(
     }
 
     repository = ListingRepository(session)
-    rows = repository.list_recent(limit=limit, offset=offset, sort=sort, new_since=new_since, **filters)
-    total_count = repository.count(new_since=new_since, **filters)
+    rows = repository.list_recent_owned(
+        user_id=current_user.id, limit=limit, offset=offset, sort=sort, new_since=new_since, **filters
+    )
+    total_count = repository.count_owned(user_id=current_user.id, new_since=new_since, **filters)
 
     return ListingListResponse(
         items=[_to_listing_out(row) for row in rows],

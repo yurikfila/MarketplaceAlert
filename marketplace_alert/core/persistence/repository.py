@@ -324,7 +324,23 @@ class ListingRepository:
     # cutover phase.
 
     def list_recent_owned(
-        self, *, user_id: int, limit: int, offset: int, sort: ListingSort = "newest"
+        self,
+        *,
+        user_id: int,
+        limit: int,
+        offset: int,
+        marketplace: str | None = None,
+        marketplaces: list[str] | None = None,
+        saved_search_id: int | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+        currency: str | None = None,
+        condition: str | None = None,
+        location: str | None = None,
+        discovered_after: datetime | None = None,
+        discovered_before: datetime | None = None,
+        new_since: datetime | None = None,
+        sort: ListingSort = "newest",
     ) -> list[DiscoveredListing]:
         """Listings attributable to a saved search this user owns -
         joins `discovered_by_saved_search_id -> saved_searches.id` and
@@ -336,25 +352,66 @@ class ListingRepository:
         the `user_id ==` filter too - both cases correctly excluded from
         every user's scoped view, never shown to anyone until a real
         owner is established.
+
+        Takes the exact same optional filters as `list_recent` - reuses
+        `_apply_filters()` on top of the ownership join, so a filter
+        never has to be implemented twice or drift between the unscoped
+        and owned query paths.
         """
-        stmt = (
+        stmt = self._apply_filters(
             select(DiscoveredListing)
             .join(SavedSearch, DiscoveredListing.discovered_by_saved_search_id == SavedSearch.id)
-            .where(SavedSearch.user_id == user_id)
-            .order_by(*self._sort_clause(sort))
-            .limit(limit)
-            .offset(offset)
+            .where(SavedSearch.user_id == user_id),
+            marketplace=marketplace,
+            marketplaces=marketplaces,
+            saved_search_id=saved_search_id,
+            min_price=min_price,
+            max_price=max_price,
+            currency=currency,
+            condition=condition,
+            location=location,
+            discovered_after=discovered_after,
+            discovered_before=discovered_before,
+            new_since=new_since,
         )
+        stmt = stmt.order_by(*self._sort_clause(sort)).limit(limit).offset(offset)
         return list(self._session.execute(stmt).scalars().all())
 
-    def count_owned(self, *, user_id: int) -> int:
-        """Total rows `list_recent_owned` would return across every page,
-        for pagination metadata - same join/filter, no limit/offset/sort."""
-        stmt = (
+    def count_owned(
+        self,
+        *,
+        user_id: int,
+        marketplace: str | None = None,
+        marketplaces: list[str] | None = None,
+        saved_search_id: int | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+        currency: str | None = None,
+        condition: str | None = None,
+        location: str | None = None,
+        discovered_after: datetime | None = None,
+        discovered_before: datetime | None = None,
+        new_since: datetime | None = None,
+    ) -> int:
+        """Total rows `list_recent_owned` would return across every page
+        with the same filters applied, for pagination metadata - same
+        join/filter, no limit/offset/sort."""
+        stmt = self._apply_filters(
             select(func.count())
             .select_from(DiscoveredListing)
             .join(SavedSearch, DiscoveredListing.discovered_by_saved_search_id == SavedSearch.id)
-            .where(SavedSearch.user_id == user_id)
+            .where(SavedSearch.user_id == user_id),
+            marketplace=marketplace,
+            marketplaces=marketplaces,
+            saved_search_id=saved_search_id,
+            min_price=min_price,
+            max_price=max_price,
+            currency=currency,
+            condition=condition,
+            location=location,
+            discovered_after=discovered_after,
+            discovered_before=discovered_before,
+            new_since=new_since,
         )
         return self._session.execute(stmt).scalar_one()
 

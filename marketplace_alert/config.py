@@ -111,6 +111,21 @@ class Settings(BaseSettings):
     # idle periods, which an in-process background thread cannot survive.
     run_scanner_in_process: bool = True
 
+    # Gates the entire legacy, unauthenticated surface: the server-rendered
+    # dashboard (`GET /`, `GET /listings`), its backing `/saved-searches*`
+    # CRUD/run routes (`main.py` - `/static/dashboard.js` is the only thing
+    # that calls these), and the temporary mock-only `/search`/`/scan`
+    # endpoints. Secure by default: `False`, so a fresh deploy/environment
+    # never accidentally exposes this fully unauthenticated bypass around
+    # /api/v1's ownership enforcement (no ownership scoping, one operator-
+    # facing tool, never meant to be ownership-aware - see ARCHITECTURE.md
+    # "The management dashboard"). Set to `True` explicitly (env var, or a
+    # test's own isolated settings) only where the legacy dashboard is
+    # actually wanted - e.g. a local/dev environment. `GET /health` and
+    # every other harmless global-metadata route (`/docs`, `/openapi.json`,
+    # `/api/v1/status`, `/api/v1/marketplaces`) are never gated by this flag.
+    legacy_routes_enabled: bool = False
+
     # Automatic PostgreSQL migrations at app startup
     # (core/persistence/migrations.py) - added because Render's Free plan
     # has no Pre-Deploy Command to run `alembic upgrade head` as a

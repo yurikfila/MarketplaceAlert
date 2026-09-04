@@ -1,8 +1,17 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from marketplace_alert.main import app
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _legacy_routes_enabled(with_legacy_routes_enabled) -> None:
+    """Most of this file exercises the legacy dashboard/`/search` surface,
+    which is now opt-in-disabled by default - see config.py's
+    `legacy_routes_enabled` docstring. Harmless for `test_app_loads`,
+    which touches no route at all."""
 
 
 def test_app_loads() -> None:

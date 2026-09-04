@@ -23,6 +23,8 @@ from marketplace_alert.api.v1.schemas import (
     SavedSearchUpdate,
 )
 from marketplace_alert.connectors.registry import get_connector
+from marketplace_alert.core.auth.dependencies import get_current_user
+from marketplace_alert.core.auth.models import User
 from marketplace_alert.core.persistence.database import get_db_session
 from marketplace_alert.core.saved_searches.repository import SavedSearchRepository
 from marketplace_alert.core.saved_searches.runner import SavedSearchRunner
@@ -38,13 +40,15 @@ router = APIRouter(prefix="/saved-searches", tags=["Mobile API - Saved Searches"
     "",
     status_code=status.HTTP_201_CREATED,
     summary="Create a saved search",
-    description="Identical validation and behavior to the legacy `POST /saved-searches`.",
+    description="Identical validation and behavior to the legacy `POST /saved-searches`, owned by the authenticated user.",
 )
 def create_saved_search(
-    data: SavedSearchCreate, service: SavedSearchService = Depends(get_saved_search_service)
+    data: SavedSearchCreate,
+    current_user: User = Depends(get_current_user),
+    service: SavedSearchService = Depends(get_saved_search_service),
 ) -> SavedSearchRead:
     try:
-        saved_search = service.create(data)
+        saved_search = service.create(data, user_id=current_user.id)
     except UnsupportedMarketplaceError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
     return SavedSearchRead.model_validate(saved_search)
@@ -52,16 +56,19 @@ def create_saved_search(
 
 @router.get("", summary="List saved searches")
 def list_saved_searches(
+    current_user: User = Depends(get_current_user),
     service: SavedSearchService = Depends(get_saved_search_service),
 ) -> list[SavedSearchRead]:
-    return [SavedSearchRead.model_validate(s) for s in service.list_all()]
+    return [SavedSearchRead.model_validate(s) for s in service.list_owned(user_id=current_user.id)]
 
 
 @router.get("/{saved_search_id}", summary="Get one saved search")
 def get_saved_search(
-    saved_search_id: int, service: SavedSearchService = Depends(get_saved_search_service)
+    saved_search_id: int,
+    current_user: User = Depends(get_current_user),
+    service: SavedSearchService = Depends(get_saved_search_service),
 ) -> SavedSearchRead:
-    saved_search = service.get(saved_search_id)
+    saved_search = service.get_owned(saved_search_id, user_id=current_user.id)
     if saved_search is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Saved search not found")
     return SavedSearchRead.model_validate(saved_search)
@@ -78,10 +85,11 @@ def get_saved_search(
 def update_saved_search(
     saved_search_id: int,
     data: SavedSearchUpdate,
+    current_user: User = Depends(get_current_user),
     service: SavedSearchService = Depends(get_saved_search_service),
 ) -> SavedSearchRead:
     try:
-        saved_search = service.update(saved_search_id, data)
+        saved_search = service.update_owned(saved_search_id, user_id=current_user.id, data=data)
     except UnsupportedMarketplaceError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
     if saved_search is None:
@@ -95,9 +103,11 @@ def update_saved_search(
     summary="Delete a saved search",
 )
 def delete_saved_search(
-    saved_search_id: int, service: SavedSearchService = Depends(get_saved_search_service)
+    saved_search_id: int,
+    current_user: User = Depends(get_current_user),
+    service: SavedSearchService = Depends(get_saved_search_service),
 ) -> None:
-    if not service.delete(saved_search_id):
+    if not service.delete_owned(saved_search_id, user_id=current_user.id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Saved search not found")
 
 
@@ -117,9 +127,10 @@ def delete_saved_search(
 )
 def run_saved_search_now(
     saved_search_id: int,
+    current_user: User = Depends(get_current_user),
     session: Session = Depends(get_db_session),
 ) -> SavedSearchRunResult:
-    saved_search = SavedSearchRepository(session).get(saved_search_id)
+    saved_search = SavedSearchRepository(session).get_owned(saved_search_id, user_id=current_user.id)
     if saved_search is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Saved search not found")
     if not saved_search.is_active:

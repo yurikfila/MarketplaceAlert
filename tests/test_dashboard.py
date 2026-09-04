@@ -8,11 +8,21 @@ exercise the rendered page, not duplicate CRUD behavior already covered by
 tests/test_saved_searches_api.py.
 """
 
+import pytest
+
 from marketplace_alert.config import settings
 from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.notifications.base import NotificationProvider
 from marketplace_alert.core.notifications.service import NotificationService
 from marketplace_alert.main import app, get_notification_service
+
+
+@pytest.fixture(autouse=True)
+def _legacy_routes_enabled(with_legacy_routes_enabled) -> None:
+    """The whole file is about the legacy dashboard surface, which is now
+    opt-in-disabled by default (see config.py's `legacy_routes_enabled`
+    docstring) - enable it for every test here rather than the default
+    itself being weakened."""
 
 
 class DisabledNotificationProvider(NotificationProvider):

@@ -1,6 +1,14 @@
+import pytest
 from sqlalchemy import select
 
 from marketplace_alert.core.persistence.models import PendingNotification
+
+
+@pytest.fixture(autouse=True)
+def _legacy_routes_enabled(with_legacy_routes_enabled) -> None:
+    """The whole file is about the legacy `/saved-searches*` CRUD/run
+    surface, which is now opt-in-disabled by default - see config.py's
+    `legacy_routes_enabled` docstring."""
 
 
 def _create(client, **overrides):

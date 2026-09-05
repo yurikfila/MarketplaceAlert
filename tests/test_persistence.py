@@ -159,6 +159,73 @@ def test_repeated_scan_of_the_same_search_does_not_duplicate_attribution(db_sess
     ).count() == 1
 
 
+# =====================================================================
+# Phase 2D-BEHAVIOR: newly_attributed_listing_ids - the notification
+# enqueue trigger (see ListingDiscoveryResult's own docstring for why
+# this is deliberately not the same set as new_listing_ids)
+# =====================================================================
+
+
+def test_newly_attributed_listing_ids_contains_a_first_time_attribution(db_session) -> None:
+    service = ListingDiscoveryService(db_session)
+    result = service.process_listings([_listing(external_id="newly-attr-1")], saved_search_id=1)
+
+    row = ListingRepository(db_session).get("mock", "newly-attr-1")
+    assert result.newly_attributed_listing_ids == [row.id]
+
+
+def test_newly_attributed_listing_ids_is_empty_without_a_saved_search_id(db_session) -> None:
+    service = ListingDiscoveryService(db_session)
+    result = service.process_listings([_listing(external_id="no-search-1")])
+    assert result.newly_attributed_listing_ids == []
+
+
+def test_newly_attributed_listing_ids_excludes_a_repeated_scan_by_the_same_search(db_session) -> None:
+    """Mandatory regression (Phase 2D-BEHAVIOR, "no retroactive spam"): a
+    second `process_listings()` call for a search that already has an
+    attribution to this exact listing must not report it as newly
+    attributed a second time - `record_if_missing`'s own idempotency
+    (`created=False`) is what this list is built from."""
+    service = ListingDiscoveryService(db_session)
+    service.process_listings([_listing(external_id="repeat-attr-1")], saved_search_id=7)
+    second = service.process_listings([_listing(external_id="repeat-attr-1")], saved_search_id=7)
+
+    assert second.newly_attributed_listing_ids == []
+
+
+def test_newly_attributed_listing_ids_includes_a_second_searchs_first_match_on_an_existing_listing(db_session) -> None:
+    """The core bug Phase 2D exists to fix: a listing already discovered
+    by search 1 that search 2 matches for the very first time must still
+    be reported as newly attributed for search 2's own call - even
+    though the canonical listing itself is already-seen, not new."""
+    service = ListingDiscoveryService(db_session)
+    service.process_listings([_listing(external_id="shared-attr-1")], saved_search_id=1)
+    second = service.process_listings([_listing(external_id="shared-attr-1")], saved_search_id=2)
+
+    row = ListingRepository(db_session).get("mock", "shared-attr-1")
+    assert second.already_seen_count == 1
+    assert second.newly_attributed_listing_ids == [row.id]
+
+
+def test_newly_attributed_listing_ids_excludes_a_pre_existing_attribution_from_before_this_call(db_session) -> None:
+    """CRITICAL / mandatory regression proof: a `ListingAttribution` row
+    that already existed before this `process_listings()` call was ever
+    made (e.g. Phase 1's backfill, or any earlier scan run by different
+    code) must never be reported as newly attributed just because this
+    code path happens to run against it now - proves that deploying
+    Phase 2D-BEHAVIOR cannot generate a retroactive notification storm
+    for attributions that already existed."""
+    row, _ = ListingRepository(db_session).get_or_create(_listing(external_id="pre-existing-1"))
+    db_session.commit()
+    ListingAttributionRepository(db_session).record_if_missing(saved_search_id=99, discovered_listing_id=row.id)
+    db_session.commit()
+
+    service = ListingDiscoveryService(db_session)
+    result = service.process_listings([_listing(external_id="pre-existing-1")], saved_search_id=99)
+
+    assert result.newly_attributed_listing_ids == []
+
+
 def test_concurrent_discovery_of_a_brand_new_listing_does_not_raise_and_shares_one_canonical_row(
     session_factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -764,6 +764,156 @@ def test_listing_already_marked_seen_does_not_get_a_second_outbox_row(db_session
     assert len(_pending_notification_listings(db_session)) == 1
 
 
+# --- Phase 2D-BEHAVIOR: enqueue driven by newly-created attribution,
+# never by attribution existence or global listing newness -----------------
+
+
+def test_pre_existing_attribution_does_not_generate_a_retroactive_notification(db_session) -> None:
+    """CRITICAL / mandatory regression: a saved search that already has a
+    `ListingAttribution` for a listing - e.g. from Phase 1's backfill, or
+    any scan that ran before this behavior shipped - must not suddenly
+    get a notification for it just because the search runs again
+    post-deployment. Only a *newly created* attribution
+    (`record_if_missing`'s own `created=True`) ever drives an enqueue -
+    see `ListingDiscoveryResult.newly_attributed_listing_ids`'s own
+    docstring. This is the exact proof that deploying Phase 2D-BEHAVIOR
+    cannot generate a retroactive notification storm for every
+    attribution that already exists today."""
+    from marketplace_alert.core.persistence.listing_attribution_repository import ListingAttributionRepository
+    from marketplace_alert.core.persistence.repository import ListingRepository
+
+    repository = SavedSearchRepository(db_session)
+    saved_search = repository.create(
+        query="Charizard", marketplaces=["good"], scan_interval_seconds=60, is_active=True
+    )
+    db_session.commit()
+
+    listing_row, _ = ListingRepository(db_session).get_or_create(_listing())
+    db_session.commit()
+    ListingAttributionRepository(db_session).record_if_missing(
+        saved_search_id=saved_search.id, discovered_listing_id=listing_row.id
+    )
+    db_session.commit()
+
+    assert len(_pending_notification_listings(db_session)) == 0
+
+    runner = SavedSearchRunner(resolve_connector=lambda name: FakeConnector([_listing()]))
+    result = runner.run(db_session, saved_search)
+
+    assert result.results[0].new_count == 0  # globally already known
+    assert len(_pending_notification_listings(db_session)) == 0
+
+
+def test_a_second_users_first_match_on_an_existing_listing_generates_their_own_notification(
+    session_factory,
+) -> None:
+    """The core bug Phase 2D exists to fix: User A's search discovers a
+    listing first (global dedup means there's only one canonical
+    `DiscoveredListing` row). User B's *own* search matching that exact
+    same listing for the first time must still generate User B's own
+    notification - never silently dropped just because the canonical
+    listing already existed."""
+    from marketplace_alert.core.auth.models import User
+
+    setup_session = session_factory()
+    user_a = User(email="pos-case-a@example.com", password_hash="irrelevant-hash")
+    user_b = User(email="pos-case-b@example.com", password_hash="irrelevant-hash")
+    setup_session.add_all([user_a, user_b])
+    setup_session.commit()
+
+    repo = SavedSearchRepository(setup_session)
+    # Both must be genuine matches for `_listing()`'s "Pokemon Charizard"
+    # title (relevance filtering runs in the real runner path, unlike
+    # test_notification_outbox.py's enqueue-only helpers) - the queries
+    # only need to differ enough to be distinguishable searches, not to
+    # target different listings.
+    search_a = repo.create(
+        query="Charizard", marketplaces=["good"], scan_interval_seconds=60, is_active=True, user_id=user_a.id
+    )
+    search_b = repo.create(
+        query="Pokemon Charizard", marketplaces=["good"], scan_interval_seconds=60, is_active=True, user_id=user_b.id
+    )
+    setup_session.commit()
+    search_a_id, search_b_id = search_a.id, search_b.id
+    user_a_id, user_b_id = user_a.id, user_b.id
+    setup_session.close()
+
+    runner = SavedSearchRunner(resolve_connector=lambda name: FakeConnector([_listing()]))
+
+    run_a_session = session_factory()
+    runner.run_by_id(run_a_session, search_a_id)
+    run_a_session.commit()
+    run_a_session.close()
+
+    verify_after_a = session_factory()
+    assert verify_after_a.query(PendingNotification).count() == 1
+    assert verify_after_a.query(PendingNotification).one().user_id == user_a_id
+    verify_after_a.close()
+
+    run_b_session = session_factory()
+    runner.run_by_id(run_b_session, search_b_id)
+    run_b_session.commit()
+    run_b_session.close()
+
+    verify_session = session_factory()
+    notifications = verify_session.query(PendingNotification).all()
+    assert len(notifications) == 2
+    assert {n.user_id for n in notifications} == {user_a_id, user_b_id}
+    verify_session.close()
+
+
+def test_same_user_two_searches_matching_the_same_listing_produces_exactly_one_notification(
+    session_factory,
+) -> None:
+    """A single user with two saved searches, both matching the same
+    listing (two newly-created `ListingAttribution` rows), must get
+    exactly ONE notification - `NotificationOutboxRepository.enqueue()`'s
+    own idempotency by `(user_id, discovered_listing_id)` collapses the
+    second attempt, but both attribution rows must still exist (there is
+    no attribution-level dedup - `ListingAttribution`'s own uniqueness is
+    scoped per `saved_search_id`, not per user)."""
+    from marketplace_alert.core.auth.models import User
+    from marketplace_alert.core.persistence.listing_attribution_repository import ListingAttributionRepository
+    from marketplace_alert.core.persistence.repository import ListingRepository
+
+    setup_session = session_factory()
+    user = User(email="same-user-two-searches@example.com", password_hash="irrelevant-hash")
+    setup_session.add(user)
+    setup_session.commit()
+
+    repo = SavedSearchRepository(setup_session)
+    # Both must be genuine matches for `_listing()`'s "Pokemon Charizard"
+    # title - see the equivalent comment above for why.
+    search_1 = repo.create(
+        query="Charizard", marketplaces=["good"], scan_interval_seconds=60, is_active=True, user_id=user.id
+    )
+    search_2 = repo.create(
+        query="Pokemon Charizard", marketplaces=["good"], scan_interval_seconds=60, is_active=True, user_id=user.id
+    )
+    setup_session.commit()
+    search_1_id, search_2_id, user_id = search_1.id, search_2.id, user.id
+    setup_session.close()
+
+    runner = SavedSearchRunner(resolve_connector=lambda name: FakeConnector([_listing()]))
+
+    run_session = session_factory()
+    runner.run_by_id(run_session, search_1_id)
+    runner.run_by_id(run_session, search_2_id)
+    run_session.commit()
+    run_session.close()
+
+    verify_session = session_factory()
+    notifications = verify_session.query(PendingNotification).all()
+    assert len(notifications) == 1
+    assert notifications[0].user_id == user_id
+
+    listing_row = ListingRepository(verify_session).get("good", "item-1")
+    attribution_repo = ListingAttributionRepository(verify_session)
+    assert attribution_repo.get(saved_search_id=search_1_id, discovered_listing_id=listing_row.id) is not None
+    assert attribution_repo.get(saved_search_id=search_2_id, discovered_listing_id=listing_row.id) is not None
+    verify_session.close()
+
+
 # --- against a real ReverbMarketplaceConnector (httpx mocked, no network) --
 
 

@@ -35,7 +35,6 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
 
 from marketplace_alert.core.auth.models import User
 from marketplace_alert.core.models.listing import Listing
@@ -94,7 +93,7 @@ def _persist_and_enqueue(
     session = session_factory()
     try:
         row = ListingRepository(session).save_new(_listing(external_id), saved_search_id=saved_search_id)
-        notification = NotificationOutboxRepository(session).enqueue(row.id, user_id=user_id)
+        notification, _ = NotificationOutboxRepository(session).enqueue(row.id, user_id=user_id)
         session.commit()
         return notification.id
     finally:
@@ -232,26 +231,39 @@ def test_enqueue_is_not_committed_by_the_repository_itself(session_factory) -> N
     verify.close()
 
 
-def test_enqueue_twice_for_the_same_listing_and_same_user_violates_the_unique_constraint(session_factory) -> None:
-    """The dedup guarantee - "never queue the same (user, listing)
-    notification twice" - is enforced by the database (Phase 2D-SCHEMA:
-    `PendingNotification`'s composite `UNIQUE(user_id, discovered_
-    listing_id)`, replacing the original single-column constraint), not
-    just by callers happening to only enqueue once."""
+def test_enqueue_twice_for_the_same_listing_and_same_user_is_idempotent(session_factory) -> None:
+    """Phase 2D-BEHAVIOR: a second `enqueue()` for the exact same
+    `(user_id, discovered_listing_id)` identity is no longer an
+    IntegrityError bug waiting to happen - it's the expected, idempotent
+    outcome of the same user matching the same listing via a second
+    saved search (see `SavedSearchRunner`'s enqueue loop and
+    `test_same_user_two_searches_matching_the_same_listing_produces_
+    exactly_one_notification` below for that exact scenario end to end).
+    The pre-check inside `enqueue()` finds the existing row and returns
+    it unchanged, with `created=False` - never a second row, never an
+    exception (Phase 2D-SCHEMA's composite `UNIQUE(user_id, discovered_
+    listing_id)` constraint is still what backs this at the database
+    level; `enqueue()` now checks *before* inserting so a legitimate,
+    expected repeat call never has to rely on catching that constraint
+    violation as its normal path)."""
     user_id = _create_user(session_factory, "dedup-owner@example.com")
     session = session_factory()
     row = ListingRepository(session).save_new(_listing("dedup-1"))
     session.commit()
 
-    NotificationOutboxRepository(session).enqueue(row.id, user_id=user_id)
+    first, first_created = NotificationOutboxRepository(session).enqueue(row.id, user_id=user_id)
     session.commit()
+    assert first_created is True
 
-    # enqueue() flushes (see its docstring), so the UNIQUE violation
-    # surfaces immediately here, not at a later commit().
-    with pytest.raises(IntegrityError):
-        NotificationOutboxRepository(session).enqueue(row.id, user_id=user_id)
-    session.rollback()
+    second, second_created = NotificationOutboxRepository(session).enqueue(row.id, user_id=user_id)
+    assert second_created is False
+    assert second.id == first.id
+    session.commit()
     session.close()
+
+    verify = session_factory()
+    assert verify.query(PendingNotification).filter_by(discovered_listing_id=row.id).count() == 1
+    verify.close()
 
 
 def test_enqueue_twice_for_the_same_listing_with_null_user_is_allowed(session_factory) -> None:
@@ -259,7 +271,12 @@ def test_enqueue_twice_for_the_same_listing_with_null_user_is_allowed(session_fa
     `NULL` as equal to `NULL`, so two `user_id=None` enqueues for the
     exact same listing no longer collide - a deliberate consequence of
     the composite constraint, not a regression of the dedup guarantee
-    (which is now scoped per-user, not global - see the test above)."""
+    (which is now scoped per-user, not global - see the test above).
+    Phase 2D-BEHAVIOR: unlike the non-null path, `enqueue(user_id=None)`
+    is still a plain, unconditional insert - no pre-check, no idempotency
+    - so this legitimately still produces two independent rows (see
+    `enqueue()`'s own docstring for why that's the correct, deliberate
+    behavior rather than an oversight)."""
     session = session_factory()
     row = ListingRepository(session).save_new(_listing("dedup-null-1"))
     session.commit()
@@ -284,7 +301,7 @@ def test_enqueue_still_produces_a_row_with_user_id_null_by_default(session_facto
     `user_id` unset (`NULL`), since nothing writes it yet."""
     session = session_factory()
     row = ListingRepository(session).save_new(_listing("phase-2a-enqueue-1"))
-    notification = NotificationOutboxRepository(session).enqueue(row.id)
+    notification, _ = NotificationOutboxRepository(session).enqueue(row.id)
     session.commit()
 
     assert notification.user_id is None
@@ -298,7 +315,7 @@ def test_pending_notification_user_id_can_be_set_directly(session_factory) -> No
     user_id = _create_user(session_factory, "phase-2a-model@example.com")
     session = session_factory()
     row = ListingRepository(session).save_new(_listing("phase-2a-model-1"))
-    notification = NotificationOutboxRepository(session).enqueue(row.id)
+    notification, _ = NotificationOutboxRepository(session).enqueue(row.id)
     notification.user_id = user_id
     session.commit()
 
@@ -330,7 +347,7 @@ def test_deleting_the_user_sets_pending_notification_user_id_to_null(session_fac
 
     row = ListingRepository(session).save_new(_listing("phase-2a-setnull-1"))
     listing_id = row.id
-    notification = NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_id)
+    notification, _ = NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_id)
     session.commit()
     notification_id = notification.id
 
@@ -358,7 +375,7 @@ def test_enqueue_stamps_the_given_user_id_directly(session_factory) -> None:
     user_id = _create_user(session_factory, "phase-2b-stamp@example.com")
     session = session_factory()
     row = ListingRepository(session).save_new(_listing("phase-2b-stamp-1"))
-    notification = NotificationOutboxRepository(session).enqueue(row.id, user_id=user_id)
+    notification, _ = NotificationOutboxRepository(session).enqueue(row.id, user_id=user_id)
     session.commit()
 
     assert notification.user_id == user_id
@@ -466,6 +483,184 @@ def test_historical_null_user_id_notification_still_resolves_via_the_legacy_chai
 
     assert result.sent_count == 1
     assert provider.destinations == ["LEGACY-555"]
+
+
+# =====================================================================
+# Phase 2D-BEHAVIOR: two independent users can each be notified about
+# the exact same canonical listing - the actual fix for the global-
+# notification-dedup limitation. See SavedSearchRunner's enqueue loop
+# and NotificationOutboxRepository.enqueue()'s own docstrings. The
+# "newly attributed listing drives enqueue" half of this is covered at
+# the service/runner level in test_persistence.py and
+# test_saved_search_scheduler.py - these tests are about what happens
+# once two independent rows for the same listing actually exist: they
+# must claim, resolve, and complete completely independently.
+# =====================================================================
+
+
+def test_two_users_notified_for_the_same_listing_get_independent_rows_and_deliveries(session_factory) -> None:
+    """Two users, each matching the exact same canonical listing, must
+    each get their own independent `PendingNotification` row (distinct
+    PKs) that drains to their own destination - never merged, never
+    cross-routed."""
+    user_a = _create_user(session_factory, "two-users-same-listing-a@example.com")
+    user_b = _create_user(session_factory, "two-users-same-listing-b@example.com")
+    _set_telegram_preference(session_factory, user_a, "SAME-LISTING-AAA")
+    _set_telegram_preference(session_factory, user_b, "SAME-LISTING-BBB")
+
+    session = session_factory()
+    row = ListingRepository(session).save_new(_listing("two-users-same-listing-1"))
+    listing_id = row.id
+    notification_a, created_a = NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_a)
+    notification_b, created_b = NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_b)
+    session.commit()
+    session.close()
+
+    assert created_a is True
+    assert created_b is True
+    assert notification_a.id != notification_b.id
+
+    provider = RecordingProvider()
+    result = _drain(session_factory, provider)
+
+    assert result.claimed_count == 2
+    assert result.sent_count == 2
+    assert set(provider.destinations) == {"SAME-LISTING-AAA", "SAME-LISTING-BBB"}
+
+
+def test_two_users_same_listing_no_destination_for_a_does_not_block_b(session_factory) -> None:
+    """User A is a fully resolvable owner but hasn't configured a
+    Telegram destination yet (Case A - awaiting config, retried
+    indefinitely, never fails permanently). User B has a configured
+    destination. A's unresolved delivery must never block or affect B's
+    - each row is claimed, resolved, and completed independently."""
+    user_a = _create_user(session_factory, "isolation-no-dest-a@example.com")
+    user_b = _create_user(session_factory, "isolation-no-dest-b@example.com")
+    _set_telegram_preference(session_factory, user_b, "NO-DEST-BBB")
+    # user_a deliberately has no NotificationPreference row at all.
+
+    session = session_factory()
+    row = ListingRepository(session).save_new(_listing("isolation-no-dest-1"))
+    listing_id = row.id
+    NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_a)
+    notification_b, _ = NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_b)
+    session.commit()
+    notification_b_id = notification_b.id
+    session.close()
+
+    provider = RecordingProvider()
+    result = _drain(session_factory, provider)
+
+    assert result.claimed_count == 2
+    assert result.sent_count == 1
+    assert result.awaiting_destination_config_count == 1
+    assert provider.destinations == ["NO-DEST-BBB"]
+
+    verify = session_factory()
+    delivered = verify.get(PendingNotification, notification_b_id)
+    assert delivered.status == NOTIFICATION_STATUS_SENT
+    verify.close()
+
+
+def test_two_users_same_listing_telegram_failure_for_a_does_not_affect_b(session_factory) -> None:
+    """Both users have configured destinations; the provider fails only
+    for A's destination. B's notification must still succeed, and A's
+    failure/retry bookkeeping (attempt_count, last_error) must never
+    touch B's independent row - `complete()` operates strictly by
+    primary key, never by listing identity."""
+    user_a = _create_user(session_factory, "isolation-fail-a@example.com")
+    user_b = _create_user(session_factory, "isolation-fail-b@example.com")
+    _set_telegram_preference(session_factory, user_a, "FAIL-AAA")
+    _set_telegram_preference(session_factory, user_b, "FAIL-BBB")
+
+    session = session_factory()
+    row = ListingRepository(session).save_new(_listing("isolation-fail-1"))
+    listing_id = row.id
+    notification_a, _ = NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_a)
+    notification_b, _ = NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_b)
+    session.commit()
+    notification_a_id, notification_b_id = notification_a.id, notification_b.id
+    session.close()
+
+    class FailsForDestinationA(NotificationProvider):
+        @property
+        def is_enabled(self) -> bool:
+            return True
+
+        def send_listing_alert(self, listing: Listing, destination: str) -> None:
+            if destination == "FAIL-AAA":
+                raise NotificationError("simulated failure for A only")
+
+    result = _drain(session_factory, FailsForDestinationA())
+
+    assert result.claimed_count == 2
+    assert result.sent_count == 1
+    assert result.failed_count == 1  # A's delivery attempt errored this pass...
+
+    verify = session_factory()
+    row_a = verify.get(PendingNotification, notification_a_id)
+    row_b = verify.get(PendingNotification, notification_b_id)
+    assert row_a.status == NOTIFICATION_STATUS_PENDING
+    assert row_a.attempt_count == 1
+    assert row_a.last_error is not None
+    assert row_b.status == NOTIFICATION_STATUS_SENT
+    assert row_b.attempt_count == 1
+    assert row_b.last_error is None
+    verify.close()
+
+
+def test_concurrent_enqueue_for_the_same_user_and_listing_does_not_raise_and_shares_one_row(
+    session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulates the race directly - the same technique already used for
+    `ListingRepository.get_or_create` (see test_persistence.py's
+    `test_concurrent_discovery_of_a_brand_new_listing_does_not_raise_and_
+    shares_one_canonical_row`): two concurrent callers both check `get()`
+    and both see "no existing row yet" for the exact same `(user_id,
+    discovered_listing_id)` identity, then both attempt to insert.
+    Session A genuinely wins and commits first; session B's own
+    pre-check is forced to report the same stale "not found" it would
+    have gotten had it truly run a moment earlier - proving `enqueue()`
+    recovers via the SAVEPOINT + `IntegrityError` path instead of
+    raising an unhandled error out to the caller."""
+    user_id = _create_user(session_factory, "race-enqueue@example.com")
+
+    setup_session = session_factory()
+    row = ListingRepository(setup_session).save_new(_listing("race-enqueue-1"))
+    listing_id = row.id
+    setup_session.commit()
+    setup_session.close()
+
+    session_a = session_factory()
+    winner, winner_created = NotificationOutboxRepository(session_a).enqueue(listing_id, user_id=user_id)
+    session_a.commit()
+    session_a.close()
+    assert winner_created is True
+
+    session_b = session_factory()
+    repository_b = NotificationOutboxRepository(session_b)
+    real_get = repository_b.get
+    calls = {"count": 0}
+
+    def _stale_get(*, user_id, discovered_listing_id):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return None  # the stale read - as if B's check ran before A's commit
+        return real_get(user_id=user_id, discovered_listing_id=discovered_listing_id)
+
+    monkeypatch.setattr(repository_b, "get", _stale_get)
+
+    loser, loser_created = repository_b.enqueue(listing_id, user_id=user_id)
+    session_b.commit()
+    session_b.close()
+
+    assert loser_created is False
+    assert loser.id == winner.id
+
+    verify = session_factory()
+    matching = verify.query(PendingNotification).filter_by(user_id=user_id, discovered_listing_id=listing_id).all()
+    assert len(matching) == 1
+    verify.close()
 
 
 # =====================================================================

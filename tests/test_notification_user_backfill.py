@@ -49,7 +49,7 @@ def _listing(session, *, external_id: str, discovered_by_saved_search_id: int | 
 
 
 def _enqueue(session, discovered_listing_id: int, *, user_id: int | None = None) -> PendingNotification:
-    notification = NotificationOutboxRepository(session).enqueue(discovered_listing_id, user_id=user_id)
+    notification, _ = NotificationOutboxRepository(session).enqueue(discovered_listing_id, user_id=user_id)
     session.commit()
     return notification
 

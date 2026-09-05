@@ -139,14 +139,28 @@ class SavedSearchRunner:
             filter_result.relevant_listings, saved_search_id=saved_search.id
         )
         outbox = NotificationOutboxRepository(session)
-        for listing_id in discovery_result.new_listing_ids:
-            # Phase 2B of the multi-user notification outbox redesign:
-            # stamp the owning user directly, from the authenticated
+        # Phase 2D-BEHAVIOR: enqueue is driven by *this search's own newly
+        # created attribution* (`newly_attributed_listing_ids`), not by
+        # global listing newness (`new_listing_ids`) - the fix for the
+        # multi-user notification limitation (see `ListingDiscoveryResult
+        # .newly_attributed_listing_ids`'s own docstring for the full
+        # reasoning). Never queries or iterates historical `ListingAttribution`
+        # rows here, and never runs at startup - only a live scan's own
+        # `process_listings()` call can ever populate this list, which is
+        # exactly what makes deploying this code safe against generating
+        # a retroactive notification storm for attributions that already
+        # existed before this code ever ran.
+        for listing_id in discovery_result.newly_attributed_listing_ids:
+            # Stamp the owning user directly, from the authenticated
             # SavedSearch fact already in hand - never guessed from
             # listing title/query/content. `saved_search.user_id` is
             # `None` for legacy/unowned searches (pre-cutover, or a test
             # fixture that never set one); `enqueue()` accepts that as-is
             # rather than inventing an owner - see its own docstring.
+            # Idempotent by `(user_id, discovered_listing_id)` - the same
+            # user's second matching search for the same listing (also
+            # newly-attributed, via a *different* saved search) reuses
+            # the existing row rather than creating a duplicate.
             outbox.enqueue(listing_id, user_id=saved_search.user_id)
 
         logger.info(

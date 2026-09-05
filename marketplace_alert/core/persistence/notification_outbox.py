@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from marketplace_alert.core.models.listing import Listing
@@ -58,35 +59,86 @@ class NotificationOutboxRepository:
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def enqueue(self, discovered_listing_id: int, *, user_id: int | None = None) -> PendingNotification:
-        """Create a pending outbox row for a just-persisted listing.
+    def get(self, *, user_id: int | None, discovered_listing_id: int) -> PendingNotification | None:
+        """The row for this exact `(user_id, discovered_listing_id)`
+        identity, or `None` - the composite identity `enqueue()`'s own
+        idempotency is scoped to (Phase 2D-BEHAVIOR). `user_id.is_(None)`,
+        not `== None`: SQL `NULL = NULL` is never true, so an `==`
+        comparison here would silently match nothing for the legacy/
+        unowned-search case."""
+        stmt = select(PendingNotification).where(
+            PendingNotification.discovered_listing_id == discovered_listing_id
+        )
+        stmt = stmt.where(
+            PendingNotification.user_id.is_(None) if user_id is None else PendingNotification.user_id == user_id
+        )
+        return self._session.execute(stmt).scalar_one_or_none()
+
+    def enqueue(
+        self, discovered_listing_id: int, *, user_id: int | None = None
+    ) -> tuple[PendingNotification, bool]:
+        """Create a pending outbox row for `(user_id, discovered_listing_
+        id)` if one doesn't already exist - returns `(row, created)`,
+        where `created` is `True` only if *this* call is the one that
+        actually inserted it (Phase 2D-BEHAVIOR: matches `ListingRepository
+        .get_or_create`/`ListingAttributionRepository.record_if_missing`'s
+        identical idempotent-insert convention exactly).
 
         Called from `SavedSearchRunner`, in the *same* session/transaction
         as the listing's own insert - never commits itself (matches
         `ListingRepository.save_new()`'s convention: flush only, the
-        caller decides when to commit). The `UNIQUE` constraint on
-        `discovered_listing_id` (`PendingNotification`'s own definition)
-        is the actual dedup guarantee - this method doesn't need to check
-        for an existing row first, since a listing only ever reaches
-        "just persisted" once.
+        caller decides when to commit).
 
-        `user_id` (Phase 2B of the multi-user notification outbox
-        redesign) is the saved search's owner *at enqueue time*, stamped
-        directly onto the new row - see `PendingNotification.user_id`'s
-        own docstring. Defaults to `None`, both for legacy/unowned
-        searches (never guess an owner) and so every existing caller that
-        predates this parameter is unaffected. **Never overwrites an
-        existing row's `user_id`** - this method only ever inserts; if a
-        row already exists for `discovered_listing_id`, the `UNIQUE`
-        constraint rejects the second insert entirely (see
-        `test_enqueue_twice_for_the_same_listing_violates_the_unique_
-        constraint`), so there is no code path here that could ever
-        transfer or change an already-stamped owner.
+        **Idempotency is scoped to non-`NULL` `user_id` only** - for a
+        real, authenticated saved search, a second enqueue attempt for
+        the same `(user_id, discovered_listing_id)` pair (e.g. that
+        user's *second* saved search also newly-attributing the same
+        listing - see `SavedSearchRunner`) checks first, then attempts an
+        optimistic insert inside a SAVEPOINT (`session.begin_nested()`).
+        If a concurrent caller wins the race, the resulting `IntegrityError`
+        rolls back only that SAVEPOINT - never the caller's whole
+        transaction, which may already hold other successfully-processed
+        listings/attributions from earlier in the same scan - and this
+        method recovers by re-reading the row for that *exact*
+        `(user_id, discovered_listing_id)` pair and returning it, never
+        another user's row.
+
+        **`user_id=None` (legacy/unowned searches) is a plain, unconditional
+        insert - unchanged from before Phase 2D-BEHAVIOR, deliberately.**
+        The composite `UNIQUE(user_id, discovered_listing_id)` constraint
+        never treats `NULL` as colliding with `NULL` (see `PendingNotification`'s
+        own docstring), so there is no real per-identity dedup to enforce
+        for this case at the database level, and adding an artificial
+        application-only one here would only diverge from what the schema
+        itself actually guarantees. Every existing caller/test that enqueues
+        with `user_id=None` keeps its exact prior behavior.
+
+        Either way, **never overwrites an existing row's `user_id`** - the
+        non-null path only ever returns an existing row as-is or inserts a
+        brand new one; there is no code path that could transfer or change
+        an already-stamped owner.
         """
-        row = PendingNotification(discovered_listing_id=discovered_listing_id, user_id=user_id)
-        self._session.add(row)
-        self._session.flush()
-        return row
+        if user_id is None:
+            row = PendingNotification(discovered_listing_id=discovered_listing_id, user_id=None)
+            self._session.add(row)
+            self._session.flush()
+            return row, True
+
+        existing = self.get(user_id=user_id, discovered_listing_id=discovered_listing_id)
+        if existing is not None:
+            return existing, False
+
+        try:
+            with self._session.begin_nested():
+                row = PendingNotification(discovered_listing_id=discovered_listing_id, user_id=user_id)
+                self._session.add(row)
+                self._session.flush()
+            return row, True
+        except IntegrityError:
+            existing = self.get(user_id=user_id, discovered_listing_id=discovered_listing_id)
+            if existing is None:
+                raise
+            return existing, False
 
     def claim_batch(
         self, *, limit: int, lease_seconds: float, no_destination_retry_seconds: float

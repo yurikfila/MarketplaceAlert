@@ -602,3 +602,125 @@ def test_downgrade_one_revision_removes_only_listing_attributions(
     for table_name in ("users", "saved_searches", "discovered_listings", "notification_preferences"):
         assert table_name in tables
     assert "discovered_by_saved_search_id" in discovered_listing_columns
+
+
+def test_upgrade_head_adds_pending_notification_user_id_column(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Phase 2A of the multi-user notification outbox redesign: a
+    nullable `user_id` foreign key column on `pending_notifications`,
+    schema-only groundwork - confirms it's actually applied on a fresh
+    database, the foreign key's `ondelete` behavior is really `CASCADE`,
+    and the table's original `UNIQUE(discovered_listing_id)` constraint -
+    unchanged since this table was first created - survives the SQLite
+    batch-mode table recreation this migration requires."""
+    db_path = tmp_path / "alembic_pending_notification_user_id_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        columns = {col["name"]: col for col in inspector.get_columns("pending_notifications")}
+        foreign_keys = {fk["constrained_columns"][0]: fk for fk in inspector.get_foreign_keys("pending_notifications")}
+        unique_constraints = inspector.get_unique_constraints("pending_notifications")
+    finally:
+        engine.dispose()
+
+    assert "user_id" in columns
+    assert columns["user_id"]["nullable"] is True
+
+    assert "user_id" in foreign_keys
+    assert foreign_keys["user_id"]["referred_table"] == "users"
+    assert foreign_keys["user_id"]["options"].get("ondelete") == "CASCADE"
+
+    # The pre-existing FK to discovered_listings must survive untouched.
+    assert foreign_keys["discovered_listing_id"]["referred_table"] == "discovered_listings"
+    assert foreign_keys["discovered_listing_id"]["options"].get("ondelete") == "CASCADE"
+
+    # The sole identity this table has ever had - completely unchanged.
+    assert len(unique_constraints) == 1
+    assert unique_constraints[0]["column_names"] == ["discovered_listing_id"]
+
+
+def test_migration_preserves_existing_pending_notification_rows(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole point of an additive migration: a row that existed before
+    this migration ran must survive it completely unchanged, with
+    `user_id` simply `NULL` (unknown, not invented) - never lost, never
+    altered, never require a NOT NULL default that would fabricate an
+    owner for a row nothing knows the owner of yet."""
+    db_path = tmp_path / "alembic_pending_notification_migration_preserves_rows_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    # Upgrade to just before this migration, then insert a row exactly as
+    # production data would already exist - a real discovered_listings
+    # row plus its outbox row - before this migration has ever run.
+    command.upgrade(cfg, "a1c2e5f9b3d7")
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO discovered_listings "
+                "(marketplace, external_listing_id, title, listing_url, first_discovered_at, last_seen_at) "
+                "VALUES ('mock', 'pre-existing-1', 'Pre-existing listing', 'https://example.com/pre-existing-1', "
+                "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+            )
+        )
+        listing_id = conn.execute(sa.text("SELECT id FROM discovered_listings WHERE external_listing_id = 'pre-existing-1'")).scalar_one()
+        conn.execute(
+            sa.text(
+                "INSERT INTO pending_notifications "
+                "(discovered_listing_id, status, attempt_count, created_at) "
+                "VALUES (:listing_id, 'sent', 1, '2026-01-01T00:00:00+00:00')"
+            ),
+            {"listing_id": listing_id},
+        )
+    engine.dispose()
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text(
+                    "SELECT discovered_listing_id, status, attempt_count, user_id FROM pending_notifications "
+                    "WHERE discovered_listing_id = :listing_id"
+                ),
+                {"listing_id": listing_id},
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert row.discovered_listing_id == listing_id
+    assert row.status == "sent"
+    assert row.attempt_count == 1
+    assert row.user_id is None
+
+
+def test_downgrade_one_revision_removes_only_pending_notification_user_id(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Downgrading exactly one revision (this migration's own) must remove
+    only the `user_id` column/foreign key it added - the table itself,
+    every other column, and `UNIQUE(discovered_listing_id)` must survive."""
+    db_path = tmp_path / "alembic_pending_notification_user_id_downgrade_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+    command.downgrade(cfg, "a1c2e5f9b3d7")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        columns = {col["name"] for col in inspector.get_columns("pending_notifications")}
+        unique_constraints = inspector.get_unique_constraints("pending_notifications")
+    finally:
+        engine.dispose()
+
+    assert "pending_notifications" in tables
+    assert "user_id" not in columns
+    for column_name in ("id", "discovered_listing_id", "status", "attempt_count", "created_at"):
+        assert column_name in columns
+    assert len(unique_constraints) == 1
+    assert unique_constraints[0]["column_names"] == ["discovered_listing_id"]

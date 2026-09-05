@@ -288,6 +288,16 @@ class PendingNotification(Base):
     notification twice" - is a hard guarantee: enforced by the `UNIQUE`
     constraint on `discovered_listing_id` below, not just by callers
     happening to only enqueue once.
+
+    **Phase 2A note (multi-user notification outbox redesign)**: `user_id`
+    below is schema-only groundwork - nullable, unwritten, unread by any
+    code path yet. `discovered_listing_id` remains the sole `UNIQUE`
+    identity for this table; ownership is still resolved exactly as
+    before, via `discovered_listing_id -> DiscoveredListing.discovered_by_
+    saved_search_id -> SavedSearch.user_id` (see `core/notifications/
+    outbox.py`'s `resolve_destination`). Writing this column, backfilling
+    it, and changing the uniqueness constraint are explicitly later,
+    separate phases - see that column's own docstring for why.
     """
 
     __tablename__ = "pending_notifications"
@@ -300,10 +310,29 @@ class PendingNotification(Base):
     # the listing itself is ever removed (e.g. by the historical
     # relevance cleanup script), an unsent notification about it is
     # meaningless and should go with it.
+    #
+    # Phase 2A: still the only UNIQUE identity this table has. Multi-user
+    # notification delivery needs this to eventually become (or be
+    # replaced by) something scoped per-user (see `user_id` below) - not
+    # done here. Changing this constraint is explicitly a later phase.
     discovered_listing_id: Mapped[int] = mapped_column(
         ForeignKey("discovered_listings.id", ondelete="CASCADE", name="fk_pending_notifications_discovered_listing_id"),
         nullable=False,
         unique=True,
+    )
+
+    # Phase 2A schema-only groundwork for multi-user notification
+    # delivery (see this model's own docstring) - nullable, and nothing
+    # in this codebase writes or reads it yet. `ON DELETE CASCADE`: if the
+    # user is ever deleted, a notification intended for them is
+    # meaningless and should go with it (same reasoning as `Notification
+    # Preference.user_id`). Deliberately left unindexed for now, matching
+    # `DiscoveredListing.metadata_backfill_status`'s own precedent of
+    # deferring an index until there's an actual query that needs it -
+    # nothing queries by this column yet, since nothing writes it yet.
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE", name="fk_pending_notifications_user_id"),
+        nullable=True,
     )
 
     # Indexed - every drain run's claim query filters on this column

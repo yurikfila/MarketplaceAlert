@@ -34,6 +34,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from marketplace_alert.core.auth.models import User
@@ -220,6 +221,74 @@ def test_enqueue_twice_for_the_same_listing_violates_the_unique_constraint(sessi
     with pytest.raises(IntegrityError):
         NotificationOutboxRepository(session).enqueue(row.id)
     session.rollback()
+    session.close()
+
+
+# =====================================================================
+# Phase 2A: pending_notifications.user_id - schema-only groundwork,
+# zero runtime behavior change (see PendingNotification's own docstring).
+# =====================================================================
+
+
+def test_enqueue_still_produces_a_row_with_user_id_null_by_default(session_factory) -> None:
+    """Zero behavior change: `enqueue()`'s signature and behavior are
+    completely untouched by Phase 2A - a freshly enqueued row still has
+    `user_id` unset (`NULL`), since nothing writes it yet."""
+    session = session_factory()
+    row = ListingRepository(session).save_new(_listing("phase-2a-enqueue-1"))
+    notification = NotificationOutboxRepository(session).enqueue(row.id)
+    session.commit()
+
+    assert notification.user_id is None
+    session.close()
+
+
+def test_pending_notification_user_id_can_be_set_directly(session_factory) -> None:
+    """The column itself is usable and nullable - proven at the model
+    level, independent of the fact that no current code path writes it
+    yet (that's a later phase)."""
+    user_id = _create_user(session_factory, "phase-2a-model@example.com")
+    session = session_factory()
+    row = ListingRepository(session).save_new(_listing("phase-2a-model-1"))
+    notification = NotificationOutboxRepository(session).enqueue(row.id)
+    notification.user_id = user_id
+    session.commit()
+
+    verify = session_factory()
+    persisted = verify.get(PendingNotification, notification.id)
+    assert persisted.user_id == user_id
+    verify.close()
+
+
+def test_deleting_the_user_cascades_to_a_pending_notification_that_references_them(session_factory) -> None:
+    """SQLite ignores `ON DELETE CASCADE` (and every other FK constraint)
+    unless `PRAGMA foreign_keys=ON` is issued per-connection - production
+    runs Postgres, which always enforces it, so this pragma is only here
+    to make SQLite behave like production for this one assertion (same
+    approach already used for `NotificationPreference`'s and `Listing
+    Attribution`'s equivalent cascade tests). Exercises the FK's declared
+    `ondelete` behavior even though nothing writes `user_id` yet - the
+    constraint itself must already behave correctly, ahead of any code
+    relying on it."""
+    session = session_factory()
+    session.execute(text("PRAGMA foreign_keys=ON"))
+
+    user = User(email="phase-2a-cascade@example.com", password_hash="irrelevant-hash")
+    session.add(user)
+    session.commit()
+
+    row = ListingRepository(session).save_new(_listing("phase-2a-cascade-1"))
+    notification = NotificationOutboxRepository(session).enqueue(row.id)
+    notification.user_id = user.id
+    session.commit()
+    notification_id = notification.id
+
+    session.delete(user)
+    session.commit()
+
+    assert session.query(PendingNotification).filter_by(id=notification_id).count() == 0
+    # The canonical listing itself must survive - only the notification row is gone.
+    assert session.query(DiscoveredListing).filter_by(id=row.id).count() == 1
     session.close()
 
 

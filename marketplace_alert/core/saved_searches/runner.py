@@ -140,7 +140,14 @@ class SavedSearchRunner:
         )
         outbox = NotificationOutboxRepository(session)
         for listing_id in discovery_result.new_listing_ids:
-            outbox.enqueue(listing_id)
+            # Phase 2B of the multi-user notification outbox redesign:
+            # stamp the owning user directly, from the authenticated
+            # SavedSearch fact already in hand - never guessed from
+            # listing title/query/content. `saved_search.user_id` is
+            # `None` for legacy/unowned searches (pre-cutover, or a test
+            # fixture that never set one); `enqueue()` accepts that as-is
+            # rather than inventing an owner - see its own docstring.
+            outbox.enqueue(listing_id, user_id=saved_search.user_id)
 
         logger.info(
             "Saved search %s / %s: %d new, %d already seen (%d raw, %d rejected as not relevant)",

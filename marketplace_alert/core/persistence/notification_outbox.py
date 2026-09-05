@@ -34,16 +34,21 @@ class ClaimedNotification:
     the time this is used the claiming session has already committed (see
     `NotificationOutboxRepository.claim_batch`'s docstring).
 
-    `discovered_by_saved_search_id` is carried through so the drain loop
-    (`core/notifications/outbox.py`) can resolve which user owns this
-    notification - the same column `claim_batch` already joins against, so
-    capturing it here costs nothing extra. `None` means "no discovering
-    search" (e.g. a legacy `/scan`-discovered listing) - a notification
-    that can never be routed to anyone, see that module's "SECURITY RULE".
+    `user_id` (Phase 2B of the multi-user notification outbox redesign) is
+    the row's own stamped owner, straight from `PendingNotification.
+    user_id` - `None` for historical rows enqueued before this column
+    existed. `discovered_by_saved_search_id` is carried through *in
+    addition to* `user_id`, not replaced by it - the drain loop
+    (`core/notifications/outbox.py`) still needs it as the fallback
+    resolution path for exactly those historical `user_id IS NULL` rows.
+    `None` here means "no discovering search" (e.g. a legacy `/scan`-
+    discovered listing) - a notification that can never be routed to
+    anyone via the fallback, see that module's "SECURITY RULE".
     """
 
     notification_id: int
     listing: Listing
+    user_id: int | None
     discovered_by_saved_search_id: int | None
 
 
@@ -53,19 +58,32 @@ class NotificationOutboxRepository:
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def enqueue(self, discovered_listing_id: int) -> PendingNotification:
+    def enqueue(self, discovered_listing_id: int, *, user_id: int | None = None) -> PendingNotification:
         """Create a pending outbox row for a just-persisted listing.
 
-        Called from `ListingDiscoveryService.process_listings()`, in the
-        *same* session/transaction as the listing's own insert - never
-        commits itself (matches `ListingRepository.save_new()`'s
-        convention: flush only, the caller decides when to commit). The
-        `UNIQUE` constraint on `discovered_listing_id`
-        (`PendingNotification`'s own definition) is the actual dedup
-        guarantee - this method doesn't need to check for an existing row
-        first, since a listing only ever reaches "just persisted" once.
+        Called from `SavedSearchRunner`, in the *same* session/transaction
+        as the listing's own insert - never commits itself (matches
+        `ListingRepository.save_new()`'s convention: flush only, the
+        caller decides when to commit). The `UNIQUE` constraint on
+        `discovered_listing_id` (`PendingNotification`'s own definition)
+        is the actual dedup guarantee - this method doesn't need to check
+        for an existing row first, since a listing only ever reaches
+        "just persisted" once.
+
+        `user_id` (Phase 2B of the multi-user notification outbox
+        redesign) is the saved search's owner *at enqueue time*, stamped
+        directly onto the new row - see `PendingNotification.user_id`'s
+        own docstring. Defaults to `None`, both for legacy/unowned
+        searches (never guess an owner) and so every existing caller that
+        predates this parameter is unaffected. **Never overwrites an
+        existing row's `user_id`** - this method only ever inserts; if a
+        row already exists for `discovered_listing_id`, the `UNIQUE`
+        constraint rejects the second insert entirely (see
+        `test_enqueue_twice_for_the_same_listing_violates_the_unique_
+        constraint`), so there is no code path here that could ever
+        transfer or change an already-stamped owner.
         """
-        row = PendingNotification(discovered_listing_id=discovered_listing_id)
+        row = PendingNotification(discovered_listing_id=discovered_listing_id, user_id=user_id)
         self._session.add(row)
         self._session.flush()
         return row
@@ -143,6 +161,7 @@ class NotificationOutboxRepository:
                 ClaimedNotification(
                     notification_id=notification.id,
                     listing=_to_listing(listing_row),
+                    user_id=notification.user_id,
                     discovered_by_saved_search_id=listing_row.discovered_by_saved_search_id,
                 )
             )

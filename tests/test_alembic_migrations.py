@@ -608,8 +608,10 @@ def test_upgrade_head_adds_pending_notification_user_id_column(tmp_path, monkeyp
     """Phase 2A of the multi-user notification outbox redesign: a
     nullable `user_id` foreign key column on `pending_notifications`,
     schema-only groundwork - confirms it's actually applied on a fresh
-    database, the foreign key's `ondelete` behavior is really `CASCADE`,
-    and the table's original `UNIQUE(discovered_listing_id)` constraint -
+    database, the foreign key's `ondelete` behavior is really `SET NULL`
+    (preserving delivery/retry history if the user is later deleted -
+    see the model's own docstring for the full reasoning), and the
+    table's original `UNIQUE(discovered_listing_id)` constraint -
     unchanged since this table was first created - survives the SQLite
     batch-mode table recreation this migration requires."""
     db_path = tmp_path / "alembic_pending_notification_user_id_test.db"
@@ -631,7 +633,7 @@ def test_upgrade_head_adds_pending_notification_user_id_column(tmp_path, monkeyp
 
     assert "user_id" in foreign_keys
     assert foreign_keys["user_id"]["referred_table"] == "users"
-    assert foreign_keys["user_id"]["options"].get("ondelete") == "CASCADE"
+    assert foreign_keys["user_id"]["options"].get("ondelete") == "SET NULL"
 
     # The pre-existing FK to discovered_listings must survive untouched.
     assert foreign_keys["discovered_listing_id"]["referred_table"] == "discovered_listings"

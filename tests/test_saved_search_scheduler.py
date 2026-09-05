@@ -132,6 +132,58 @@ def test_scanner_runs_due_search_and_notifies_new_listing(session_factory) -> No
     verify_session.close()
 
 
+def test_scanner_stamps_the_owning_saved_searchs_user_id_on_a_new_notification(session_factory) -> None:
+    """Phase 2B: a globally-new listing discovered by an *owned* saved
+    search must have its `pending_notifications` row stamped with that
+    search's `user_id` directly - the authenticated fact already in
+    hand, never guessed from the listing's title/query/content."""
+    from marketplace_alert.core.auth.models import User
+
+    setup_session = session_factory()
+    user = User(email="scanner-stamp@example.com", password_hash="irrelevant-hash")
+    setup_session.add(user)
+    setup_session.commit()
+    saved_search = SavedSearchRepository(setup_session).create(
+        query="Charizard", marketplaces=["good"], scan_interval_seconds=60, is_active=True, user_id=user.id
+    )
+    setup_session.commit()
+    user_id, saved_search_id = user.id, saved_search.id
+    setup_session.close()
+
+    runner = SavedSearchRunner(resolve_connector=lambda name: FakeConnector([_listing()]))
+    scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
+
+    scanner.run_due_searches()
+
+    verify_session = session_factory()
+    notification = verify_session.query(PendingNotification).one()
+    assert notification.user_id == user_id
+    verify_session.close()
+
+
+def test_scanner_leaves_user_id_null_for_an_unowned_saved_search(session_factory) -> None:
+    """The other half of the same requirement: an unowned saved search
+    (legacy/test path, `user_id IS NULL`) must never have an owner
+    fabricated for its notifications - `enqueue()` receives exactly
+    `saved_search.user_id` (`None` here), preserved as-is."""
+    setup_session = session_factory()
+    SavedSearchRepository(setup_session).create(
+        query="Charizard", marketplaces=["good"], scan_interval_seconds=60, is_active=True
+    )
+    setup_session.commit()
+    setup_session.close()
+
+    runner = SavedSearchRunner(resolve_connector=lambda name: FakeConnector([_listing()]))
+    scanner = BackgroundScanner(session_factory=session_factory, runner=runner, run_guard=SavedSearchRunGuard())
+
+    scanner.run_due_searches()
+
+    verify_session = session_factory()
+    notification = verify_session.query(PendingNotification).one()
+    assert notification.user_id is None
+    verify_session.close()
+
+
 def test_scanner_runs_due_searches_belonging_to_multiple_different_users(session_factory) -> None:
     """The scheduler must remain fully unscoped - see the ownership-
     enforcement phase's scheduler requirement: it processes every due

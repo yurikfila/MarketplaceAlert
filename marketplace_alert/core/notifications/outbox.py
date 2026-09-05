@@ -37,12 +37,23 @@ pending rows, send, mark sent" in one transaction):
    `notification_max_attempts`) on failure. Committed immediately.
 
 **SECURITY RULE - per-user notification routing, never a global
-fallback.** Each notification's destination is resolved independently via
-`PendingNotification -> DiscoveredListing -> discovered_by_saved_search_id
--> SavedSearch -> user_id -> NotificationPreference -> telegram_chat_id` -
-the same ownership join already proven by the saved-searches/listings
-ownership-enforcement phase. If ownership cannot be resolved at any hop
-(no discovering search, an unowned search, no preference row, or an empty
+fallback.** Each notification's destination is resolved independently, via
+one of two paths (Phase 2B of the multi-user notification outbox
+redesign - see `resolve_destination`'s own docstring for the full
+reasoning):
+
+1. **Stamped, preferred**: `PendingNotification.user_id` (set directly at
+   enqueue time, see `NotificationOutboxRepository.enqueue`) -> straight
+   to `NotificationPreference -> telegram_chat_id`. No dependency on
+   `SavedSearch` still existing.
+2. **Legacy fallback, for historical rows enqueued before `user_id`
+   existed**: `PendingNotification -> DiscoveredListing -> discovered_by_
+   saved_search_id -> SavedSearch -> user_id -> NotificationPreference ->
+   telegram_chat_id` - the original ownership join already proven by the
+   saved-searches/listings ownership-enforcement phase, unchanged.
+
+If ownership cannot be resolved via either path (no stamped `user_id` and
+no discovering search, an unowned search, no preference row, or an empty
 `telegram_chat_id`), the notification is **never** delivered to the
 legacy global `TELEGRAM_CHAT_ID`, or to any other user's destination -
 `resolve_destination` returns a `ResolvedDestination` with `destination is
@@ -204,47 +215,65 @@ def claim_due_notifications(
 
 
 def resolve_destination(
-    session_factory: Callable[[], Session], *, discovered_by_saved_search_id: int | None
+    session_factory: Callable[[], Session],
+    *,
+    user_id: int | None,
+    discovered_by_saved_search_id: int | None,
 ) -> ResolvedDestination:
-    """Resolves the Telegram chat id belonging to the user who owns the
-    saved search that discovered this listing - see this module's
-    "SECURITY RULE" docstring section. Never returns a global default.
+    """Resolves the Telegram chat id belonging to the user this
+    notification is for - see this module's "SECURITY RULE" docstring
+    section. Never returns a global default.
 
-    Distinguishes *why* a destination couldn't be resolved, in two steps:
+    **Phase 2B: two resolution paths, stamped `user_id` preferred.**
 
-    1. Resolve the owner (`SavedSearch.user_id`). This fails - Case B,
-       `NOTIFICATION_ERROR_OWNER_UNRESOLVED` - if `discovered_by_saved_
-       search_id` is `None` (e.g. a legacy `/scan`-discovered listing,
-       never tied to any saved search), the saved search no longer exists
-       (deleted after this notification was claimed - a narrow, real
-       race, safe to treat the same as "never existed"), or it exists but
-       has no owner yet (`user_id IS NULL`, pre-cutover, not yet
-       backfilled). None of these can ever resolve themselves by waiting.
-    2. If the owner *is* resolved, look up their `NotificationPreference`.
-       No row at all, or one with `telegram_chat_id IS NULL`/empty (never
-       configured, or explicitly cleared) - Case A,
-       `NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG`. This is exactly
-       the case that's plausibly temporary and retried indefinitely
-       (throttled) rather than ever failing permanently - see the module
-       docstring.
+    1. If `user_id` is already known (stamped directly onto the
+       `PendingNotification` row at enqueue time - see `Notification
+       OutboxRepository.enqueue`), it's used immediately, with no lookup
+       through `SavedSearch` at all. This is what makes a stamped
+       notification's destination resolution independent of whether its
+       originating saved search still exists - if that search is deleted
+       *after* enqueue, this path is completely unaffected by it.
+    2. If `user_id` is `None` (a historical row enqueued before this
+       column existed), falls back to the exact original chain: resolve
+       the owner via `SavedSearch.user_id` for `discovered_by_saved_
+       search_id`. This fails - Case B, `NOTIFICATION_ERROR_OWNER_
+       UNRESOLVED` - if `discovered_by_saved_search_id` is `None` (e.g. a
+       legacy `/scan`-discovered listing), the saved search no longer
+       exists (deleted after this notification was claimed - a narrow,
+       real race, safe to treat the same as "never existed"), or it
+       exists but has no owner yet (`user_id IS NULL`, pre-cutover). None
+       of these can ever resolve themselves by waiting. Both "no `user_id`
+       and no `discovered_by_saved_search_id` at all" are checked before
+       ever opening a session - there is nothing a database round-trip
+       could resolve in that case.
+
+    Once an owner is resolved (via either path), the same second step
+    applies: look up their `NotificationPreference`. No row at all, or
+    one with `telegram_chat_id IS NULL`/empty (never configured, or
+    explicitly cleared) - Case A, `NOTIFICATION_ERROR_AWAITING_
+    DESTINATION_CONFIG`. This is exactly the case that's plausibly
+    temporary and retried indefinitely (throttled) rather than ever
+    failing permanently - see the module docstring.
 
     Opens and closes its own short session - same "no lock held during
     delivery" discipline as `claim_due_notifications`/
     `complete_notification` (see this module's docstring).
     """
-    if discovered_by_saved_search_id is None:
+    if user_id is None and discovered_by_saved_search_id is None:
         return ResolvedDestination(None, NOTIFICATION_ERROR_OWNER_UNRESOLVED)
 
     session = session_factory()
     try:
-        owner_user_id = session.execute(
-            select(SavedSearch.user_id).where(SavedSearch.id == discovered_by_saved_search_id)
-        ).scalar_one_or_none()
-        if owner_user_id is None:
-            return ResolvedDestination(None, NOTIFICATION_ERROR_OWNER_UNRESOLVED)
+        resolved_user_id = user_id
+        if resolved_user_id is None:
+            resolved_user_id = session.execute(
+                select(SavedSearch.user_id).where(SavedSearch.id == discovered_by_saved_search_id)
+            ).scalar_one_or_none()
+            if resolved_user_id is None:
+                return ResolvedDestination(None, NOTIFICATION_ERROR_OWNER_UNRESOLVED)
 
         telegram_chat_id = session.execute(
-            select(NotificationPreference.telegram_chat_id).where(NotificationPreference.user_id == owner_user_id)
+            select(NotificationPreference.telegram_chat_id).where(NotificationPreference.user_id == resolved_user_id)
         ).scalar_one_or_none()
         if not telegram_chat_id:
             return ResolvedDestination(None, NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG)
@@ -362,7 +391,9 @@ def drain_pending_notifications(
 
     for notification in claimed:
         resolved = resolve_destination(
-            session_factory, discovered_by_saved_search_id=notification.discovered_by_saved_search_id
+            session_factory,
+            user_id=notification.user_id,
+            discovered_by_saved_search_id=notification.discovered_by_saved_search_id,
         )
         success, error = _deliver(provider, notification, resolved)
         complete_notification(

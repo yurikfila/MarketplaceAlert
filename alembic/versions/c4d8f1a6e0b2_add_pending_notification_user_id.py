@@ -22,6 +22,14 @@ listing can never get two outbox rows. Deliberately no index on `user_id`
 yet either - nothing queries by it, since nothing writes it yet (see the
 model's own docstring for the precedent this follows).
 
+`ON DELETE SET NULL`, not `CASCADE` - corrected before this (still
+unreleased) migration was ever deployed. `pending_notifications` can
+carry real delivery/retry history (`sent`/`failed`, `attempt_count`,
+timestamps); deleting a user must not silently destroy that history, only
+forget whose notification it specifically was - see the model's own
+docstring for the full reasoning (the same principle `discovered_by_
+saved_search_id` above already applies for the identical situation).
+
 **Uses `op.batch_alter_table()`, hand-added after autogenerate** - same
 reason `280fbde82447` (`add listing product fields and saved search
 attribution`) needed it: plain `op.add_column()`/`op.create_foreign_key()`
@@ -62,7 +70,7 @@ def upgrade() -> None:
             'users',
             ['user_id'],
             ['id'],
-            ondelete='CASCADE',
+            ondelete='SET NULL',
         )
 
 

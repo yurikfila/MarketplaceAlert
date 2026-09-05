@@ -77,18 +77,24 @@ def _listing(external_id: str) -> Listing:
     )
 
 
-def _persist_and_enqueue(session_factory, external_id: str, *, saved_search_id: int | None = None) -> int:
+def _persist_and_enqueue(
+    session_factory, external_id: str, *, saved_search_id: int | None = None, user_id: int | None = None
+) -> int:
     """Persists a `DiscoveredListing` and its outbox row in one committed
     transaction (matching how `ListingDiscoveryService.process_listings()`
     and `SavedSearchRunner` do it together in real use), and returns the
     notification id. `saved_search_id` defaults to `None` - a listing
     with no discovering search, exactly like a legacy `/scan` row -
     deliberately left unroutable unless a caller supplies one, so tests
-    are explicit about which listings should resolve a destination."""
+    are explicit about which listings should resolve a destination.
+    `user_id` (Phase 2B) defaults to `None` too - every existing caller
+    that predates it is unaffected and still exercises the legacy
+    resolution chain; only a caller that explicitly wants a *stamped*
+    notification passes it."""
     session = session_factory()
     try:
         row = ListingRepository(session).save_new(_listing(external_id), saved_search_id=saved_search_id)
-        notification = NotificationOutboxRepository(session).enqueue(row.id)
+        notification = NotificationOutboxRepository(session).enqueue(row.id, user_id=user_id)
         session.commit()
         return notification.id
     finally:
@@ -132,11 +138,33 @@ def _routed_notification(session_factory, external_id: str, *, telegram_chat_id:
     resolve to some real destination", without caring about the specific
     user/search - builds the full ownership chain (a fresh user, one
     saved search they own, a preference with `telegram_chat_id` set) and
-    one enqueued notification attributed to it."""
+    one enqueued notification attributed to it via the *legacy* chain
+    (`user_id` left `None`, resolved only through `discovered_by_saved_
+    search_id` - see `resolve_destination`). Deliberately unchanged by
+    Phase 2B: every test using this helper is proving the fallback path
+    still works exactly as before."""
     user_id = _create_user(session_factory, f"user-{external_id}@example.com")
     saved_search_id = _create_owned_saved_search(session_factory, user_id)
     _set_telegram_preference(session_factory, user_id, telegram_chat_id)
     return _persist_and_enqueue(session_factory, external_id, saved_search_id=saved_search_id)
+
+
+def _stamped_notification(session_factory, external_id: str, *, telegram_chat_id: str = "999") -> tuple[int, int, int]:
+    """Phase 2B counterpart to `_routed_notification`: builds the same
+    full ownership chain, but enqueues with `user_id` stamped directly
+    (as `SavedSearchRunner` now does for every globally-new listing) -
+    `discovered_by_saved_search_id` is still recorded too (unchanged),
+    but resolution should never need it. Returns
+    `(notification_id, user_id, saved_search_id)` so a test can, for
+    example, delete the saved search afterward and confirm resolution is
+    unaffected."""
+    user_id = _create_user(session_factory, f"user-{external_id}@example.com")
+    saved_search_id = _create_owned_saved_search(session_factory, user_id)
+    _set_telegram_preference(session_factory, user_id, telegram_chat_id)
+    notification_id = _persist_and_enqueue(
+        session_factory, external_id, saved_search_id=saved_search_id, user_id=user_id
+    )
+    return notification_id, user_id, saved_search_id
 
 
 def _drain(session_factory, provider, *, max_attempts: int = 5, no_destination_retry_seconds: float = _NO_THROTTLE_TESTING):
@@ -260,36 +288,160 @@ def test_pending_notification_user_id_can_be_set_directly(session_factory) -> No
     verify.close()
 
 
-def test_deleting_the_user_cascades_to_a_pending_notification_that_references_them(session_factory) -> None:
-    """SQLite ignores `ON DELETE CASCADE` (and every other FK constraint)
+def test_deleting_the_user_sets_pending_notification_user_id_to_null(session_factory) -> None:
+    """SQLite ignores `ON DELETE SET NULL` (and every other FK constraint)
     unless `PRAGMA foreign_keys=ON` is issued per-connection - production
     runs Postgres, which always enforces it, so this pragma is only here
     to make SQLite behave like production for this one assertion (same
     approach already used for `NotificationPreference`'s and `Listing
-    Attribution`'s equivalent cascade tests). Exercises the FK's declared
-    `ondelete` behavior even though nothing writes `user_id` yet - the
-    constraint itself must already behave correctly, ahead of any code
-    relying on it."""
+    Attribution`'s equivalent cascade tests, adapted here for `SET NULL`
+    instead of `CASCADE`). `PendingNotification` carries real delivery/
+    retry history (`status`/`attempt_count`/timestamps) - deleting the
+    user must preserve that history, only forgetting whose notification
+    it specifically was, never deleting the row itself (see the model's
+    own docstring for the full reasoning)."""
     session = session_factory()
     session.execute(text("PRAGMA foreign_keys=ON"))
 
-    user = User(email="phase-2a-cascade@example.com", password_hash="irrelevant-hash")
+    user = User(email="phase-2a-setnull@example.com", password_hash="irrelevant-hash")
     session.add(user)
     session.commit()
+    user_id = user.id
 
-    row = ListingRepository(session).save_new(_listing("phase-2a-cascade-1"))
-    notification = NotificationOutboxRepository(session).enqueue(row.id)
-    notification.user_id = user.id
+    row = ListingRepository(session).save_new(_listing("phase-2a-setnull-1"))
+    listing_id = row.id
+    notification = NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_id)
     session.commit()
     notification_id = notification.id
 
     session.delete(user)
     session.commit()
-
-    assert session.query(PendingNotification).filter_by(id=notification_id).count() == 0
-    # The canonical listing itself must survive - only the notification row is gone.
-    assert session.query(DiscoveredListing).filter_by(id=row.id).count() == 1
     session.close()
+
+    verify = session_factory()
+    persisted = verify.get(PendingNotification, notification_id)
+    assert persisted is not None  # the row itself survives - only user_id is affected
+    assert persisted.user_id is None
+    # The canonical listing itself must survive too, unaffected either way.
+    assert verify.query(DiscoveredListing).filter_by(id=listing_id).count() == 1
+    verify.close()
+
+
+# =====================================================================
+# Phase 2B: dual-write / dual-read ownership - stamped user_id preferred,
+# legacy discovered_by_saved_search_id chain as fallback for historical
+# rows. See core/notifications/outbox.py's resolve_destination docstring.
+# =====================================================================
+
+
+def test_enqueue_stamps_the_given_user_id_directly(session_factory) -> None:
+    user_id = _create_user(session_factory, "phase-2b-stamp@example.com")
+    session = session_factory()
+    row = ListingRepository(session).save_new(_listing("phase-2b-stamp-1"))
+    notification = NotificationOutboxRepository(session).enqueue(row.id, user_id=user_id)
+    session.commit()
+
+    assert notification.user_id == user_id
+    session.close()
+
+
+def test_re_enqueue_does_not_overwrite_an_existing_rows_user_id(session_factory) -> None:
+    """Phase 2B is explicitly not the multi-user cutover: a second
+    enqueue attempt for an already-enqueued listing must not transfer
+    ownership to a different user - it must fail exactly as it always
+    has (`UNIQUE(discovered_listing_id)`), leaving the original row's
+    `user_id` untouched."""
+    user_a = _create_user(session_factory, "phase-2b-owner-a@example.com")
+    user_b = _create_user(session_factory, "phase-2b-owner-b@example.com")
+    session = session_factory()
+    row = ListingRepository(session).save_new(_listing("phase-2b-reenqueue-1"))
+    listing_id = row.id
+    NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_a)
+    session.commit()
+
+    with pytest.raises(IntegrityError):
+        NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_b)
+    session.rollback()
+    session.close()
+
+    verify = session_factory()
+    persisted = verify.query(PendingNotification).filter_by(discovered_listing_id=listing_id).one()
+    assert persisted.user_id == user_a
+    verify.close()
+
+
+def test_resolve_destination_prefers_stamped_user_id_over_the_legacy_chain(session_factory) -> None:
+    """The stamped `user_id` is used directly, without ever consulting
+    `SavedSearch` at all - proven by pointing `discovered_by_saved_
+    search_id` at a search that belongs to a *different* user with a
+    *different* destination, and confirming the stamped user's own
+    destination wins, not the search-owner's."""
+    stamped_user = _create_user(session_factory, "phase-2b-stamped-owner@example.com")
+    _set_telegram_preference(session_factory, stamped_user, "STAMPED-DESTINATION")
+
+    other_user = _create_user(session_factory, "phase-2b-other-owner@example.com")
+    other_search_id = _create_owned_saved_search(session_factory, other_user, query="Someone else's search")
+    _set_telegram_preference(session_factory, other_user, "OTHER-DESTINATION")
+
+    resolved = resolve_destination(
+        session_factory, user_id=stamped_user, discovered_by_saved_search_id=other_search_id
+    )
+
+    assert resolved.destination == "STAMPED-DESTINATION"
+    assert resolved.unresolved_reason is None
+
+
+def test_stamped_user_id_resolves_even_after_the_originating_saved_search_is_deleted(session_factory) -> None:
+    """Requirement: if the originating SavedSearch is deleted after
+    enqueue, a stamped notification must still resolve its owner and
+    destination correctly - the whole point of storing `user_id`
+    directly rather than only resolving it lazily through `SavedSearch`
+    at drain time."""
+    notification_id, user_id, saved_search_id = _stamped_notification(session_factory, "phase-2b-deleted-search-1")
+
+    session = session_factory()
+    saved_search = SavedSearchRepository(session).get(saved_search_id)
+    session.delete(saved_search)
+    session.commit()
+    session.close()
+
+    verify = session_factory()
+    notification = verify.get(PendingNotification, notification_id)
+    resolved = resolve_destination(
+        session_factory, user_id=notification.user_id, discovered_by_saved_search_id=None
+    )
+    verify.close()
+
+    assert resolved.destination == "999"
+    assert resolved.unresolved_reason is None
+
+
+def test_full_drain_delivers_correctly_via_the_stamped_user_id_path(session_factory) -> None:
+    """End-to-end analogue of `test_notification_for_user_a_routes_only_to_a`,
+    but for a notification enqueued the Phase 2B way (stamped `user_id`)
+    rather than the legacy way - proves the whole claim/resolve/deliver/
+    complete pipeline works identically through either path."""
+    _stamped_notification(session_factory, "phase-2b-drain-1", telegram_chat_id="STAMPED-777")
+
+    provider = RecordingProvider()
+    result = _drain(session_factory, provider)
+
+    assert result.sent_count == 1
+    assert provider.destinations == ["STAMPED-777"]
+
+
+def test_historical_null_user_id_notification_still_resolves_via_the_legacy_chain(session_factory) -> None:
+    """Explicit Phase 2B regression: a notification that predates the
+    `user_id` column (or was simply enqueued without one) must continue
+    to resolve exactly as before, through `discovered_by_saved_search_id`
+    alone - proven end to end via a full drain, not just a unit call."""
+    _routed_notification(session_factory, "phase-2b-legacy-1", telegram_chat_id="LEGACY-555")
+
+    provider = RecordingProvider()
+    result = _drain(session_factory, provider)
+
+    assert result.sent_count == 1
+    assert provider.destinations == ["LEGACY-555"]
 
 
 # =====================================================================
@@ -459,7 +611,9 @@ def test_crash_after_successful_send_before_completion_commit_may_redeliver(sess
     )
     assert len(claimed) == 1
     resolved = resolve_destination(
-        session_factory, discovered_by_saved_search_id=claimed[0].discovered_by_saved_search_id
+        session_factory,
+        user_id=claimed[0].user_id,
+        discovered_by_saved_search_id=claimed[0].discovered_by_saved_search_id,
     )
     provider.send_listing_alert(claimed[0].listing, resolved.destination)  # "successfully" sent...
     # ...and then the process dies right here - complete_notification (phase 3) never runs.
@@ -605,7 +759,7 @@ def test_resolve_destination_returns_owner_unresolved_when_no_discovering_search
     """A legacy `/scan`-discovered listing (or any listing whose
     `discovered_by_saved_search_id` is `None`) can never be routed -
     Case B, not something waiting will fix."""
-    resolved = resolve_destination(session_factory, discovered_by_saved_search_id=None)
+    resolved = resolve_destination(session_factory, user_id=None, discovered_by_saved_search_id=None)
     assert resolved.destination is None
     assert resolved.unresolved_reason == NOTIFICATION_ERROR_OWNER_UNRESOLVED
 
@@ -621,7 +775,7 @@ def test_resolve_destination_returns_owner_unresolved_for_an_unowned_saved_searc
     saved_search_id = saved_search.id
     session.close()
 
-    resolved = resolve_destination(session_factory, discovered_by_saved_search_id=saved_search_id)
+    resolved = resolve_destination(session_factory, user_id=None, discovered_by_saved_search_id=saved_search_id)
     assert resolved.destination is None
     assert resolved.unresolved_reason == NOTIFICATION_ERROR_OWNER_UNRESOLVED
 
@@ -632,7 +786,7 @@ def test_resolve_destination_returns_awaiting_config_when_owner_has_no_preferenc
     user_id = _create_user(session_factory, "no-preference@example.com")
     saved_search_id = _create_owned_saved_search(session_factory, user_id)
 
-    resolved = resolve_destination(session_factory, discovered_by_saved_search_id=saved_search_id)
+    resolved = resolve_destination(session_factory, user_id=None, discovered_by_saved_search_id=saved_search_id)
     assert resolved.destination is None
     assert resolved.unresolved_reason == NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG
 
@@ -642,7 +796,7 @@ def test_resolve_destination_returns_awaiting_config_when_preference_has_no_chat
     saved_search_id = _create_owned_saved_search(session_factory, user_id)
     _set_telegram_preference(session_factory, user_id, None)
 
-    resolved = resolve_destination(session_factory, discovered_by_saved_search_id=saved_search_id)
+    resolved = resolve_destination(session_factory, user_id=None, discovered_by_saved_search_id=saved_search_id)
     assert resolved.destination is None
     assert resolved.unresolved_reason == NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG
 
@@ -652,7 +806,7 @@ def test_resolve_destination_returns_the_owners_chat_id(session_factory) -> None
     saved_search_id = _create_owned_saved_search(session_factory, user_id)
     _set_telegram_preference(session_factory, user_id, "111222")
 
-    resolved = resolve_destination(session_factory, discovered_by_saved_search_id=saved_search_id)
+    resolved = resolve_destination(session_factory, user_id=None, discovered_by_saved_search_id=saved_search_id)
     assert resolved.destination == "111222"
     assert resolved.unresolved_reason is None
 

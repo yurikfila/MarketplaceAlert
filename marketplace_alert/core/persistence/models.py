@@ -323,15 +323,26 @@ class PendingNotification(Base):
 
     # Phase 2A schema-only groundwork for multi-user notification
     # delivery (see this model's own docstring) - nullable, and nothing
-    # in this codebase writes or reads it yet. `ON DELETE CASCADE`: if the
-    # user is ever deleted, a notification intended for them is
-    # meaningless and should go with it (same reasoning as `Notification
-    # Preference.user_id`). Deliberately left unindexed for now, matching
+    # in this codebase writes or reads it yet. `ON DELETE SET NULL`,
+    # deliberately not `CASCADE`: unlike `NotificationPreference.user_id`
+    # (a *current* setting, meaningless once the user is gone) or
+    # `ListingAttribution`'s foreign keys (a *current* visibility grant),
+    # this row can carry real delivery/retry history (`sent`/`failed`,
+    # `attempt_count`, timestamps) - a past event, not a live
+    # relationship. Deleting a user must not silently destroy that
+    # history; it only forgets whose notification it specifically was -
+    # the row survives with `user_id` reset to `NULL`, exactly the same
+    # reasoning `discovered_by_saved_search_id` above already uses for
+    # the identical situation. A still-`pending` row left with `user_id
+    # IS NULL` this way simply falls back to the existing Case B
+    # (`NOTIFICATION_ERROR_OWNER_UNRESOLVED`) path and expires via the
+    # already-proven bounded-retry-then-`failed` mechanism - no special
+    # handling needed. Deliberately left unindexed for now, matching
     # `DiscoveredListing.metadata_backfill_status`'s own precedent of
     # deferring an index until there's an actual query that needs it -
     # nothing queries by this column yet, since nothing writes it yet.
     user_id: Mapped[int | None] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE", name="fk_pending_notifications_user_id"),
+        ForeignKey("users.id", ondelete="SET NULL", name="fk_pending_notifications_user_id"),
         nullable=True,
     )
 

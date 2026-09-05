@@ -60,4 +60,33 @@ describe('LoginScreen', () => {
 
     expect(await findByText('Incorrect email or password')).toBeTruthy();
   });
+
+  it('hides the password by default and reveals/hides it on tap without altering the value', async () => {
+    const { getByLabelText } = await renderWithNavigation(LoginScreen);
+
+    await fireEvent.changeText(getByLabelText('Password'), 'hunter2');
+    expect(getByLabelText('Password').props.secureTextEntry).toBe(true);
+
+    await fireEvent.press(getByLabelText('Show password'));
+    expect(getByLabelText('Password').props.secureTextEntry).toBe(false);
+    expect(getByLabelText('Password').props.value).toBe('hunter2');
+
+    await fireEvent.press(getByLabelText('Hide password'));
+    expect(getByLabelText('Password').props.secureTextEntry).toBe(true);
+    expect(getByLabelText('Password').props.value).toBe('hunter2');
+  });
+
+  it('still submits correctly after the password visibility has been toggled', async () => {
+    mockLogin.mockResolvedValue(undefined);
+    const { getByText, getByLabelText } = await renderWithNavigation(LoginScreen);
+
+    await fireEvent.changeText(getByLabelText('Email'), 'shopper@example.com');
+    await fireEvent.changeText(getByLabelText('Password'), 'hunter2');
+    await fireEvent.press(getByLabelText('Show password'));
+    await fireEvent.press(getByText('Sign in'));
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(mockLogin).toHaveBeenCalledWith('shopper@example.com', 'hunter2');
+  });
 });

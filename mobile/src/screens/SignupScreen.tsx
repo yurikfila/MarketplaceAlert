@@ -5,6 +5,7 @@ import { ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { ApiError } from '../api/client';
 import { useAuth } from '../auth/AuthContext';
+import { PasswordInput } from '../components/PasswordInput';
 import { PrimaryButton } from '../components/PrimaryButton';
 import { Screen } from '../components/Screen';
 import type { AuthStackParamList } from '../navigation/types';
@@ -68,14 +69,12 @@ export function SignupScreen() {
 
         <View style={styles.field}>
           <Text style={styles.label}>Password</Text>
-          <TextInput
+          <PasswordInput
             value={password}
             onChangeText={setPassword}
             placeholder="At least 8 characters"
             placeholderTextColor={colors.textMuted}
-            style={styles.input}
             accessibilityLabel="Password"
-            secureTextEntry
             textContentType="newPassword"
             returnKeyType="done"
             onSubmitEditing={handleSubmit}

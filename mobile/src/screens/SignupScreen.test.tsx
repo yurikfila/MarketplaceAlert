@@ -61,4 +61,33 @@ describe('SignupScreen', () => {
 
     expect(await findByText('An account with this email already exists')).toBeTruthy();
   });
+
+  it('hides the password by default and reveals/hides it on tap without altering the value', async () => {
+    const { getByLabelText } = await renderWithNavigation(SignupScreen);
+
+    await fireEvent.changeText(getByLabelText('Password'), 'a-strong-password');
+    expect(getByLabelText('Password').props.secureTextEntry).toBe(true);
+
+    await fireEvent.press(getByLabelText('Show password'));
+    expect(getByLabelText('Password').props.secureTextEntry).toBe(false);
+    expect(getByLabelText('Password').props.value).toBe('a-strong-password');
+
+    await fireEvent.press(getByLabelText('Hide password'));
+    expect(getByLabelText('Password').props.secureTextEntry).toBe(true);
+    expect(getByLabelText('Password').props.value).toBe('a-strong-password');
+  });
+
+  it('still submits correctly after the password visibility has been toggled', async () => {
+    mockSignup.mockResolvedValue(undefined);
+    const { getByText, getByLabelText } = await renderWithNavigation(SignupScreen);
+
+    await fireEvent.changeText(getByLabelText('Email'), 'new@example.com');
+    await fireEvent.changeText(getByLabelText('Password'), 'a-strong-password');
+    await fireEvent.press(getByLabelText('Show password'));
+    await fireEvent.press(getByText('Create account'));
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(mockSignup).toHaveBeenCalledWith('new@example.com', 'a-strong-password');
+  });
 });

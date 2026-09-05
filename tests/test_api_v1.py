@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import select
 
 from marketplace_alert.config import settings
-from marketplace_alert.core.persistence.models import DiscoveredListing, PendingNotification
+from marketplace_alert.core.persistence.models import DiscoveredListing, ListingAttribution, PendingNotification
 
 
 @pytest.fixture(autouse=True)
@@ -357,6 +357,12 @@ def _insert_listing(
     source_created_at=None,
     saved_search_id=None,
 ) -> DiscoveredListing:
+    """`saved_search_id`, when given, also creates the corresponding
+    `ListingAttribution` row - that's what actually drives `GET
+    /api/v1/listings`' ownership scoping now (Phase 1 of multi-user
+    listing attribution: `list_recent_owned` queries `ListingAttribution`,
+    not `discovered_by_saved_search_id` alone). Kept as the same
+    parameter shape every existing test in this file already uses."""
     now = first_discovered_at or datetime.now(timezone.utc)
     row = DiscoveredListing(
         marketplace=marketplace,
@@ -376,6 +382,11 @@ def _insert_listing(
     )
     db_session.add(row)
     db_session.commit()
+    if saved_search_id is not None:
+        db_session.add(
+            ListingAttribution(saved_search_id=saved_search_id, discovered_listing_id=row.id, discovered_at=now)
+        )
+        db_session.commit()
     return row
 
 

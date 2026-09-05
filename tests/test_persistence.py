@@ -6,7 +6,8 @@ from sqlalchemy.exc import IntegrityError
 
 from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.persistence.database import create_db_engine, init_db
-from marketplace_alert.core.persistence.models import DiscoveredListing
+from marketplace_alert.core.persistence.listing_attribution_repository import ListingAttributionRepository
+from marketplace_alert.core.persistence.models import DiscoveredListing, ListingAttribution
 from marketplace_alert.core.persistence.repository import ListingRepository
 from marketplace_alert.core.persistence.service import ListingDiscoveryService
 
@@ -123,6 +124,124 @@ def test_process_listings_without_a_saved_search_id_leaves_attribution_null(db_s
     row = ListingRepository(db_session).get("mock", "unattributed-001")
     assert row is not None
     assert row.discovered_by_saved_search_id is None
+
+
+def test_two_different_searches_matching_the_same_listing_both_get_attribution(db_session) -> None:
+    """The Phase 1 fix itself: whichever search discovers a listing first
+    still owns `discovered_by_saved_search_id` (unchanged), but a second,
+    different search matching the exact same already-existing listing
+    must still get its own `ListingAttribution` row - not silently
+    dropped the way it used to be."""
+    service = ListingDiscoveryService(db_session)
+    service.process_listings([_listing(external_id="shared-1")], saved_search_id=1)
+    result = service.process_listings([_listing(external_id="shared-1")], saved_search_id=2)
+
+    assert result.already_seen_count == 1  # canonical listing identity is still global
+
+    row = ListingRepository(db_session).get("mock", "shared-1")
+    assert row is not None
+    assert row.discovered_by_saved_search_id == 1  # historical "first discovered by" - unchanged
+
+    attribution_repo = ListingAttributionRepository(db_session)
+    assert attribution_repo.get(saved_search_id=1, discovered_listing_id=row.id) is not None
+    assert attribution_repo.get(saved_search_id=2, discovered_listing_id=row.id) is not None
+
+
+def test_repeated_scan_of_the_same_search_does_not_duplicate_attribution(db_session) -> None:
+    service = ListingDiscoveryService(db_session)
+    service.process_listings([_listing(external_id="repeat-1")], saved_search_id=7)
+    service.process_listings([_listing(external_id="repeat-1")], saved_search_id=7)
+    service.process_listings([_listing(external_id="repeat-1")], saved_search_id=7)
+
+    row = ListingRepository(db_session).get("mock", "repeat-1")
+    assert db_session.query(ListingAttribution).filter_by(
+        saved_search_id=7, discovered_listing_id=row.id
+    ).count() == 1
+
+
+def test_concurrent_discovery_of_a_brand_new_listing_does_not_raise_and_shares_one_canonical_row(
+    session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulates the race directly: two saved searches both check
+    `ListingRepository.get()` and both see "not found yet" for the exact
+    same brand-new listing, then both attempt to persist it. Session A
+    genuinely wins and commits first; session B's own existence-check is
+    forced to report the same stale "not found" it would have gotten had
+    it truly run a moment earlier - proving `get_or_create` recovers via
+    the UNIQUE constraint instead of raising an unhandled `IntegrityError`
+    out of `process_listings()`."""
+    session_a = session_factory()
+    winner_row, winner_created = ListingRepository(session_a).get_or_create(_listing(external_id="race-1"))
+    session_a.commit()
+    session_a.close()
+    assert winner_created is True
+
+    session_b = session_factory()
+    repository_b = ListingRepository(session_b)
+    real_get = repository_b.get
+    calls = {"count": 0}
+
+    def _stale_get(marketplace: str, external_listing_id: str):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return None  # the stale read - as if B's check ran before A's commit
+        return real_get(marketplace, external_listing_id)
+
+    monkeypatch.setattr(repository_b, "get", _stale_get)
+
+    loser_row, loser_created = repository_b.get_or_create(_listing(external_id="race-1"))
+    session_b.commit()
+    session_b.close()
+
+    assert loser_created is False
+    assert loser_row.id == winner_row.id
+
+    verify_session = session_factory()
+    matching_rows = (
+        verify_session.query(DiscoveredListing)
+        .filter_by(marketplace="mock", external_listing_id="race-1")
+        .all()
+    )
+    assert len(matching_rows) == 1
+    verify_session.close()
+
+
+def test_concurrent_discovery_still_records_attribution_for_each_matching_search(
+    session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same race as above, but through the full `ListingDiscoveryService`
+    path with two different `saved_search_id`s - proves no attribution is
+    lost for the "losing" side of the race either."""
+    session_a = session_factory()
+    ListingDiscoveryService(session_a).process_listings(
+        [_listing(external_id="race-attr-1")], saved_search_id=101
+    )
+    session_a.commit()
+    session_a.close()
+
+    session_b = session_factory()
+    service_b = ListingDiscoveryService(session_b)
+    real_get = service_b._repository.get
+    calls = {"count": 0}
+
+    def _stale_get(marketplace: str, external_listing_id: str):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return None
+        return real_get(marketplace, external_listing_id)
+
+    monkeypatch.setattr(service_b._repository, "get", _stale_get)
+
+    service_b.process_listings([_listing(external_id="race-attr-1")], saved_search_id=102)
+    session_b.commit()
+    session_b.close()
+
+    verify_session = session_factory()
+    row = ListingRepository(verify_session).get("mock", "race-attr-1")
+    attribution_repo = ListingAttributionRepository(verify_session)
+    assert attribution_repo.get(saved_search_id=101, discovered_listing_id=row.id) is not None
+    assert attribution_repo.get(saved_search_id=102, discovered_listing_id=row.id) is not None
+    verify_session.close()
 
 
 def test_touch_last_seen_does_not_refresh_product_fields(db_session) -> None:

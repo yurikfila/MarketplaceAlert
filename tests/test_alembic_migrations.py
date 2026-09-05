@@ -537,3 +537,68 @@ def test_downgrade_one_revision_removes_only_notification_preferences(
     assert "notification_preferences" not in tables
     for table_name in ("users", "saved_searches", "discovered_listings", "refresh_tokens"):
         assert table_name in tables
+
+
+def test_upgrade_head_creates_listing_attributions_table(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "alembic_listing_attributions_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        columns = {col["name"] for col in inspector.get_columns("listing_attributions")}
+        index_names_and_unique = {
+            idx["name"]: idx["unique"] for idx in inspector.get_indexes("listing_attributions")
+        }
+        unique_constraints = inspector.get_unique_constraints("listing_attributions")
+        foreign_keys = {fk["constrained_columns"][0]: fk for fk in inspector.get_foreign_keys("listing_attributions")}
+    finally:
+        engine.dispose()
+
+    for column_name in ("id", "saved_search_id", "discovered_listing_id", "discovered_at"):
+        assert column_name in columns
+
+    # discovered_listing_id gets its own plain index (not covered by the
+    # composite UNIQUE below, whose leftmost column is saved_search_id) -
+    # matching the model's own docstring reasoning.
+    assert index_names_and_unique.get("ix_listing_attributions_discovered_listing_id") == 0
+
+    # The idempotency guarantee is a genuine multi-column UNIQUE table
+    # constraint, not a separate unique index - matches the model's
+    # `UniqueConstraint` (not `mapped_column(unique=True)`) exactly.
+    assert len(unique_constraints) == 1
+    assert unique_constraints[0]["column_names"] == ["saved_search_id", "discovered_listing_id"]
+
+    assert foreign_keys["saved_search_id"]["referred_table"] == "saved_searches"
+    assert foreign_keys["saved_search_id"]["options"].get("ondelete") == "CASCADE"
+    assert foreign_keys["discovered_listing_id"]["referred_table"] == "discovered_listings"
+    assert foreign_keys["discovered_listing_id"]["options"].get("ondelete") == "CASCADE"
+
+
+def test_downgrade_one_revision_removes_only_listing_attributions(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Downgrading exactly one revision (this migration's own) must remove
+    `listing_attributions` and nothing else - `discovered_listings.
+    discovered_by_saved_search_id` (the historical column this migration
+    deliberately leaves untouched) and every other table must survive."""
+    db_path = tmp_path / "alembic_listing_attributions_downgrade_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+    command.downgrade(cfg, "5faab97d82e8")  # one revision before listing_attributions
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        discovered_listing_columns = {col["name"] for col in inspector.get_columns("discovered_listings")}
+    finally:
+        engine.dispose()
+
+    assert "listing_attributions" not in tables
+    for table_name in ("users", "saved_searches", "discovered_listings", "notification_preferences"):
+        assert table_name in tables
+    assert "discovered_by_saved_search_id" in discovered_listing_columns

@@ -159,6 +159,79 @@ class DiscoveredListing(Base):
     metadata_backfill_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ListingAttribution(Base):
+    """Records that one specific `SavedSearch` legitimately matched one
+    specific `DiscoveredListing` - the fix for the global-dedup limitation
+    `DiscoveredListing.discovered_by_saved_search_id` has by itself (see
+    that column's docstring): a canonical listing's dedup identity stays
+    global (`UNIQUE(marketplace, external_listing_id)` on `discovered_
+    listings`, unchanged), but *attribution* - who is entitled to see this
+    listing, and (in a later phase) be notified about it - is no longer
+    limited to whichever search happened to discover it first. Every
+    search that genuinely matches a listing gets its own row here,
+    independent of whether the canonical listing itself was brand new.
+
+    Deliberately narrow and immutable: three facts (which search, which
+    listing, when), never updated after insert - there is nothing about
+    an attribution that later changes, unlike `DiscoveredListing.last_seen_at`.
+
+    `UNIQUE(saved_search_id, discovered_listing_id)` is the idempotency
+    guarantee - the same search can never attribute the same listing
+    twice, enforced by the database, not just by callers checking first
+    (see `ListingAttributionRepository.record_if_missing`).
+
+    Both foreign keys `ON DELETE CASCADE`, deliberately different from
+    `discovered_by_saved_search_id`'s `SET NULL`: that column's `SET NULL`
+    exists because it used to be the *only* record of discovery, so
+    losing it entirely on search-deletion felt too destructive. That
+    reasoning doesn't apply here - this row's entire reason for existing
+    is "this search found this listing"; if the search is deleted, that
+    specific claim should go with it. The canonical `discovered_listings`
+    row is never touched by that cascade (nothing here ever cascades
+    *into* `discovered_listings`), and every other search's/user's own
+    attribution rows are completely unaffected. Cascading on `discovered_
+    listing_id` too, matching `PendingNotification`'s identical reasoning:
+    if the listing itself is ever removed (e.g. historical relevance
+    cleanup), an attribution to it is meaningless and should go with it.
+
+    Phase 1 note: this table is populated by `ListingDiscoveryService.
+    process_listings()` going forward, and by the one-time `scripts/
+    backfill_listing_attributions.py` for pre-existing history - but
+    nothing yet *reads* it for notification delivery (`PendingNotification`
+    is explicitly out of scope this phase - see that model's docstring).
+    `ListingRepository.list_recent_owned`/`count_owned` are the only
+    current readers, for listing *visibility*.
+    """
+
+    __tablename__ = "listing_attributions"
+    __table_args__ = (
+        UniqueConstraint(
+            "saved_search_id", "discovered_listing_id", name="uq_listing_attribution_saved_search_listing"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    saved_search_id: Mapped[int] = mapped_column(
+        ForeignKey("saved_searches.id", ondelete="CASCADE", name="fk_listing_attributions_saved_search_id"),
+        nullable=False,
+    )
+    # Indexed on its own (unlike saved_search_id, which is already the
+    # leading column of the UNIQUE constraint above and so already has an
+    # index covering saved-search-first lookups for free) - ownership
+    # queries also need to go the other way ("does any attribution exist
+    # for this listing"), which the composite index alone can't serve.
+    discovered_listing_id: Mapped[int] = mapped_column(
+        ForeignKey("discovered_listings.id", ondelete="CASCADE", name="fk_listing_attributions_discovered_listing_id"),
+        nullable=False,
+        index=True,
+    )
+
+    discovered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+
 # `PendingNotification.status` values - see `core/notifications/outbox.py`
 # for the full claim/deliver/complete design these values support.
 NOTIFICATION_STATUS_PENDING = "pending"

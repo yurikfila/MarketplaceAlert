@@ -9,10 +9,11 @@ from datetime import datetime, timezone
 from typing import Literal
 
 from sqlalchemy import Select, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from marketplace_alert.core.models.listing import Listing
-from marketplace_alert.core.persistence.models import BACKFILL_STATUS_FAILED, DiscoveredListing
+from marketplace_alert.core.persistence.models import BACKFILL_STATUS_FAILED, DiscoveredListing, ListingAttribution
 from marketplace_alert.core.saved_searches.models import SavedSearch
 
 ListingSort = Literal["newest", "oldest", "price_asc", "price_desc"]
@@ -66,6 +67,49 @@ class ListingRepository:
         self._session.flush()
         return row
 
+    def get_or_create(
+        self, listing: Listing, *, saved_search_id: int | None = None
+    ) -> tuple[DiscoveredListing, bool]:
+        """Race-safe version of "check then `save_new`": returns
+        `(row, created)`, where `created` is `True` only if this call is
+        the one that actually inserted the row.
+
+        **The concurrency fix.** Two different saved searches (owned by
+        different users, or a scheduler tick racing a manual "run now"
+        request - `SavedSearchRunGuard` only prevents the *same* saved
+        search from overlapping itself, never two different ones) can
+        both see "not found yet" for a brand-new listing and both attempt
+        to insert it. Before this method existed, the second insert would
+        raise an unhandled `IntegrityError` on `discovered_listings`'
+        `UNIQUE(marketplace, external_listing_id)` constraint straight out
+        of `ListingDiscoveryService.process_listings()`, crashing that
+        scan.
+
+        The fix is a standard SAVEPOINT-protected optimistic insert: the
+        insert attempt runs inside `session.begin_nested()`, so if it
+        collides with a concurrent committer, only that one SAVEPOINT is
+        rolled back - never the caller's whole transaction (which, mid
+        `process_listings()` loop, may already hold other successfully
+        inserted rows from earlier in the same batch that must not be
+        discarded). On `IntegrityError`, the losing side simply re-reads
+        the row the winner just committed and returns that instead of
+        raising - both callers converge on the exact same canonical row,
+        and neither sees an error.
+        """
+        existing = self.get(listing.marketplace, listing.external_listing_id)
+        if existing is not None:
+            return existing, False
+
+        try:
+            with self._session.begin_nested():
+                row = self.save_new(listing, saved_search_id=saved_search_id)
+            return row, True
+        except IntegrityError:
+            existing = self.get(listing.marketplace, listing.external_listing_id)
+            if existing is None:
+                raise
+            return existing, False
+
     def touch_last_seen(self, row: DiscoveredListing) -> None:
         """Update last_seen_at for a listing that showed up again."""
         row.last_seen_at = datetime.now(timezone.utc)
@@ -91,15 +135,18 @@ class ListingRepository:
     ) -> list[DiscoveredListing]:
         """Discovered listings matching every given filter, in `sort` order.
 
-        Backs `GET /api/v1/listings` - see that route's docstring for the
-        exact meaning of each filter/sort mode, and for what's
-        intentionally NOT offered (`only_new`) and why.
+        Backs the legacy, unauthenticated dashboard `/listings` page only
+        (`main.py`) - the authenticated `GET /api/v1/listings` route uses
+        `list_recent_owned` below. `saved_search_id` here still means
+        "first discovered by" (`discovered_by_saved_search_id`, unchanged) -
+        this unscoped path was deliberately left alone by the Phase 1
+        listing-attribution work; see `list_recent_owned`'s docstring for
+        why that filter means something more precise there.
         """
         stmt = self._apply_filters(
             select(DiscoveredListing),
             marketplace=marketplace,
             marketplaces=marketplaces,
-            saved_search_id=saved_search_id,
             min_price=min_price,
             max_price=max_price,
             currency=currency,
@@ -109,6 +156,8 @@ class ListingRepository:
             discovered_before=discovered_before,
             new_since=new_since,
         )
+        if saved_search_id is not None:
+            stmt = stmt.where(DiscoveredListing.discovered_by_saved_search_id == saved_search_id)
         stmt = stmt.order_by(*self._sort_clause(sort)).limit(limit).offset(offset)
         return list(self._session.execute(stmt).scalars().all())
 
@@ -134,7 +183,6 @@ class ListingRepository:
             select(func.count()).select_from(DiscoveredListing),
             marketplace=marketplace,
             marketplaces=marketplaces,
-            saved_search_id=saved_search_id,
             min_price=min_price,
             max_price=max_price,
             currency=currency,
@@ -144,6 +192,8 @@ class ListingRepository:
             discovered_before=discovered_before,
             new_since=new_since,
         )
+        if saved_search_id is not None:
+            stmt = stmt.where(DiscoveredListing.discovered_by_saved_search_id == saved_search_id)
         return self._session.execute(stmt).scalar_one()
 
     def _apply_filters(
@@ -152,7 +202,6 @@ class ListingRepository:
         *,
         marketplace: str | None,
         marketplaces: list[str] | None,
-        saved_search_id: int | None,
         min_price: float | None,
         max_price: float | None,
         currency: str | None,
@@ -162,10 +211,19 @@ class ListingRepository:
         discovered_before: datetime | None,
         new_since: datetime | None,
     ) -> Select:
-        """The one place every `GET /api/v1/listings` filter becomes a
-        SQL predicate - shared by `list_recent` and `count` so pagination
-        metadata can never drift out of sync with what a page actually
-        contains.
+        """The one place every price/currency/condition/location/date/
+        marketplace filter becomes a SQL predicate - shared by all four
+        of `list_recent`/`count`/`list_recent_owned`/`count_owned` so
+        none of them can drift out of sync with the others.
+
+        **`saved_search_id` is deliberately NOT handled here** - unlike
+        every other filter, what it means depends on which of the four
+        callers is asking: `list_recent`/`count` (unscoped, legacy
+        dashboard only) still filter on `discovered_by_saved_search_id`
+        directly; `list_recent_owned`/`count_owned` filter through
+        `ListingAttribution` instead (see that method's docstring for
+        why - Phase 1 of multi-user listing attribution). Each caller
+        applies its own `saved_search_id` predicate after calling this.
 
         `marketplace` (singular, exact match) and `marketplaces` (plural,
         "is one of") are two independent, both-optional filters on the
@@ -184,8 +242,6 @@ class ListingRepository:
             stmt = stmt.where(DiscoveredListing.marketplace == marketplace)
         if marketplaces:
             stmt = stmt.where(DiscoveredListing.marketplace.in_(marketplaces))
-        if saved_search_id is not None:
-            stmt = stmt.where(DiscoveredListing.discovered_by_saved_search_id == saved_search_id)
         if min_price is not None:
             stmt = stmt.where(DiscoveredListing.price >= min_price)
         if max_price is not None:
@@ -317,11 +373,62 @@ class ListingRepository:
             row.metadata_backfill_attempted_at = None
         return len(rows)
 
-    # --- Ownership-scoped variant (groundwork for the route-protection
-    # phase - see PROJECT_CONTEXT.md's authentication design decision).
-    # Not yet called by any route - `list_recent`/`count` above remain
-    # exactly what `GET /api/v1/listings` uses, unscoped, until a later
-    # cutover phase.
+    # --- Ownership-scoped variant - what the authenticated `GET
+    # /api/v1/listings` route actually uses (see `api/v1/listings.py`).
+
+    def _owned_exists_clause(self, *, user_id: int, saved_search_id: int | None):
+        """`EXISTS(... ListingAttribution ... WHERE user owns it [and,
+        if given, the attribution is specifically to `saved_search_id`])`
+        - the ownership/filter predicate `list_recent_owned`/`count_owned`
+        both apply to `DiscoveredListing`.
+
+        `EXISTS`, not a `JOIN`, deliberately: a listing can now have more
+        than one attribution (Phase 1 of multi-user listing attribution -
+        the same user's two saved searches, or two different users',
+        independently matching the same listing). A `JOIN` would return
+        one result row per matching attribution, multiplying a listing
+        with several attributions into several output rows; `EXISTS`
+        never multiplies rows at all, so "does this user own at least one
+        attribution for this listing" is answered without needing a
+        `DISTINCT` (which would additionally need every `ORDER BY`
+        expression to appear in the `SELECT` list on some backends) to
+        undo it afterwards.
+
+        When `saved_search_id` is given, a *second*, independent `EXISTS`
+        re-verifies both "attributed to specifically this search" and
+        "this search belongs to `user_id`" together - not just "attributed
+        to this search" alone. This preserves the exact security property
+        the old single-column `discovered_by_saved_search_id` join had:
+        naming another user's `saved_search_id` must always yield zero
+        rows for that listing via this clause, even if the current user
+        separately owns a different, legitimate attribution for the same
+        listing - the filter must narrow what's shown, never expand it to
+        something the `saved_search_id` value itself doesn't actually
+        authorize.
+        """
+        owns_any_attribution = (
+            select(ListingAttribution.id)
+            .join(SavedSearch, ListingAttribution.saved_search_id == SavedSearch.id)
+            .where(
+                ListingAttribution.discovered_listing_id == DiscoveredListing.id,
+                SavedSearch.user_id == user_id,
+            )
+            .exists()
+        )
+        if saved_search_id is None:
+            return owns_any_attribution
+
+        owns_this_specific_search = (
+            select(ListingAttribution.id)
+            .join(SavedSearch, ListingAttribution.saved_search_id == SavedSearch.id)
+            .where(
+                ListingAttribution.discovered_listing_id == DiscoveredListing.id,
+                ListingAttribution.saved_search_id == saved_search_id,
+                SavedSearch.user_id == user_id,
+            )
+            .exists()
+        )
+        return owns_any_attribution & owns_this_specific_search
 
     def list_recent_owned(
         self,
@@ -342,29 +449,22 @@ class ListingRepository:
         new_since: datetime | None = None,
         sort: ListingSort = "newest",
     ) -> list[DiscoveredListing]:
-        """Listings attributable to a saved search this user owns -
-        joins `discovered_by_saved_search_id -> saved_searches.id` and
-        filters on `saved_searches.user_id`. An `INNER JOIN`, not a
-        `LEFT JOIN`, deliberately: a listing with `discovered_by_saved_
-        search_id IS NULL` has no row to join to at all and is dropped
-        automatically, and a listing whose discovering search itself has
-        `user_id IS NULL` (not yet cutover-attributed to anyone) fails
-        the `user_id ==` filter too - both cases correctly excluded from
-        every user's scoped view, never shown to anyone until a real
-        owner is established.
+        """Listings this user owns at least one `ListingAttribution` for -
+        see `_owned_exists_clause`'s docstring for the query shape and why
+        it's `EXISTS`, not a `JOIN`. A listing this user's own two saved
+        searches both independently matched appears exactly once (not
+        twice) - `EXISTS` only ever asks "is there at least one", it never
+        counts or multiplies.
 
         Takes the exact same optional filters as `list_recent` - reuses
-        `_apply_filters()` on top of the ownership join, so a filter
-        never has to be implemented twice or drift between the unscoped
-        and owned query paths.
+        `_apply_filters()` for everything except `saved_search_id` (see
+        that method's docstring), so a filter never has to be implemented
+        twice or drift between the unscoped and owned query paths.
         """
         stmt = self._apply_filters(
-            select(DiscoveredListing)
-            .join(SavedSearch, DiscoveredListing.discovered_by_saved_search_id == SavedSearch.id)
-            .where(SavedSearch.user_id == user_id),
+            select(DiscoveredListing).where(self._owned_exists_clause(user_id=user_id, saved_search_id=saved_search_id)),
             marketplace=marketplace,
             marketplaces=marketplaces,
-            saved_search_id=saved_search_id,
             min_price=min_price,
             max_price=max_price,
             currency=currency,
@@ -395,15 +495,15 @@ class ListingRepository:
     ) -> int:
         """Total rows `list_recent_owned` would return across every page
         with the same filters applied, for pagination metadata - same
-        join/filter, no limit/offset/sort."""
+        `EXISTS`/filter, no limit/offset/sort. No `DISTINCT` needed here
+        either, for the same reason `list_recent_owned` needs none - see
+        `_owned_exists_clause`'s docstring."""
         stmt = self._apply_filters(
             select(func.count())
             .select_from(DiscoveredListing)
-            .join(SavedSearch, DiscoveredListing.discovered_by_saved_search_id == SavedSearch.id)
-            .where(SavedSearch.user_id == user_id),
+            .where(self._owned_exists_clause(user_id=user_id, saved_search_id=saved_search_id)),
             marketplace=marketplace,
             marketplaces=marketplaces,
-            saved_search_id=saved_search_id,
             min_price=min_price,
             max_price=max_price,
             currency=currency,

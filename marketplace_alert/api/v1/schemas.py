@@ -116,12 +116,15 @@ class ListingOut(BaseModel):
     when a marketplace/connector didn't provide that field for this
     listing (never invented), and never refreshed afterwards even if the
     source listing changes (see `DiscoveredListing`'s docstring in
-    `core/persistence/models.py`). `saved_search_id` is the saved search
-    whose scan *first* discovered this row - `null` for a listing
-    discovered via the legacy `/scan` endpoint, or before this column
-    existed - and is a "first discovered by" attribution, not an
-    exclusive-ownership relationship (see
-    `DiscoveredListing.discovered_by_saved_search_id`'s docstring).
+    `core/persistence/models.py`). `saved_search_id` is *the requesting
+    user's own* earliest saved search attributed to this listing (see
+    `core/persistence/models.py:ListingAttribution` - Phase 1 of
+    multi-user listing attribution) - `null` if this user has no
+    attribution for it at all (shouldn't happen for a row this same
+    request just returned, but never assumed). Deliberately stays a
+    single scalar value, by product decision, even though a listing can
+    now genuinely have more than one attribution (e.g. two of this user's
+    own saved searches both matched it) - never a list.
     """
 
     id: int

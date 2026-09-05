@@ -17,12 +17,15 @@ endpoint only *reads*.
   above (added later, purely additively - existing callers using
   `marketplace` alone are unaffected). Each value is validated the same
   way `marketplace` is (422 if any isn't a currently-registered connector).
-- `saved_search_id` - the saved search whose scan *first* discovered a
-  listing (see `ListingOut`'s docstring - a "first discovered by"
-  attribution, not exclusive ownership). Must be a positive integer;
-  an id that doesn't match any row simply returns zero results, same as
-  any other filter that happens to match nothing - this endpoint never
-  404s based on a filter value.
+- `saved_search_id` - listings genuinely attributed to this saved search
+  (via `ListingAttribution` - see `core/persistence/models.py` and
+  `ListingRepository.list_recent_owned`'s docstring for Phase 1 of
+  multi-user listing attribution), not merely whichever search happened
+  to discover a listing first globally. Must be a positive integer; an id
+  that doesn't match any row - or that isn't one of the caller's own
+  saved searches - simply returns zero results, same as any other filter
+  that happens to match nothing; this endpoint never 404s based on a
+  filter value, and never reveals whether an id belongs to someone else.
 - `min_price`/`max_price` - inclusive bounds on `price`; a listing with no
   stored price never matches either bound (it's neither "at least X" nor
   "at most Y" - genuinely unknown, not zero). Rejected (422) if
@@ -76,6 +79,7 @@ from marketplace_alert.connectors.registry import is_marketplace_supported
 from marketplace_alert.core.auth.dependencies import get_current_user
 from marketplace_alert.core.auth.models import User
 from marketplace_alert.core.persistence.database import get_db_session
+from marketplace_alert.core.persistence.listing_attribution_repository import ListingAttributionRepository
 from marketplace_alert.core.persistence.models import DiscoveredListing
 from marketplace_alert.core.persistence.repository import ListingRepository, ListingSort
 
@@ -86,10 +90,16 @@ _MAX_LIMIT = 100
 _MAX_CURRENCY_LENGTH = 8  # ISO 4217 codes are 3 letters; generous headroom, never unbounded
 
 
-def _to_listing_out(row: DiscoveredListing) -> ListingOut:
+def _to_listing_out(row: DiscoveredListing, *, saved_search_id: int | None) -> ListingOut:
     """Explicit field-by-field mapping, not `from_attributes` auto-mapping -
     keeps every field's source column visible in one place, rather than
-    relying on Pydantic to silently match them up by name."""
+    relying on Pydantic to silently match them up by name.
+
+    `saved_search_id` is supplied by the caller, not read from `row.
+    discovered_by_saved_search_id` - see this module's `list_listings`
+    for why (Phase 1 of multi-user listing attribution: the requesting
+    user's own earliest attribution, never the listing's global "first
+    discovered by" fact, which could belong to a different user entirely)."""
     return ListingOut(
         id=row.id,
         marketplace=row.marketplace,
@@ -105,7 +115,7 @@ def _to_listing_out(row: DiscoveredListing) -> ListingOut:
         source_created_at=row.source_created_at,
         first_discovered_at=row.first_discovered_at,
         last_seen_at=row.last_seen_at,
-        saved_search_id=row.discovered_by_saved_search_id,
+        saved_search_id=saved_search_id,
     )
 
 
@@ -181,8 +191,17 @@ def list_listings(
     )
     total_count = repository.count_owned(user_id=current_user.id, new_since=new_since, **filters)
 
+    # ListingOut.saved_search_id stays a single scalar value by product
+    # decision (Phase 1 of multi-user listing attribution - never a list,
+    # even though a listing can now have more than one attribution): for
+    # each returned row, report this user's own *earliest* attributed
+    # saved search - one extra query for the whole page, not one per row.
+    earliest_by_listing = ListingAttributionRepository(session).get_earliest_attribution_search_ids(
+        user_id=current_user.id, discovered_listing_ids=[row.id for row in rows]
+    )
+
     return ListingListResponse(
-        items=[_to_listing_out(row) for row in rows],
+        items=[_to_listing_out(row, saved_search_id=earliest_by_listing.get(row.id)) for row in rows],
         limit=limit,
         offset=offset,
         total_count=total_count,

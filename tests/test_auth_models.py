@@ -201,9 +201,15 @@ def test_password_reset_token_creation_has_expected_defaults(db_session) -> None
     assert token.id is not None
     assert isinstance(token.created_at, datetime)
     assert token.used_at is None
+    assert token.failed_attempts == 0
 
 
-def test_password_reset_token_hash_must_be_unique(db_session) -> None:
+def test_password_reset_token_hash_must_be_unique_per_user(db_session) -> None:
+    """`UNIQUE(user_id, token_hash)` (`uq_password_reset_tokens_user_id_
+    token_hash`) still rejects a duplicate `token_hash` for the *same*
+    user - see `test_password_reset_token_hash_can_repeat_across_
+    different_users` below for why this is no longer a bare
+    `UNIQUE(token_hash)`."""
     user = _user()
     db_session.add(user)
     db_session.commit()
@@ -215,6 +221,25 @@ def test_password_reset_token_hash_must_be_unique(db_session) -> None:
     with pytest.raises(IntegrityError):
         db_session.flush()
     db_session.rollback()
+
+
+def test_password_reset_token_hash_can_repeat_across_different_users(db_session) -> None:
+    """The entire point of the 6-digit-code-compatible composite
+    constraint: a 6-digit code has only ~1,000,000 possible values, so two
+    different users can legitimately be issued (and hash to) the exact
+    same code at the same time - this must never be rejected at the
+    database level, unlike the original 256-bit-token-shaped
+    `UNIQUE(token_hash)` this replaces."""
+    user_a = _user(email="reset-a@example.com")
+    user_b = _user(email="reset-b@example.com")
+    db_session.add_all([user_a, user_b])
+    db_session.commit()
+
+    db_session.add(_password_reset_token(user_a.id, token_hash="shared-hash"))
+    db_session.add(_password_reset_token(user_b.id, token_hash="shared-hash"))
+    db_session.commit()
+
+    assert db_session.query(PasswordResetToken).filter_by(token_hash="shared-hash").count() == 2
 
 
 def test_password_reset_token_can_be_marked_used(db_session) -> None:

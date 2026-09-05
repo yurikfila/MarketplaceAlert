@@ -404,10 +404,16 @@ def test_refresh_tokens_table_has_expected_columns_fk_and_unique_token_hash(
 def test_password_reset_tokens_table_has_expected_columns_fk_and_unique_token_hash(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Pinned to `f3a7c9e2b4d1` explicitly, not `"head"` - this test is
+    about `2732fd410d2f`'s own, original shape (a bare
+    `UNIQUE(token_hash)`); `30fc5cd97dad` (the 6-digit-code-compatible
+    schema pass) deliberately replaces that constraint afterward - see
+    `test_upgrade_head_adds_failed_attempts_and_replaces_password_reset_
+    token_unique_constraint` for that migration's own equivalent test."""
     db_path = tmp_path / "alembic_password_reset_tokens_test.db"
     cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
 
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "f3a7c9e2b4d1")
 
     engine = create_db_engine(f"sqlite:///{db_path}")
     try:
@@ -1149,3 +1155,346 @@ def test_downgrade_fails_once_two_users_share_a_listing(tmp_path, monkeypatch: p
     finally:
         engine.dispose()
     assert count == 2
+
+
+# =====================================================================
+# Phase 1 (schema only) of the 6-digit email-verification-code
+# password-reset design: replace UNIQUE(token_hash) with
+# UNIQUE(user_id, token_hash) on password_reset_tokens, and add
+# failed_attempts - schema cutover only, no runtime behavior change (see
+# 30fc5cd97dad's own module docstring). No forgot-password/reset-password
+# route/service/repository/code-generator exists yet.
+# =====================================================================
+
+
+def _insert_password_reset_token(
+    conn,
+    *,
+    user_id: int,
+    token_hash: str,
+    created_at: str = "2026-01-01T00:00:00+00:00",
+    expires_at: str = "2026-01-01T00:30:00+00:00",
+    used_at: str | None = None,
+) -> int:
+    conn.execute(
+        sa.text(
+            "INSERT INTO password_reset_tokens (user_id, token_hash, created_at, expires_at, used_at) "
+            "VALUES (:user_id, :token_hash, :created_at, :expires_at, :used_at)"
+        ),
+        {
+            "user_id": user_id,
+            "token_hash": token_hash,
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "used_at": used_at,
+        },
+    )
+    return conn.execute(
+        sa.text(
+            "SELECT id FROM password_reset_tokens WHERE user_id = :user_id AND token_hash = :token_hash"
+        ),
+        {"user_id": user_id, "token_hash": token_hash},
+    ).scalar_one()
+
+
+def test_upgrade_head_reaches_the_new_password_reset_token_revision(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "alembic_password_reset_token_head_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert version == "30fc5cd97dad"
+
+
+def test_upgrade_head_adds_failed_attempts_and_replaces_password_reset_token_unique_constraint(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The original single-column `UNIQUE(token_hash)` (from
+    `2732fd410d2f`, unnamed there) is replaced with a composite
+    `UNIQUE(user_id, token_hash)` - a 6-digit code has too few possible
+    values for global uniqueness to be safe (see `30fc5cd97dad`'s own
+    docstring). `failed_attempts` is new, `NOT NULL`. Everything else -
+    the `user_id` FK/`ON DELETE CASCADE`/index, `token_hash`'s type,
+    `created_at`, `expires_at`, `used_at` - must survive untouched."""
+    db_path = tmp_path / "alembic_password_reset_token_upgrade_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        columns = {col["name"]: col for col in inspector.get_columns("password_reset_tokens")}
+        foreign_keys = {
+            fk["constrained_columns"][0]: fk for fk in inspector.get_foreign_keys("password_reset_tokens")
+        }
+        unique_constraints = inspector.get_unique_constraints("password_reset_tokens")
+        index_names_and_unique = {
+            idx["name"]: idx["unique"] for idx in inspector.get_indexes("password_reset_tokens")
+        }
+    finally:
+        engine.dispose()
+
+    assert "failed_attempts" in columns
+    assert columns["failed_attempts"]["nullable"] is False
+    for column_name in ("id", "user_id", "token_hash", "created_at", "expires_at", "used_at"):
+        assert column_name in columns
+
+    assert foreign_keys["user_id"]["referred_table"] == "users"
+    assert foreign_keys["user_id"]["options"].get("ondelete") == "CASCADE"
+
+    # The old single-column constraint is gone - never both, never neither.
+    assert len(unique_constraints) == 1
+    assert unique_constraints[0]["name"] == "uq_password_reset_tokens_user_id_token_hash"
+    assert unique_constraints[0]["column_names"] == ["user_id", "token_hash"]
+
+    assert index_names_and_unique.get("ix_password_reset_tokens_user_id") == 0
+
+
+def test_password_reset_token_failed_attempts_defaults_to_zero_after_migration(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "alembic_password_reset_token_default_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_id = _insert_user(conn, "reset-default@example.com")
+        token_id = _insert_password_reset_token(conn, user_id=user_id, token_hash="default-check-hash")
+    engine.dispose()
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            failed_attempts = conn.execute(
+                sa.text("SELECT failed_attempts FROM password_reset_tokens WHERE id = :id"), {"id": token_id}
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert failed_attempts == 0
+
+
+def test_two_different_users_can_share_the_same_token_hash(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The entire point of this cutover: two different users can each
+    have their own `PasswordResetToken` row hashing to the exact same
+    6-digit code at the same time."""
+    db_path = tmp_path / "alembic_password_reset_token_two_users_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_a = _insert_user(conn, "reset-a@example.com")
+        user_b = _insert_user(conn, "reset-b@example.com")
+        _insert_password_reset_token(conn, user_id=user_a, token_hash="shared-code-hash")
+        _insert_password_reset_token(conn, user_id=user_b, token_hash="shared-code-hash")
+        count = conn.execute(
+            sa.text("SELECT COUNT(*) FROM password_reset_tokens WHERE token_hash = :token_hash"),
+            {"token_hash": "shared-code-hash"},
+        ).scalar_one()
+    engine.dispose()
+
+    assert count == 2
+
+
+def test_same_user_same_token_hash_twice_is_rejected(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The composite constraint still enforces per-user uniqueness - the
+    same user can never get two rows for the same code hash."""
+    db_path = tmp_path / "alembic_password_reset_token_same_user_twice_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_a = _insert_user(conn, "reset-dup@example.com")
+        _insert_password_reset_token(conn, user_id=user_a, token_hash="dup-code-hash")
+
+    engine2 = create_db_engine(f"sqlite:///{db_path}")
+    with pytest.raises(IntegrityError):
+        with engine2.begin() as conn:
+            _insert_password_reset_token(conn, user_id=user_a, token_hash="dup-code-hash")
+    engine.dispose()
+    engine2.dispose()
+
+
+def test_migration_preserves_a_populated_password_reset_token_row(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Existing rows are never rewritten by this migration - proven with
+    representative, deliberately non-default history values (a used,
+    populated row), inserted *before* this migration runs, then confirmed
+    byte-for-byte unchanged after, with `failed_attempts` simply defaulted
+    to 0 (nothing ever wrote to it before this column existed)."""
+    db_path = tmp_path / "alembic_password_reset_token_preserve_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "f3a7c9e2b4d1")
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_id = _insert_user(conn, "populated-reset@example.com")
+        token_id = _insert_password_reset_token(
+            conn,
+            user_id=user_id,
+            token_hash="populated-hash",
+            created_at="2026-01-01T00:00:00+00:00",
+            expires_at="2026-01-01T00:30:00+00:00",
+            used_at="2026-01-01T00:05:00+00:00",
+        )
+    engine.dispose()
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text(
+                    "SELECT id, user_id, token_hash, created_at, expires_at, used_at, failed_attempts "
+                    "FROM password_reset_tokens WHERE id = :id"
+                ),
+                {"id": token_id},
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert row.id == token_id
+    assert row.user_id == user_id
+    assert row.token_hash == "populated-hash"
+    assert row.created_at == "2026-01-01T00:00:00+00:00"
+    assert row.expires_at == "2026-01-01T00:30:00+00:00"
+    assert row.used_at == "2026-01-01T00:05:00+00:00"
+    assert row.failed_attempts == 0
+
+
+def test_downgrade_removes_failed_attempts_and_restores_single_column_unique(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before any two users have ever shared a `token_hash` (not yet
+    possible at all - no code-issuing logic exists in this phase), the
+    old single-column uniqueness rule is never actually violated by real
+    data, so downgrade must succeed cleanly and remove exactly what this
+    migration added."""
+    db_path = tmp_path / "alembic_password_reset_token_downgrade_safe_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_id = _insert_user(conn, "safe-downgrade-reset@example.com")
+        token_id = _insert_password_reset_token(conn, user_id=user_id, token_hash="safe-downgrade-hash")
+    engine.dispose()
+
+    command.downgrade(cfg, "f3a7c9e2b4d1")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        columns = {col["name"] for col in inspector.get_columns("password_reset_tokens")}
+        unique_constraints = inspector.get_unique_constraints("password_reset_tokens")
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text("SELECT user_id, token_hash FROM password_reset_tokens WHERE id = :id"), {"id": token_id}
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert "failed_attempts" not in columns
+    for column_name in ("id", "user_id", "token_hash", "created_at", "expires_at", "used_at"):
+        assert column_name in columns
+    assert len(unique_constraints) == 1
+    assert unique_constraints[0]["column_names"] == ["token_hash"]
+    # Data is never deleted or rewritten by downgrade either.
+    assert row.user_id == user_id
+    assert row.token_hash == "safe-downgrade-hash"
+
+
+def test_downgrade_fails_once_two_users_share_a_token_hash(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Documents the operational limitation `30fc5cd97dad`'s own downgrade
+    docstring identifies, rather than resolving it: once two different
+    users genuinely share a `token_hash` (what a later phase's actual
+    code-issuing logic would eventually create), restoring
+    `UNIQUE(token_hash)` alone is a real constraint violation - PostgreSQL
+    and SQLite both validate ALL existing rows when creating a new UNIQUE
+    constraint. This migration must never silently delete or merge rows to
+    force the downgrade to succeed."""
+    db_path = tmp_path / "alembic_password_reset_token_downgrade_unsafe_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_a = _insert_user(conn, "conflict-reset-a@example.com")
+        user_b = _insert_user(conn, "conflict-reset-b@example.com")
+        _insert_password_reset_token(conn, user_id=user_a, token_hash="conflict-hash")
+        _insert_password_reset_token(conn, user_id=user_b, token_hash="conflict-hash")
+    engine.dispose()
+
+    with pytest.raises(Exception):
+        command.downgrade(cfg, "f3a7c9e2b4d1")
+
+    # Never silently resolved by deleting/merging rows to force success -
+    # both rows must still be there, completely unrewritten.
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            count = conn.execute(
+                sa.text("SELECT COUNT(*) FROM password_reset_tokens WHERE token_hash = :token_hash"),
+                {"token_hash": "conflict-hash"},
+            ).scalar_one()
+    finally:
+        engine.dispose()
+    assert count == 2
+
+
+def test_password_reset_token_upgrade_downgrade_reupgrade_succeeds_on_a_compatible_dataset(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The full round trip, on a dataset the old single-column constraint
+    can still tolerate (no two users share a `token_hash`) - proves the
+    migration is safely reversible and re-appliable, not just a one-way
+    upgrade."""
+    db_path = tmp_path / "alembic_password_reset_token_round_trip_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_id = _insert_user(conn, "round-trip-reset@example.com")
+        token_id = _insert_password_reset_token(conn, user_id=user_id, token_hash="round-trip-hash")
+    engine.dispose()
+
+    command.downgrade(cfg, "f3a7c9e2b4d1")
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        columns = {col["name"] for col in inspector.get_columns("password_reset_tokens")}
+        unique_constraints = inspector.get_unique_constraints("password_reset_tokens")
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text(
+                    "SELECT user_id, token_hash, failed_attempts FROM password_reset_tokens WHERE id = :id"
+                ),
+                {"id": token_id},
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert "failed_attempts" in columns
+    assert len(unique_constraints) == 1
+    assert unique_constraints[0]["column_names"] == ["user_id", "token_hash"]
+    assert row.user_id == user_id
+    assert row.token_hash == "round-trip-hash"
+    assert row.failed_attempts == 0

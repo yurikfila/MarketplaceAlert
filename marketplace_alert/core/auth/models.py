@@ -19,7 +19,7 @@ the tokens this package owns.
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from marketplace_alert.core.persistence.database import Base
@@ -151,14 +151,40 @@ class RefreshToken(Base):
 
 
 class PasswordResetToken(Base):
-    """One issued password-reset token - single-use, short-lived, and (per
-    the approved authentication design) not wired to any email-delivery
-    mechanism yet. This table exists now so the token/expiry/single-use
+    """One issued password-reset verification code - single-use,
+    short-lived, and (per the approved 6-digit email-verification-code
+    design) not wired to any email-delivery/route/service-layer code yet.
+    This table exists now so the code/expiry/single-use/attempt-limit
     model can be built and tested ahead of that, without a later schema
-    change once email delivery is added.
+    change once the actual issuing/verification logic is added.
+
+    **`token_hash` holds a hash of a 6-digit numeric code, not a 256-bit
+    opaque token** - `hash_token()` itself is unchanged (still SHA-256,
+    still never the raw value - see this module's docstring), but with
+    only ~1,000,000 possible codes, two different users can legitimately
+    be issued the exact same code (and therefore the exact same hash) at
+    the same time. `UNIQUE(user_id, token_hash)`
+    (`uq_password_reset_tokens_user_id_token_hash`, added by revision
+    `30fc5cd97dad`) is what this table actually enforces - not a bare
+    `UNIQUE(token_hash)`, which a 6-digit code cannot safely satisfy (see
+    that migration's own docstring for why). This is defense-in-depth
+    against an application bug, not the real lookup mechanism: verifying
+    a submitted code must always be scoped by `user_id` (resolved
+    server-side from the client-supplied email) first, never by
+    `token_hash` alone - a lookup keyed on `token_hash` alone could match
+    a *different* user's row purely by coincidence.
+
+    `failed_attempts` bounds brute force against the code's much smaller
+    keyspace (compare `RefreshToken`'s 256-bit token, which needed no such
+    counter) - nothing writes to it yet.
     """
 
     __tablename__ = "password_reset_tokens"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "token_hash", name="uq_password_reset_tokens_user_id_token_hash"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
@@ -168,10 +194,11 @@ class PasswordResetToken(Base):
         index=True,
     )
 
-    # A hash of the actual token that would go in a reset link/email,
-    # never the raw value - see this module's docstring. `UNIQUE` for the
-    # same reason as `RefreshToken.token_hash`.
-    token_hash: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    # A hash of the actual code that would go in a reset email, never the
+    # raw value - see this module's docstring. No column-level `unique=True`
+    # here - see the class docstring for why uniqueness is scoped to
+    # `(user_id, token_hash)` instead (`__table_args__` above).
+    token_hash: Mapped[str] = mapped_column(String, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
@@ -180,8 +207,20 @@ class PasswordResetToken(Base):
     # `settings.password_reset_token_expire_minutes`.
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
-    # None = not yet used. Set (to "now") the moment a reset is completed
-    # with this token - single-use is enforced by checking this field, not
-    # by deleting the row (keeping it is a harmless audit trail: "someone
-    # did reset this account's password on this date").
+    # None = still a live candidate. Set (to "now") both when a reset is
+    # actually completed with this code, and when a newer code is issued
+    # for the same user before this one was ever used (superseding it) -
+    # single-use *and* at-most-one-live-code-per-user are both enforced by
+    # checking this one field, not by deleting the row (keeping it is a
+    # harmless audit trail). Deliberately the same "set means no longer
+    # valid, for any reason" pattern `RefreshToken.revoked_at` already uses
+    # in this codebase - not something this migration/model needs a second
+    # field to express.
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Wrong-code attempts against this specific row since it was issued -
+    # a 6-digit code has far less entropy than the token above, so this is
+    # what actually bounds brute force (not `token_hash`'s hash speed).
+    # Reset to 0 only by issuing a brand-new code (which supersedes this
+    # row via `used_at` instead) - never decremented or reset in place.
+    failed_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

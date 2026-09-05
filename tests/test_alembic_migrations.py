@@ -612,12 +612,18 @@ def test_upgrade_head_adds_pending_notification_user_id_column(tmp_path, monkeyp
     (preserving delivery/retry history if the user is later deleted -
     see the model's own docstring for the full reasoning), and the
     table's original `UNIQUE(discovered_listing_id)` constraint -
-    unchanged since this table was first created - survives the SQLite
-    batch-mode table recreation this migration requires."""
+    unchanged as of *this* migration - survives the SQLite batch-mode
+    table recreation this migration requires.
+
+    Pinned to `c4d8f1a6e0b2` explicitly, not `"head"` - this test is
+    about that migration's own, specific behavior; `f3a7c9e2b4d1`
+    (Phase 2D-SCHEMA) deliberately replaces this exact constraint
+    afterward - see `test_upgrade_head_replaces_pending_notification_
+    unique_constraint` for that migration's own equivalent test."""
     db_path = tmp_path / "alembic_pending_notification_user_id_test.db"
     cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
 
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "c4d8f1a6e0b2")
 
     engine = create_db_engine(f"sqlite:///{db_path}")
     try:
@@ -704,11 +710,15 @@ def test_downgrade_one_revision_removes_only_pending_notification_user_id(
 ) -> None:
     """Downgrading exactly one revision (this migration's own) must remove
     only the `user_id` column/foreign key it added - the table itself,
-    every other column, and `UNIQUE(discovered_listing_id)` must survive."""
+    every other column, and `UNIQUE(discovered_listing_id)` must survive.
+
+    Pinned to `c4d8f1a6e0b2` explicitly (not `"head"`, which now includes
+    `f3a7c9e2b4d1` on top and would make this "one revision" downgrade
+    silently traverse two)."""
     db_path = tmp_path / "alembic_pending_notification_user_id_downgrade_test.db"
     cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
 
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "c4d8f1a6e0b2")
     command.downgrade(cfg, "a1c2e5f9b3d7")
 
     engine = create_db_engine(f"sqlite:///{db_path}")
@@ -726,3 +736,416 @@ def test_downgrade_one_revision_removes_only_pending_notification_user_id(
         assert column_name in columns
     assert len(unique_constraints) == 1
     assert unique_constraints[0]["column_names"] == ["discovered_listing_id"]
+
+
+# =====================================================================
+# Phase 2D-SCHEMA: replace UNIQUE(discovered_listing_id) with
+# UNIQUE(user_id, discovered_listing_id) - schema cutover only, no
+# runtime behavior change (see f3a7c9e2b4d1's own module docstring).
+# =====================================================================
+
+
+def _insert_user(conn, email: str) -> int:
+    conn.execute(
+        sa.text(
+            "INSERT INTO users (email, password_hash, is_active, created_at, updated_at, failed_login_attempts) "
+            "VALUES (:email, 'irrelevant-hash', 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 0)"
+        ),
+        {"email": email},
+    )
+    return conn.execute(sa.text("SELECT id FROM users WHERE email = :email"), {"email": email}).scalar_one()
+
+
+def _insert_listing(conn, external_id: str) -> int:
+    conn.execute(
+        sa.text(
+            "INSERT INTO discovered_listings "
+            "(marketplace, external_listing_id, title, listing_url, first_discovered_at, last_seen_at) "
+            "VALUES ('mock', :external_id, 'Listing', :url, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+        ),
+        {"external_id": external_id, "url": f"https://example.com/{external_id}"},
+    )
+    return conn.execute(
+        sa.text("SELECT id FROM discovered_listings WHERE external_listing_id = :external_id"),
+        {"external_id": external_id},
+    ).scalar_one()
+
+
+def test_upgrade_head_replaces_pending_notification_unique_constraint(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 2D-SCHEMA: the original single-column `UNIQUE(discovered_
+    listing_id)` (from `163ae88ffc55`, unnamed there) is replaced with a
+    composite `UNIQUE(user_id, discovered_listing_id)`, plus a dedicated,
+    separate, non-unique index on `discovered_listing_id` alone (needed
+    since the composite index leads with `user_id` and can't efficiently
+    serve a lookup keyed on `discovered_listing_id` alone - matches
+    `ListingAttribution.discovered_listing_id`'s identical precedent).
+    The pre-existing `status` index must survive untouched too."""
+    db_path = tmp_path / "alembic_pending_notification_unique_replace_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        unique_constraints = inspector.get_unique_constraints("pending_notifications")
+        index_names_and_unique = {
+            idx["name"]: idx["unique"] for idx in inspector.get_indexes("pending_notifications")
+        }
+    finally:
+        engine.dispose()
+
+    # The old single-column constraint is gone - never both, never neither.
+    assert len(unique_constraints) == 1
+    assert unique_constraints[0]["name"] == "uq_pending_notifications_user_id_discovered_listing_id"
+    assert unique_constraints[0]["column_names"] == ["user_id", "discovered_listing_id"]
+
+    assert index_names_and_unique.get("ix_pending_notifications_discovered_listing_id") == 0
+    assert index_names_and_unique.get("ix_pending_notifications_status") == 0
+
+
+def test_same_listing_allowed_for_two_different_non_null_users(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The entire point of this cutover: two different users can each
+    have their own `PendingNotification` row for the exact same
+    canonical listing."""
+    db_path = tmp_path / "alembic_pending_notification_two_users_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_a = _insert_user(conn, "a@example.com")
+        user_b = _insert_user(conn, "b@example.com")
+        listing_id = _insert_listing(conn, "shared-1")
+        conn.execute(
+            sa.text(
+                "INSERT INTO pending_notifications (discovered_listing_id, user_id, status, attempt_count, created_at) "
+                "VALUES (:listing_id, :user_id, 'pending', 0, '2026-01-01T00:00:00+00:00')"
+            ),
+            {"listing_id": listing_id, "user_id": user_a},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO pending_notifications (discovered_listing_id, user_id, status, attempt_count, created_at) "
+                "VALUES (:listing_id, :user_id, 'pending', 0, '2026-01-01T00:00:00+00:00')"
+            ),
+            {"listing_id": listing_id, "user_id": user_b},
+        )
+        count = conn.execute(
+            sa.text("SELECT COUNT(*) FROM pending_notifications WHERE discovered_listing_id = :listing_id"),
+            {"listing_id": listing_id},
+        ).scalar_one()
+    engine.dispose()
+
+    assert count == 2
+
+
+def test_same_listing_same_non_null_user_twice_is_rejected(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The composite constraint still enforces per-user uniqueness - the
+    same user can never get two rows for the same listing."""
+    db_path = tmp_path / "alembic_pending_notification_same_user_twice_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_a = _insert_user(conn, "a@example.com")
+        listing_id = _insert_listing(conn, "dup-1")
+        conn.execute(
+            sa.text(
+                "INSERT INTO pending_notifications (discovered_listing_id, user_id, status, attempt_count, created_at) "
+                "VALUES (:listing_id, :user_id, 'pending', 0, '2026-01-01T00:00:00+00:00')"
+            ),
+            {"listing_id": listing_id, "user_id": user_a},
+        )
+
+    engine2 = create_db_engine(f"sqlite:///{db_path}")
+    with pytest.raises(IntegrityError):
+        with engine2.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO pending_notifications (discovered_listing_id, user_id, status, attempt_count, created_at) "
+                    "VALUES (:listing_id, :user_id, 'pending', 0, '2026-01-01T00:00:00+00:00')"
+                ),
+                {"listing_id": listing_id, "user_id": user_a},
+            )
+    engine.dispose()
+    engine2.dispose()
+
+
+def test_same_listing_null_user_twice_is_allowed(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Standard SQL uniqueness semantics: NULL is never treated as equal
+    to NULL, so two `user_id IS NULL` rows for the exact same listing
+    never violate the composite constraint - true on both PostgreSQL and
+    SQLite. No application-level special-casing is added for this in
+    Phase 2D-SCHEMA; the database's own semantics already do the right
+    thing unaided."""
+    db_path = tmp_path / "alembic_pending_notification_null_user_twice_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        listing_id = _insert_listing(conn, "null-user-1")
+        conn.execute(
+            sa.text(
+                "INSERT INTO pending_notifications (discovered_listing_id, user_id, status, attempt_count, created_at) "
+                "VALUES (:listing_id, NULL, 'pending', 0, '2026-01-01T00:00:00+00:00')"
+            ),
+            {"listing_id": listing_id},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO pending_notifications (discovered_listing_id, user_id, status, attempt_count, created_at) "
+                "VALUES (:listing_id, NULL, 'pending', 0, '2026-01-01T00:00:00+00:00')"
+            ),
+            {"listing_id": listing_id},
+        )
+        count = conn.execute(
+            sa.text(
+                "SELECT COUNT(*) FROM pending_notifications WHERE discovered_listing_id = :listing_id "
+                "AND user_id IS NULL"
+            ),
+            {"listing_id": listing_id},
+        ).scalar_one()
+    engine.dispose()
+
+    assert count == 2
+
+
+def test_migration_preserves_a_populated_user_id_row_and_its_history_fields(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Existing rows are never rewritten by this migration - proven with
+    representative, deliberately non-default history values (a `failed`
+    row with several retry attempts already recorded), inserted *before*
+    this migration runs, then confirmed byte-for-byte unchanged after."""
+    db_path = tmp_path / "alembic_pending_notification_preserve_populated_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "c4d8f1a6e0b2")
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_id = _insert_user(conn, "populated@example.com")
+        listing_id = _insert_listing(conn, "populated-1")
+        conn.execute(
+            sa.text(
+                "INSERT INTO pending_notifications "
+                "(discovered_listing_id, user_id, status, attempt_count, claimed_at, last_attempted_at, "
+                "last_error, created_at, sent_at) "
+                "VALUES (:listing_id, :user_id, 'failed', 7, '2026-01-02T00:00:00+00:00', "
+                "'2026-01-03T00:00:00+00:00', 'simulated permanent failure', '2026-01-01T00:00:00+00:00', NULL)"
+            ),
+            {"listing_id": listing_id, "user_id": user_id},
+        )
+    engine.dispose()
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text(
+                    "SELECT user_id, status, attempt_count, claimed_at, last_attempted_at, last_error, "
+                    "created_at, sent_at FROM pending_notifications WHERE discovered_listing_id = :listing_id"
+                ),
+                {"listing_id": listing_id},
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert row.user_id == user_id
+    assert row.status == "failed"
+    assert row.attempt_count == 7
+    assert row.claimed_at is not None
+    assert row.last_attempted_at is not None
+    assert row.last_error == "simulated permanent failure"
+    assert row.created_at is not None
+    assert row.sent_at is None
+
+
+def test_migration_preserves_a_null_user_historical_row(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The 24 real historical rows this phase must never touch, guess, or
+    reassign - simulated here as a `sent` row (successfully delivered
+    before `user_id` ever existed) with `user_id IS NULL`."""
+    db_path = tmp_path / "alembic_pending_notification_preserve_null_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "c4d8f1a6e0b2")
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        listing_id = _insert_listing(conn, "null-historical-1")
+        conn.execute(
+            sa.text(
+                "INSERT INTO pending_notifications "
+                "(discovered_listing_id, user_id, status, attempt_count, created_at, sent_at) "
+                "VALUES (:listing_id, NULL, 'sent', 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:05:00+00:00')"
+            ),
+            {"listing_id": listing_id},
+        )
+    engine.dispose()
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text(
+                    "SELECT user_id, status, attempt_count, sent_at FROM pending_notifications "
+                    "WHERE discovered_listing_id = :listing_id"
+                ),
+                {"listing_id": listing_id},
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert row.user_id is None
+    assert row.status == "sent"
+    assert row.attempt_count == 1
+    assert row.sent_at is not None
+
+
+def test_downgrade_succeeds_before_any_multi_user_duplicate_listing_exists(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before Phase 2D-BEHAVIOR ever ships, every listing still has at
+    most one notification row regardless of user - the old single-column
+    uniqueness rule is never actually violated by real data yet, so
+    downgrade must succeed cleanly."""
+    db_path = tmp_path / "alembic_pending_notification_downgrade_safe_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_id = _insert_user(conn, "safe-downgrade@example.com")
+        listing_id = _insert_listing(conn, "safe-downgrade-1")
+        conn.execute(
+            sa.text(
+                "INSERT INTO pending_notifications (discovered_listing_id, user_id, status, attempt_count, created_at) "
+                "VALUES (:listing_id, :user_id, 'pending', 0, '2026-01-01T00:00:00+00:00')"
+            ),
+            {"listing_id": listing_id, "user_id": user_id},
+        )
+    engine.dispose()
+
+    command.downgrade(cfg, "c4d8f1a6e0b2")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        unique_constraints = inspector.get_unique_constraints("pending_notifications")
+        index_names = {idx["name"] for idx in inspector.get_indexes("pending_notifications")}
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text(
+                    "SELECT user_id, status FROM pending_notifications WHERE discovered_listing_id = :listing_id"
+                ),
+                {"listing_id": listing_id},
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert len(unique_constraints) == 1
+    assert unique_constraints[0]["column_names"] == ["discovered_listing_id"]
+    assert "ix_pending_notifications_discovered_listing_id" not in index_names
+    # Data is never deleted or rewritten by downgrade either.
+    assert row.user_id == user_id
+    assert row.status == "pending"
+
+
+def test_downgrade_does_not_delete_or_rewrite_the_24_style_null_user_rows(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Downgrade must never silently delete or reassign the historical
+    NULL-user rows either, even though restoring the old single-column
+    constraint doesn't logically require touching them."""
+    db_path = tmp_path / "alembic_pending_notification_downgrade_preserves_null_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        listing_id = _insert_listing(conn, "downgrade-null-1")
+        conn.execute(
+            sa.text(
+                "INSERT INTO pending_notifications (discovered_listing_id, user_id, status, attempt_count, created_at) "
+                "VALUES (:listing_id, NULL, 'failed', 10, '2026-01-01T00:00:00+00:00')"
+            ),
+            {"listing_id": listing_id},
+        )
+    engine.dispose()
+
+    command.downgrade(cfg, "c4d8f1a6e0b2")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text(
+                    "SELECT user_id, status, attempt_count FROM pending_notifications "
+                    "WHERE discovered_listing_id = :listing_id"
+                ),
+                {"listing_id": listing_id},
+            ).one()
+            total = conn.execute(sa.text("SELECT COUNT(*) FROM pending_notifications")).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert row.user_id is None
+    assert row.status == "failed"
+    assert row.attempt_count == 10
+    assert total == 1
+
+
+def test_downgrade_fails_once_two_users_share_a_listing(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Documents the operational limitation the audit identified, rather
+    than resolving it: once a canonical listing genuinely has two
+    non-NULL-user rows (what Phase 2D-BEHAVIOR, a later phase, would
+    create), restoring `UNIQUE(discovered_listing_id)` alone is a real
+    constraint violation - PostgreSQL and SQLite both validate ALL
+    existing rows when creating a new UNIQUE constraint. This migration
+    must never silently delete or merge rows to force the downgrade to
+    succeed - the correct operational response, if this is ever hit for
+    real, is to roll back the *application code* instead and leave the
+    schema as `upgrade()` left it (see this migration's own downgrade()
+    docstring)."""
+    db_path = tmp_path / "alembic_pending_notification_downgrade_unsafe_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_a = _insert_user(conn, "conflict-a@example.com")
+        user_b = _insert_user(conn, "conflict-b@example.com")
+        listing_id = _insert_listing(conn, "conflict-1")
+        for user_id in (user_a, user_b):
+            conn.execute(
+                sa.text(
+                    "INSERT INTO pending_notifications (discovered_listing_id, user_id, status, attempt_count, created_at) "
+                    "VALUES (:listing_id, :user_id, 'pending', 0, '2026-01-01T00:00:00+00:00')"
+                ),
+                {"listing_id": listing_id, "user_id": user_id},
+            )
+    engine.dispose()
+
+    with pytest.raises(Exception):
+        command.downgrade(cfg, "c4d8f1a6e0b2")
+
+    # Never silently resolved by deleting/merging rows to force success -
+    # both rows must still be there, completely unrewritten, after the
+    # failed downgrade attempt.
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            count = conn.execute(
+                sa.text("SELECT COUNT(*) FROM pending_notifications WHERE discovered_listing_id = :listing_id"),
+                {"listing_id": listing_id},
+            ).scalar_one()
+    finally:
+        engine.dispose()
+    assert count == 2

@@ -232,23 +232,43 @@ def test_enqueue_is_not_committed_by_the_repository_itself(session_factory) -> N
     verify.close()
 
 
-def test_enqueue_twice_for_the_same_listing_violates_the_unique_constraint(session_factory) -> None:
-    """The dedup guarantee - "never queue the same listing's notification
-    twice" - is enforced by the database (`PendingNotification`'s
-    `UNIQUE` constraint on `discovered_listing_id`), not just by callers
-    happening to only enqueue once."""
+def test_enqueue_twice_for_the_same_listing_and_same_user_violates_the_unique_constraint(session_factory) -> None:
+    """The dedup guarantee - "never queue the same (user, listing)
+    notification twice" - is enforced by the database (Phase 2D-SCHEMA:
+    `PendingNotification`'s composite `UNIQUE(user_id, discovered_
+    listing_id)`, replacing the original single-column constraint), not
+    just by callers happening to only enqueue once."""
+    user_id = _create_user(session_factory, "dedup-owner@example.com")
     session = session_factory()
     row = ListingRepository(session).save_new(_listing("dedup-1"))
     session.commit()
 
-    NotificationOutboxRepository(session).enqueue(row.id)
+    NotificationOutboxRepository(session).enqueue(row.id, user_id=user_id)
     session.commit()
 
     # enqueue() flushes (see its docstring), so the UNIQUE violation
     # surfaces immediately here, not at a later commit().
     with pytest.raises(IntegrityError):
-        NotificationOutboxRepository(session).enqueue(row.id)
+        NotificationOutboxRepository(session).enqueue(row.id, user_id=user_id)
     session.rollback()
+    session.close()
+
+
+def test_enqueue_twice_for_the_same_listing_with_null_user_is_allowed(session_factory) -> None:
+    """Phase 2D-SCHEMA: standard SQL uniqueness semantics never treat
+    `NULL` as equal to `NULL`, so two `user_id=None` enqueues for the
+    exact same listing no longer collide - a deliberate consequence of
+    the composite constraint, not a regression of the dedup guarantee
+    (which is now scoped per-user, not global - see the test above)."""
+    session = session_factory()
+    row = ListingRepository(session).save_new(_listing("dedup-null-1"))
+    session.commit()
+
+    NotificationOutboxRepository(session).enqueue(row.id)
+    NotificationOutboxRepository(session).enqueue(row.id)
+    session.commit()
+
+    assert session.query(PendingNotification).filter_by(discovered_listing_id=row.id).count() == 2
     session.close()
 
 
@@ -345,28 +365,32 @@ def test_enqueue_stamps_the_given_user_id_directly(session_factory) -> None:
     session.close()
 
 
-def test_re_enqueue_does_not_overwrite_an_existing_rows_user_id(session_factory) -> None:
-    """Phase 2B is explicitly not the multi-user cutover: a second
-    enqueue attempt for an already-enqueued listing must not transfer
-    ownership to a different user - it must fail exactly as it always
-    has (`UNIQUE(discovered_listing_id)`), leaving the original row's
-    `user_id` untouched."""
-    user_a = _create_user(session_factory, "phase-2b-owner-a@example.com")
-    user_b = _create_user(session_factory, "phase-2b-owner-b@example.com")
+def test_enqueue_for_a_different_user_creates_an_independent_second_row(session_factory) -> None:
+    """Phase 2D-SCHEMA: enqueueing for a *different* user for an
+    already-enqueued listing no longer collides with the first user's
+    row at all - it creates its own, independent row, and never
+    overwrites, merges into, or otherwise disturbs the first. This is
+    the schema half of letting User A and User B each get their own
+    notification for the same canonical listing (the runtime trigger for
+    actually calling `enqueue()` a second time is a later, separate
+    phase - see `PendingNotification`'s own docstring - but the schema
+    already permits it as of this phase)."""
+    user_a = _create_user(session_factory, "phase-2d-owner-a@example.com")
+    user_b = _create_user(session_factory, "phase-2d-owner-b@example.com")
     session = session_factory()
-    row = ListingRepository(session).save_new(_listing("phase-2b-reenqueue-1"))
+    row = ListingRepository(session).save_new(_listing("phase-2d-second-row-1"))
     listing_id = row.id
     NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_a)
     session.commit()
 
-    with pytest.raises(IntegrityError):
-        NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_b)
-    session.rollback()
+    NotificationOutboxRepository(session).enqueue(listing_id, user_id=user_b)
+    session.commit()
     session.close()
 
     verify = session_factory()
-    persisted = verify.query(PendingNotification).filter_by(discovered_listing_id=listing_id).one()
-    assert persisted.user_id == user_a
+    rows = verify.query(PendingNotification).filter_by(discovered_listing_id=listing_id).all()
+    assert {row.user_id for row in rows} == {user_a, user_b}
+    verify.close()
     verify.close()
 
 

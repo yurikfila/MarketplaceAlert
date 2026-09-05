@@ -284,41 +284,69 @@ class PendingNotification(Base):
     than eliminated (it cannot be eliminated without a distributed
     transaction spanning Postgres and Telegram, which does not exist).
 
-    Deduplication *before* sending - "never queue the same listing's
-    notification twice" - is a hard guarantee: enforced by the `UNIQUE`
-    constraint on `discovered_listing_id` below, not just by callers
-    happening to only enqueue once.
+    Deduplication is a hard database guarantee, not just callers happening
+    to enqueue once - see `UniqueConstraint` below for exactly what's
+    unique and why (Phase 2D-SCHEMA of the multi-user notification outbox
+    redesign changed this from a single-column to a composite constraint;
+    see that constraint's own comment for the full reasoning).
 
-    **Phase 2A note (multi-user notification outbox redesign)**: `user_id`
-    below is schema-only groundwork - nullable, unwritten, unread by any
-    code path yet. `discovered_listing_id` remains the sole `UNIQUE`
-    identity for this table; ownership is still resolved exactly as
-    before, via `discovered_listing_id -> DiscoveredListing.discovered_by_
-    saved_search_id -> SavedSearch.user_id` (see `core/notifications/
-    outbox.py`'s `resolve_destination`). Writing this column, backfilling
-    it, and changing the uniqueness constraint are explicitly later,
-    separate phases - see that column's own docstring for why.
+    **Phase 2D-SCHEMA note (multi-user notification outbox redesign,
+    schema-only half)**: `user_id` is still schema-only groundwork as far
+    as *runtime behavior* goes - `SavedSearchRunner` still enqueues only
+    one row per globally-new listing (`discovery_result.new_listing_ids`),
+    exactly as before; nothing yet enqueues a second row for a second
+    user sharing the same listing. What changed in this phase is only
+    that the schema now *permits* that second row, once a later,
+    separate phase (Phase 2D-BEHAVIOR) actually starts creating it - see
+    the audit that preceded this phase for why schema-first, behavior-
+    later is the safe order. Ownership resolution is unchanged: `user_id`
+    preferred when stamped (Phase 2B), falling back to `discovered_
+    listing_id -> DiscoveredListing.discovered_by_saved_search_id ->
+    SavedSearch.user_id` for historical `NULL` rows (see `core/
+    notifications/outbox.py`'s `resolve_destination`).
     """
 
     __tablename__ = "pending_notifications"
+    __table_args__ = (
+        # Phase 2D-SCHEMA: replaces the original single-column
+        # `UNIQUE(discovered_listing_id)` (see `163ae88ffc55_add_
+        # notification_outbox.py` - unnamed there, so PostgreSQL auto-
+        # generated its actual constraint name; the migration that
+        # replaces it discovers that name via reflection rather than
+        # guessing it - see that migration's own docstring). A listing
+        # can now have at most one outbox row *per user* rather than one
+        # ever, globally - the schema half of enabling User A and User B
+        # to each get their own notification for the same canonical
+        # listing. `user_id IS NULL` never collides with itself under
+        # standard SQL uniqueness semantics (NULL is never treated as
+        # equal to NULL) - both PostgreSQL and SQLite agree on this, so
+        # the 24 (and growing) historical rows enqueued before `user_id`
+        # existed, and any future genuinely-unresolvable-owner row, can
+        # freely coexist without ever needing special-casing here.
+        UniqueConstraint(
+            "user_id", "discovered_listing_id", name="uq_pending_notifications_user_id_discovered_listing_id"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
-    # The dedup guarantee - a listing can only ever have one outbox row,
-    # enforced by the database, not just by `ListingDiscoveryService`
-    # only ever enqueueing on first discovery. `ondelete="CASCADE"`: if
-    # the listing itself is ever removed (e.g. by the historical
-    # relevance cleanup script), an unsent notification about it is
-    # meaningless and should go with it.
+    # `ondelete="CASCADE"`: if the listing itself is ever removed (e.g.
+    # by the historical relevance cleanup script), an unsent notification
+    # about it is meaningless and should go with it.
     #
-    # Phase 2A: still the only UNIQUE identity this table has. Multi-user
-    # notification delivery needs this to eventually become (or be
-    # replaced by) something scoped per-user (see `user_id` below) - not
-    # done here. Changing this constraint is explicitly a later phase.
+    # No longer `unique=True` on its own (Phase 2D-SCHEMA - see this
+    # table's `UniqueConstraint` above for the replacement). `index=True`
+    # here instead: the composite unique index above leads with `user_id`,
+    # which doesn't efficiently serve a lookup keyed on `discovered_
+    # listing_id` alone (e.g. this FK's own `ON DELETE CASCADE` needing to
+    # find every notification for a deleted listing) - a dedicated,
+    # non-unique index on this column alone closes that gap, matching
+    # `ListingAttribution.discovered_listing_id`'s identical precedent and
+    # reasoning exactly.
     discovered_listing_id: Mapped[int] = mapped_column(
         ForeignKey("discovered_listings.id", ondelete="CASCADE", name="fk_pending_notifications_discovered_listing_id"),
         nullable=False,
-        unique=True,
+        index=True,
     )
 
     # Phase 2A schema-only groundwork for multi-user notification

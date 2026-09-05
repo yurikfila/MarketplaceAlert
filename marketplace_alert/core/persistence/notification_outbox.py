@@ -217,6 +217,15 @@ class NotificationOutboxRepository:
             row.status = NOTIFICATION_STATUS_FAILED if row.attempt_count >= max_attempts else NOTIFICATION_STATUS_PENDING
         self._session.flush()
 
+    def list_all(self) -> list[PendingNotification]:
+        """Every `pending_notifications` row, unpaginated - for maintenance
+        operations that need to inspect every row (e.g. Phase 2C's
+        `core/persistence/notification_user_backfill.py`). Never for a
+        normal claim/deliver/complete path - see `claim_batch` for that.
+        Matches `ListingRepository.list_all()`'s identical convention."""
+        stmt = select(PendingNotification).order_by(PendingNotification.id)
+        return list(self._session.execute(stmt).scalars().all())
+
 
 def _to_listing(row: DiscoveredListing) -> Listing:
     """Reconstructs a `Listing` (the shape `NotificationProvider` expects)

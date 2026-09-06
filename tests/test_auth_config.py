@@ -126,3 +126,43 @@ def test_token_lifetime_settings_are_overridable() -> None:
     assert settings.password_reset_max_attempts == 3
     assert settings.password_reset_resend_cooldown_seconds == 30
     assert settings.password_reset_max_per_hour == 2
+
+
+# --- Password-reset email delivery (Resend) settings - Phase 4B --------------
+#
+# Provider/config only in this phase - nothing reads these at runtime yet
+# (see `marketplace_alert/notifications/email/provider.py` and
+# `dependencies.py`). All three are optional, same convention as every
+# other external integration (Telegram, Etsy, eBay, Reverb, Bonanza).
+
+
+def test_resend_settings_default_to_none() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.resend_api_key is None
+    assert settings.password_reset_email_from is None
+    assert settings.password_reset_email_reply_to is None
+
+
+def test_resend_settings_are_overridable() -> None:
+    settings = Settings(
+        _env_file=None,
+        resend_api_key="re_fake_test_key",
+        password_reset_email_from="MarketplaceAlert <noreply@example.com>",
+        password_reset_email_reply_to="support@example.com",
+    )
+    assert settings.resend_api_key == "re_fake_test_key"
+    assert settings.password_reset_email_from == "MarketplaceAlert <noreply@example.com>"
+    assert settings.password_reset_email_reply_to == "support@example.com"
+
+
+def test_missing_resend_settings_does_not_raise_and_does_not_require_database_url() -> None:
+    """The core startup-safety requirement: leaving all three Resend
+    settings unset must never prevent `Settings` from constructing, with
+    or without DATABASE_URL set (i.e. regardless of local-dev vs.
+    production-shaped configuration) - matching every other optional
+    integration's own established behavior."""
+    without_database_url = Settings(_env_file=None, jwt_secret_key=_VALID_SECRET)
+    with_database_url = Settings(_env_file=None, database_url=_FAKE_DATABASE_URL, jwt_secret_key=_VALID_SECRET)
+
+    assert without_database_url.resend_api_key is None
+    assert with_database_url.resend_api_key is None

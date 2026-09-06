@@ -22,6 +22,7 @@ from marketplace_alert.core.persistence.database import get_db_session
 from marketplace_alert.core.saved_searches.runner import SavedSearchRunner
 from marketplace_alert.core.saved_searches.service import SavedSearchService
 from marketplace_alert.core.scheduler.guard import SavedSearchRunGuard
+from marketplace_alert.notifications.email.provider import PasswordResetEmailSender
 from marketplace_alert.notifications.telegram.provider import TelegramNotificationProvider
 
 # The concrete provider (Telegram) is chosen here, once, at startup - every
@@ -49,6 +50,24 @@ notification_provider = TelegramNotificationProvider(
 notification_service = NotificationService(
     notification_provider,
     send_delay_seconds=settings.telegram_send_delay_seconds,
+)
+
+# Phase 4B of the approved Resend-integration design
+# (`marketplace_alert/notifications/email/provider.py`) - a module-level
+# singleton, same convention as `notification_provider` above (stateless,
+# holds only external-service configuration, safe to share across
+# requests). Disabled automatically if `RESEND_API_KEY`/`PASSWORD_RESET_
+# EMAIL_FROM` are missing - see that class's own docstring.
+#
+# **Intentionally dead/unreferenced runtime functionality as of this
+# phase** - nothing calls `send_password_reset_code` yet.
+# `POST /api/v1/auth/forgot-password` (`api/v1/auth.py`) still discards
+# `AuthService.request_password_reset`'s result entirely; wiring this
+# singleton into that route is Phase 4C's job, not this one's.
+password_reset_email_sender = PasswordResetEmailSender(
+    api_key=settings.resend_api_key,
+    from_address=settings.password_reset_email_from,
+    reply_to=settings.password_reset_email_reply_to,
 )
 
 

@@ -300,6 +300,26 @@ class Settings(BaseSettings):
     # matching account, so there is nothing here to count against it).
     password_reset_max_per_hour: int = 5
 
+    # --- Password-reset email delivery (Resend - the email provider;
+    # unrelated to the "resend"/re-send-request wording used just above) ---
+    #
+    # Phase 4B of the approved Resend-integration design
+    # (`marketplace_alert/notifications/email/provider.py`) - all three
+    # optional, exactly like every other external integration in this
+    # codebase (Telegram, Etsy, eBay, Reverb, Bonanza): leave unset to
+    # disable password-reset email delivery entirely - the app still
+    # starts normally, and `PasswordResetEmailSender.is_enabled` is
+    # `False`. Not wired into any route yet (that's Phase 4C) - nothing
+    # reads these three settings at runtime today. Never hard-code a real
+    # value here - these are read from the environment / `.env` only.
+    resend_api_key: str | None = None
+    password_reset_email_from: str | None = None
+    # Optional - Resend accepts `reply_to` only when the caller actually
+    # wants replies routed somewhere; omitted from the outbound request
+    # entirely when unset (see PasswordResetEmailSender.send_password_
+    # reset_code), never sent as an empty/null value.
+    password_reset_email_reply_to: str | None = None
+
     # Brute-force login protection (Phase 2 - `core/auth/service.py`,
     # `User.failed_login_attempts`/`locked_until`). After this many
     # consecutive wrong-password attempts against one account, further

@@ -29,6 +29,7 @@ lifespan with a no-op, so even a future test written with the dangerous
 
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 import pytest
 from fastapi import FastAPI
@@ -41,8 +42,10 @@ from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.notifications.base import NotificationProvider
 from marketplace_alert.core.notifications.service import NotificationService
 from marketplace_alert.core.persistence.database import Base, create_db_engine, get_db_session
+from marketplace_alert.dependencies import get_password_reset_email_sender
 from marketplace_alert.main import app, get_notification_service
 from marketplace_alert.main import _saved_search_run_guard as saved_search_run_guard
+from marketplace_alert.notifications.email.provider import PasswordResetEmailError
 
 
 @pytest.fixture(autouse=True)
@@ -77,6 +80,40 @@ class FakeNotificationProvider(NotificationProvider):
 
     def send_listing_alert(self, listing: Listing, destination: str) -> None:
         self.sent_listings.append(listing)
+
+
+@dataclass
+class _RecordedPasswordResetEmailCall:
+    email: str
+    code: str
+    expires_minutes: int
+
+
+class FakePasswordResetEmailSender:
+    """Records calls instead of sending real email via Resend - the
+    `PasswordResetEmailSender` the `client` fixture overrides
+    `get_password_reset_email_sender` with (see `api/v1/auth.py:
+    _deliver_password_reset_code`, the route-level orchestration this
+    fake exists to test without any real HTTP).
+
+    `is_enabled` defaults to `True` (most tests want the "happy path"
+    without extra setup) and is a plain mutable attribute, not a
+    read-only property like the real class's - tests need to freely
+    toggle it. Set `.error` to a `PasswordResetEmailError` instance to
+    make `send_password_reset_code` raise (recording the call first, same
+    as the real provider recording an attempt before it can fail).
+    Inspect `.calls` - never real, never sent anywhere.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[_RecordedPasswordResetEmailCall] = []
+        self.is_enabled = True
+        self.error: PasswordResetEmailError | None = None
+
+    def send_password_reset_code(self, *, email: str, code: str, expires_minutes: int) -> None:
+        self.calls.append(_RecordedPasswordResetEmailCall(email=email, code=code, expires_minutes=expires_minutes))
+        if self.error is not None:
+            raise self.error
 
 
 @pytest.fixture()
@@ -124,9 +161,21 @@ def fake_notification_provider() -> FakeNotificationProvider:
 
 
 @pytest.fixture()
-def client(db_engine: Engine, fake_notification_provider: FakeNotificationProvider) -> Iterator[TestClient]:
+def fake_password_reset_email_sender() -> FakePasswordResetEmailSender:
+    """The fake sender used by the `client` fixture; inspect `.calls`, set
+    `.is_enabled`/`.error` to exercise the other delivery-outcome branches."""
+    return FakePasswordResetEmailSender()
+
+
+@pytest.fixture()
+def client(
+    db_engine: Engine,
+    fake_notification_provider: FakeNotificationProvider,
+    fake_password_reset_email_sender: FakePasswordResetEmailSender,
+) -> Iterator[TestClient]:
     """A TestClient whose /scan endpoint is wired to the isolated test engine
-    and a fake notification provider - never the real database or Telegram."""
+    and fake notification/password-reset-email providers - never the real
+    database, Telegram, or Resend."""
     session_factory = sessionmaker(bind=db_engine, autoflush=False, expire_on_commit=False)
 
     def override_get_db_session() -> Iterator[Session]:
@@ -144,6 +193,7 @@ def client(db_engine: Engine, fake_notification_provider: FakeNotificationProvid
     app.dependency_overrides[get_notification_service] = lambda: NotificationService(
         fake_notification_provider
     )
+    app.dependency_overrides[get_password_reset_email_sender] = lambda: fake_password_reset_email_sender
     # The manual /saved-searches/{id}/run overlap guard is a module-level
     # singleton (main.py), not request-scoped - reset it so a test that
     # exercises the "already running" 409 case can't leak state into a

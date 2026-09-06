@@ -17,6 +17,7 @@ from marketplace_alert.config import settings
 from marketplace_alert.core.auth import service as auth_service_module
 from marketplace_alert.core.auth.models import PasswordResetToken, RefreshToken, User
 from marketplace_alert.core.auth.security import create_access_token, hash_token
+from marketplace_alert.notifications.email.provider import PasswordResetEmailError
 
 _FORGOT_PASSWORD_GENERIC_BODY = {"message": "If that email is registered, a verification code has been sent."}
 
@@ -577,6 +578,206 @@ def test_forgot_password_never_logs_the_raw_code(
         _forgot_password(client, email="raw-code-log@example.com")
 
     assert "135791" not in caplog.text
+
+
+def test_forgot_password_never_logs_the_recipient_email(
+    client, caplog: pytest.LogCaptureFixture
+) -> None:
+    _signup(client, email="very-specific-recipient@example.com")
+
+    with caplog.at_level("DEBUG"):
+        _forgot_password(client, email="very-specific-recipient@example.com")
+
+    assert "very-specific-recipient@example.com" not in caplog.text
+
+
+def test_forgot_password_sender_failure_never_logs_email_or_code(
+    client, fake_password_reset_email_sender, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(auth_service_module, "generate_reset_code", lambda: "864209")
+    fake_password_reset_email_sender.error = PasswordResetEmailError("simulated delivery failure")
+    _signup(client, email="failure-log-check@example.com")
+
+    with caplog.at_level("DEBUG"):
+        response = _forgot_password(client, email="failure-log-check@example.com")
+
+    assert response.status_code == 200
+    assert "864209" not in caplog.text
+    assert "failure-log-check@example.com" not in caplog.text
+
+
+# =====================================================================
+# Email delivery orchestration (Phase 4C)
+# =====================================================================
+
+
+def test_forgot_password_does_not_call_sender_when_email_is_unknown(
+    client, fake_password_reset_email_sender
+) -> None:
+    """should_deliver=False internally - the sender must never be called."""
+    response = _forgot_password(client, email="orchestration-unknown@example.com")
+
+    assert response.status_code == 200
+    assert response.json() == _FORGOT_PASSWORD_GENERIC_BODY
+    assert fake_password_reset_email_sender.calls == []
+
+
+def test_forgot_password_does_not_call_sender_for_an_inactive_user(
+    client, db_session, fake_password_reset_email_sender
+) -> None:
+    _signup(client, email="orchestration-inactive@example.com")
+    user = db_session.query(User).filter_by(email="orchestration-inactive@example.com").one()
+    user.is_active = False
+    db_session.commit()
+
+    response = _forgot_password(client, email="orchestration-inactive@example.com")
+
+    assert response.status_code == 200
+    assert response.json() == _FORGOT_PASSWORD_GENERIC_BODY
+    assert fake_password_reset_email_sender.calls == []
+
+
+def test_forgot_password_does_not_call_sender_when_disabled(
+    client, fake_password_reset_email_sender
+) -> None:
+    """should_deliver=True but sender.is_enabled=False - never called."""
+    fake_password_reset_email_sender.is_enabled = False
+    _signup(client, email="orchestration-disabled@example.com")
+
+    response = _forgot_password(client, email="orchestration-disabled@example.com")
+
+    assert response.status_code == 200
+    assert response.json() == _FORGOT_PASSWORD_GENERIC_BODY
+    assert fake_password_reset_email_sender.calls == []
+
+
+def test_forgot_password_calls_sender_exactly_once_with_the_correct_arguments(
+    client, monkeypatch: pytest.MonkeyPatch, fake_password_reset_email_sender
+) -> None:
+    monkeypatch.setattr(auth_service_module, "generate_reset_code", lambda: "741852")
+    _signup(client, email="orchestration-success@example.com")
+
+    response = _forgot_password(client, email="orchestration-success@example.com")
+
+    assert response.status_code == 200
+    assert response.json() == _FORGOT_PASSWORD_GENERIC_BODY
+    assert len(fake_password_reset_email_sender.calls) == 1
+    call = fake_password_reset_email_sender.calls[0]
+    assert call.email == "orchestration-success@example.com"
+    assert call.code == "741852"
+    assert call.expires_minutes == settings.password_reset_token_expire_minutes
+
+
+def test_forgot_password_sender_error_still_returns_the_generic_response(
+    client, fake_password_reset_email_sender
+) -> None:
+    fake_password_reset_email_sender.error = PasswordResetEmailError("simulated delivery failure")
+    _signup(client, email="orchestration-failure@example.com")
+
+    response = _forgot_password(client, email="orchestration-failure@example.com")
+
+    assert response.status_code == 200
+    assert response.json() == _FORGOT_PASSWORD_GENERIC_BODY
+    assert len(fake_password_reset_email_sender.calls) == 1  # attempted once; the failure never leaked out
+
+
+def test_forgot_password_does_not_call_sender_a_second_time_during_the_resend_cooldown(
+    client, fake_password_reset_email_sender
+) -> None:
+    _signup(client, email="orchestration-cooldown@example.com")
+
+    first = _forgot_password(client, email="orchestration-cooldown@example.com")
+    assert first.status_code == 200
+    assert len(fake_password_reset_email_sender.calls) == 1
+
+    second = _forgot_password(client, email="orchestration-cooldown@example.com")
+
+    assert second.status_code == 200
+    assert second.json() == _FORGOT_PASSWORD_GENERIC_BODY
+    assert len(fake_password_reset_email_sender.calls) == 1  # still just the one from the first request
+
+
+def test_forgot_password_does_not_call_sender_once_the_hourly_cap_is_reached(
+    client, monkeypatch: pytest.MonkeyPatch, fake_password_reset_email_sender
+) -> None:
+    monkeypatch.setattr(settings, "password_reset_max_per_hour", 1)
+    monkeypatch.setattr(settings, "password_reset_resend_cooldown_seconds", 0)
+    _signup(client, email="orchestration-hourly@example.com")
+
+    _forgot_password(client, email="orchestration-hourly@example.com")
+    assert len(fake_password_reset_email_sender.calls) == 1
+
+    _forgot_password(client, email="orchestration-hourly@example.com")
+
+    assert len(fake_password_reset_email_sender.calls) == 1
+
+
+def test_forgot_password_every_delivery_outcome_produces_the_identical_response(
+    client, monkeypatch: pytest.MonkeyPatch, fake_password_reset_email_sender
+) -> None:
+    """Extends the Phase 3 enumeration-safety guarantee to the two new
+    delivery-outcome states this phase introduces: sender disabled, and
+    sender raising `PasswordResetEmailError`."""
+    _signup(client, email="delivery-outcome-success@example.com")
+    success_response = _forgot_password(client, email="delivery-outcome-success@example.com")
+
+    fake_password_reset_email_sender.is_enabled = False
+    _signup(client, email="delivery-outcome-disabled@example.com")
+    disabled_response = _forgot_password(client, email="delivery-outcome-disabled@example.com")
+
+    fake_password_reset_email_sender.is_enabled = True
+    fake_password_reset_email_sender.error = PasswordResetEmailError("simulated delivery failure")
+    _signup(client, email="delivery-outcome-failure@example.com")
+    failure_response = _forgot_password(client, email="delivery-outcome-failure@example.com")
+
+    responses = [success_response, disabled_response, failure_response]
+    assert all(r.status_code == 200 for r in responses)
+    assert all(r.json() == _FORGOT_PASSWORD_GENERIC_BODY for r in responses)
+
+
+def test_forgot_password_never_makes_a_real_http_call(client, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The `client` fixture's fake sender means `/forgot-password` never
+    touches `httpx.post` at all - proven directly by making any such call
+    fail the test outright."""
+    import httpx
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("must never make a real HTTP call from an API test")
+
+    monkeypatch.setattr(httpx, "post", _fail_if_called)
+    _signup(client, email="no-real-http@example.com")
+
+    response = _forgot_password(client, email="no-real-http@example.com")
+
+    assert response.status_code == 200
+
+
+def test_cooldown_after_delivery_failure_stays_generic_and_creates_no_second_code(
+    client, db_session, fake_password_reset_email_sender
+) -> None:
+    """The approved, unchanged policy: a delivery failure does not bypass
+    the resend cooldown - the code is committed to the database before
+    delivery is ever attempted, so the cooldown (measured from issuance,
+    not delivery outcome) still suppresses an immediate second request.
+    No immediate-resend workaround, no code invalidation, no new DB row."""
+    fake_password_reset_email_sender.error = PasswordResetEmailError("simulated delivery failure")
+    _signup(client, email="cooldown-failure@example.com")
+
+    first = _forgot_password(client, email="cooldown-failure@example.com")
+    assert first.status_code == 200
+    assert first.json() == _FORGOT_PASSWORD_GENERIC_BODY
+    assert len(fake_password_reset_email_sender.calls) == 1
+
+    user_id = db_session.query(User).filter_by(email="cooldown-failure@example.com").one().id
+    assert db_session.query(PasswordResetToken).filter_by(user_id=user_id).count() == 1
+
+    second = _forgot_password(client, email="cooldown-failure@example.com")
+
+    assert second.status_code == 200
+    assert second.json() == _FORGOT_PASSWORD_GENERIC_BODY
+    # Suppressed by the cooldown - the sender is not invoked again, and no second row was created.
+    assert len(fake_password_reset_email_sender.calls) == 1
+    assert db_session.query(PasswordResetToken).filter_by(user_id=user_id).count() == 1
 
 
 # =====================================================================

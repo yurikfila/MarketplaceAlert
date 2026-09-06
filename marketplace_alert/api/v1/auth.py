@@ -15,18 +15,21 @@ do NOT - both must work for a user who cannot currently log in at all.
 listing routes remain exactly as open as before this router exists - see
 PROJECT_CONTEXT.md's authentication design decision for the phased plan.
 
-**Phase 3 of the approved 6-digit-code password-reset design: API
-contract only, no email delivery yet.** `forgot_password()` below calls
-`AuthService.request_password_reset()` and discards its return value
-entirely - no email provider is configured in this phase, so there is
-nothing yet to actually send. A future phase will inspect that call's
-`should_deliver`/`raw_code` to decide whether/what to email, but **must
-never change this route's own response based on them** -
+**Phase 4C of the approved 6-digit-code password-reset design: email
+delivery is wired in, at this API/orchestration layer only.**
+`forgot_password()` calls `AuthService.request_password_reset()`, then
+`_deliver_password_reset_code()` (below) decides - internally,
+privately - whether to actually call `PasswordResetEmailSender`. **This
+route's own public response never changes based on any of that** -
 `PasswordResetRequestResult` is internal-only (see its own docstring in
-`core/auth/service.py`) and is never imported, referenced, or returned
-here at all - FastAPI's `jsonable_encoder` would happily auto-serialize
-it (a plain dataclass) if it ever were.
+`core/auth/service.py`) and is never imported for any purpose other than
+reading `.should_deliver`/`.raw_code` inside `_deliver_password_reset_code`
+- never returned, logged, or otherwise exposed. `core/auth/` itself stays
+completely free of Resend/httpx/email-provider imports, by design - see
+`_deliver_password_reset_code`'s own docstring.
 """
+
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
@@ -41,6 +44,7 @@ from marketplace_alert.api.v1.schemas import (
     TokenPairOut,
     UserPublic,
 )
+from marketplace_alert.config import settings
 from marketplace_alert.core.auth.dependencies import get_current_user
 from marketplace_alert.core.auth.models import User
 from marketplace_alert.core.auth.service import (
@@ -51,11 +55,15 @@ from marketplace_alert.core.auth.service import (
     InvalidCredentialsError,
     InvalidRefreshTokenError,
     InvalidResetCodeError,
+    PasswordResetRequestResult,
     RefreshTokenReusedError,
     TokenPair,
     WeakNewPasswordError,
 )
-from marketplace_alert.dependencies import get_auth_service
+from marketplace_alert.dependencies import get_auth_service, get_password_reset_email_sender
+from marketplace_alert.notifications.email.provider import PasswordResetEmailError, PasswordResetEmailSender
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Mobile API - Authentication"])
 
@@ -174,32 +182,66 @@ def me(current_user: User = Depends(get_current_user)) -> UserPublic:
     return _user_public(current_user)
 
 
+def _deliver_password_reset_code(
+    result: PasswordResetRequestResult, *, email: str, sender: PasswordResetEmailSender
+) -> None:
+    """The one place `PasswordResetRequestResult`'s `should_deliver`/
+    `raw_code` are ever read - deliberately kept out of `AuthService`
+    (see `core/auth/service.py`'s own module docstring: it stays fully
+    usable and fully tested with zero external I/O) and out of
+    `core/auth/` entirely, so the auth/domain layer never has to know
+    Resend exists. Called from `forgot_password()` below; never affects
+    what that route returns, regardless of outcome.
+
+    - `should_deliver=False`: nothing to send - return immediately.
+      `result.raw_code` is never inspected beyond the dataclass's own
+      already-enforced invariant.
+    - `should_deliver=True` but `sender.is_enabled` is `False`: nothing
+      configured to send with - a sanitized, non-identifying log line
+      only, never the email/code.
+    - `should_deliver=True` and enabled: call `send_password_reset_code`
+      exactly once. That method already retries transient failures
+      internally (Phase 4B) - this function adds no second retry loop.
+    - `PasswordResetEmailError`: swallowed here, with a sanitized log
+      line only (no email, no code, no exception text - see that
+      exception's own docstring for why its message could still be
+      provider-shaped rather than instance-specific). Deliberately the
+      *only* exception type caught - an unexpected bug elsewhere must
+      still surface normally as a 500, never silently swallowed.
+    """
+    if not result.should_deliver:
+        return
+    if not sender.is_enabled:
+        logger.info("Password reset email skipped because sender is not configured")
+        return
+    try:
+        sender.send_password_reset_code(
+            email=email,
+            code=result.raw_code,
+            expires_minutes=settings.password_reset_token_expire_minutes,
+        )
+    except PasswordResetEmailError:
+        logger.error("Password reset email delivery failed")
+
+
 @router.post(
     "/forgot-password",
     summary="Request a password-reset verification code",
     description=(
         "Always returns the identical response whether or not the email "
         "is registered, active, on cooldown, or already at its hourly "
-        "issuance limit - see AuthService.request_password_reset's own "
-        "docstring. Unauthenticated by design. No email is actually sent "
-        "yet in this phase (no provider is configured) - a future phase "
-        "delivers the code without ever changing this response."
+        "issuance limit, or whatever happens during email delivery - see "
+        "AuthService.request_password_reset's own docstring. "
+        "Unauthenticated by design."
     ),
 )
 def forgot_password(
-    data: ForgotPasswordRequest, auth_service: AuthService = Depends(get_auth_service)
+    data: ForgotPasswordRequest,
+    auth_service: AuthService = Depends(get_auth_service),
+    email_sender: PasswordResetEmailSender = Depends(get_password_reset_email_sender),
 ) -> ForgotPasswordResponse:
-    # The internal result (should_deliver/raw_code - see
-    # PasswordResetRequestResult's own docstring) is entirely discarded
-    # here, on purpose: there is no email provider in this phase, so
-    # there is nothing yet to actually send. A future Phase 4 will
-    # capture this same call's return value to decide whether/what to
-    # email - but must still always return this exact same response
-    # below regardless of what that value is. Never assign it to a
-    # variable, log it, or let it influence this function's return value
-    # in any way - that discipline is what keeps this route from ever
-    # becoming an account-enumeration or raw-code-leak oracle.
-    auth_service.request_password_reset(email=data.email)
+    result = auth_service.request_password_reset(email=data.email)
+    _deliver_password_reset_code(result, email=data.email, sender=email_sender)
     return ForgotPasswordResponse(message=_FORGOT_PASSWORD_GENERIC_MESSAGE)
 
 

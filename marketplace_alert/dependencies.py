@@ -52,18 +52,14 @@ notification_service = NotificationService(
     send_delay_seconds=settings.telegram_send_delay_seconds,
 )
 
-# Phase 4B of the approved Resend-integration design
-# (`marketplace_alert/notifications/email/provider.py`) - a module-level
-# singleton, same convention as `notification_provider` above (stateless,
-# holds only external-service configuration, safe to share across
-# requests). Disabled automatically if `RESEND_API_KEY`/`PASSWORD_RESET_
-# EMAIL_FROM` are missing - see that class's own docstring.
-#
-# **Intentionally dead/unreferenced runtime functionality as of this
-# phase** - nothing calls `send_password_reset_code` yet.
-# `POST /api/v1/auth/forgot-password` (`api/v1/auth.py`) still discards
-# `AuthService.request_password_reset`'s result entirely; wiring this
-# singleton into that route is Phase 4C's job, not this one's.
+# Resend-integration design (`marketplace_alert/notifications/email/
+# provider.py`) - a module-level singleton, same convention as
+# `notification_provider` above (stateless, holds only external-service
+# configuration, safe to share across requests). Disabled automatically
+# if `RESEND_API_KEY`/`PASSWORD_RESET_EMAIL_FROM` are missing - see that
+# class's own docstring. Wired into `POST /api/v1/auth/forgot-password`
+# (`api/v1/auth.py`) via `get_password_reset_email_sender` below - see
+# that route's own docstring for the exact delivery rules.
 password_reset_email_sender = PasswordResetEmailSender(
     api_key=settings.resend_api_key,
     from_address=settings.password_reset_email_from,
@@ -78,6 +74,16 @@ def get_notification_service() -> NotificationService:
     tests/conftest.py.
     """
     return notification_service
+
+
+def get_password_reset_email_sender() -> PasswordResetEmailSender:
+    """FastAPI dependency, overridden in tests with a fake sender - same
+    convention as `get_notification_service` above.
+
+    Never send real password-reset emails from automated tests - see
+    tests/conftest.py.
+    """
+    return password_reset_email_sender
 
 
 def get_saved_search_service(session: Session = Depends(get_db_session)) -> SavedSearchService:

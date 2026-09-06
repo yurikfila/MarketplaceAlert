@@ -1,5 +1,6 @@
 """Cryptographic primitives for authentication: password hashing, JWT
-access tokens, and refresh-token generation/hashing.
+access tokens, refresh-token generation/hashing, and password-reset
+verification-code generation.
 
 Deliberately the only module in this package that imports `passlib` or
 `jwt` directly - `core/auth/service.py` orchestrates business logic on top
@@ -137,22 +138,46 @@ def decode_access_token(token: str, *, secret_key: str) -> int:
 
 def generate_token() -> str:
     """A cryptographically random, URL-safe opaque token - what a client
-    actually holds (a refresh token, or a password-reset link's token).
-    32 random bytes (~256 bits) - comfortably beyond brute-force range,
-    matching this project's JWT-secret minimum-strength reasoning."""
+    actually holds (a refresh token; password-reset codes use the
+    dedicated `generate_reset_code()` below instead - a 6-digit code has
+    to be short enough to read and type back by hand). 32 random bytes
+    (~256 bits) - comfortably beyond brute-force range, matching this
+    project's JWT-secret minimum-strength reasoning."""
     return secrets.token_urlsafe(32)
 
 
+def generate_reset_code() -> str:
+    """A cryptographically random 6-digit numeric password-reset
+    verification code - what an email actually shows the user.
+
+    `secrets.randbelow(1_000_000)` - never `random.random()`, a UUID, or
+    anything timestamp-derived (all either predictable or the wrong shape
+    entirely) - zero-padded to always be exactly 6 digits (`"000483"` is a
+    valid code, never shortened to `"483"`). Only ~1,000,000 possible
+    values - nowhere near `generate_token()`'s brute-force resistance on
+    its own; see `PasswordResetToken.failed_attempts` and
+    `AuthService.reset_password` for the attempt ceiling that's what
+    actually makes this safe to use.
+    """
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
 def hash_token(raw_token: str) -> str:
-    """Hash an opaque token for storage - SHA-256, not bcrypt.
+    """Hash an opaque token or verification code for storage - SHA-256,
+    not bcrypt.
 
     Deliberately a fast cryptographic hash, not a slow password-hashing
     one: bcrypt's slowness defends a *low-entropy, guessable* secret
-    (a human password) against offline brute force. `raw_token` is
-    already ~256 bits of real randomness (`generate_token`) - there is no
-    dictionary to defend against, so a slow hash would only add cost with
-    no security benefit. What still matters, and is still true here: the
-    raw token is never stored, only this hash - see this package's
+    (a human password) against offline brute force. For `generate_token()`'s
+    ~256-bit output, there is no dictionary to defend against at all, so a
+    slow hash would only add cost with no security benefit. **This
+    reasoning does NOT extend to `generate_reset_code()`'s 6-digit output**
+    (only ~1,000,000 possible values) - hashing speed was never what makes
+    a reset code brute-force-resistant; `PasswordResetToken.failed_attempts`
+    and `AuthService.reset_password`'s attempt ceiling are what actually
+    defend that much smaller keyspace (see `generate_reset_code()`'s own
+    docstring). What still matters, and is still true for either input:
+    the raw value is never stored, only this hash - see this package's
     `models.py` docstring.
     """
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()

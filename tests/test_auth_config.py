@@ -104,7 +104,10 @@ def test_token_lifetime_defaults() -> None:
     settings = Settings(_env_file=None)
     assert settings.access_token_expire_minutes == 30
     assert settings.refresh_token_expire_days == 30
-    assert settings.password_reset_token_expire_minutes == 30
+    assert settings.password_reset_token_expire_minutes == 10
+    assert settings.password_reset_max_attempts == 5
+    assert settings.password_reset_resend_cooldown_seconds == 60
+    assert settings.password_reset_max_per_hour == 5
 
 
 def test_token_lifetime_settings_are_overridable() -> None:
@@ -112,8 +115,14 @@ def test_token_lifetime_settings_are_overridable() -> None:
         _env_file=None,
         access_token_expire_minutes=15,
         refresh_token_expire_days=7,
-        password_reset_token_expire_minutes=60,
+        password_reset_token_expire_minutes=20,
+        password_reset_max_attempts=3,
+        password_reset_resend_cooldown_seconds=30,
+        password_reset_max_per_hour=2,
     )
     assert settings.access_token_expire_minutes == 15
     assert settings.refresh_token_expire_days == 7
-    assert settings.password_reset_token_expire_minutes == 60
+    assert settings.password_reset_token_expire_minutes == 20
+    assert settings.password_reset_max_attempts == 3
+    assert settings.password_reset_resend_cooldown_seconds == 30
+    assert settings.password_reset_max_per_hour == 2

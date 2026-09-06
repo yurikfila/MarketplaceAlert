@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from marketplace_alert.core.auth.models import RefreshToken, User
+from marketplace_alert.core.auth.models import PasswordResetToken, RefreshToken, User
 
 
 def normalize_email(email: str) -> str:
@@ -86,6 +86,18 @@ class UserRepository:
         user.updated_at = datetime.now(timezone.utc)
         self._session.flush()
 
+    def set_password_hash(self, user: User, password_hash: str) -> None:
+        """Overwrites the stored password hash - the one reusable "set/
+        change password" operation this repository was missing (used by
+        `AuthService.reset_password`). Bumps `updated_at`, same as every
+        other User-mutating method here; never touches
+        `failed_login_attempts`/`locked_until` - a password reset and a
+        login-lockout reset are independent concerns, not something this
+        method should conflate."""
+        user.password_hash = password_hash
+        user.updated_at = datetime.now(timezone.utc)
+        self._session.flush()
+
 
 class RefreshTokenRepository:
     """Persistence operations for `RefreshToken` rows, scoped to one session."""
@@ -125,3 +137,156 @@ class RefreshTokenRepository:
         )
         self._session.execute(stmt)
         self._session.flush()
+
+
+class PasswordResetTokenRepository:
+    """Persistence operations for `PasswordResetToken` rows, scoped to one
+    session - same "raw SQL/ORM access only, caller (`AuthService`)
+    decides transaction boundaries" convention as `UserRepository`/
+    `RefreshTokenRepository` above.
+
+    **Every lookup here is scoped by `user_id`, never by `token_hash`
+    alone** - see `PasswordResetToken`'s own class docstring for why a
+    global `token_hash` lookup is unsafe for a 6-digit code (two different
+    users can legitimately share one). `AuthService` always resolves
+    `email -> user` first (via `UserRepository.get_by_email`), then calls
+    into this repository with that user's `id` - nothing here accepts a
+    raw code or a bare `token_hash` to search by, on purpose.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def create(self, *, user_id: int, token_hash: str, expires_at: datetime) -> PasswordResetToken:
+        token = PasswordResetToken(user_id=user_id, token_hash=token_hash, expires_at=expires_at)
+        self._session.add(token)
+        self._session.flush()
+        return token
+
+    def get_live_for_user(self, user_id: int, *, now: datetime) -> PasswordResetToken | None:
+        """The one row (if any) that's still a usable candidate for this
+        user right now - unused (`used_at IS NULL`) and unexpired.
+        Supersession-on-issue (`supersede_unused_for_user`, always called
+        before `create()` - see `AuthService.request_password_reset`) is
+        what keeps this to at most one row in the ordinary case; `.first()`
+        over `created_at` descending is used rather than a strict
+        "exactly one or none" query so a theoretical concurrent-issuance
+        race (two `request_password_reset` calls for the same user landing
+        at the exact same instant - a narrow window this phase doesn't add
+        explicit locking for) degrades to "the newest one wins," never a
+        hard crash over an edge case this rare.
+        """
+        stmt = (
+            select(PasswordResetToken)
+            .where(
+                PasswordResetToken.user_id == user_id,
+                PasswordResetToken.used_at.is_(None),
+                PasswordResetToken.expires_at > now,
+            )
+            .order_by(PasswordResetToken.created_at.desc())
+        )
+        return self._session.execute(stmt).scalars().first()
+
+    def get_most_recent_for_user(self, user_id: int) -> PasswordResetToken | None:
+        """The most recently issued row for this user, regardless of
+        whether it's still live - what the resend cooldown
+        (`settings.password_reset_resend_cooldown_seconds`) is measured
+        against. A superseded or already-used code's issuance still
+        counts as "the last time a code was requested" - `get_live_for_
+        user` above would miss it entirely once it's no longer live,
+        which is exactly why this is a separate query, not a reuse of
+        that one.
+        """
+        stmt = (
+            select(PasswordResetToken)
+            .where(PasswordResetToken.user_id == user_id)
+            .order_by(PasswordResetToken.created_at.desc())
+        )
+        return self._session.execute(stmt).scalars().first()
+
+    def count_issued_since(self, user_id: int, *, since: datetime) -> int:
+        """How many codes have been issued to this user since `since` -
+        every issuance counts toward `settings.password_reset_max_per_
+        hour`, live or not (the hourly cap bounds request/email volume,
+        not how many codes are still usable right now)."""
+        stmt = select(func.count(PasswordResetToken.id)).where(
+            PasswordResetToken.user_id == user_id,
+            PasswordResetToken.created_at >= since,
+        )
+        return self._session.execute(stmt).scalar_one()
+
+    def supersede_unused_for_user(self, user_id: int, *, now: datetime) -> None:
+        """Invalidates every still-unused row for this user by setting
+        `used_at` - the exact same "no longer valid, for any reason"
+        pattern already used by `RefreshTokenRepository.revoke_all_for_
+        user` above, applied here so at most one live row ever exists per
+        user immediately after a new one is issued. Never deletes a row -
+        kept as a harmless audit trail, same reasoning as
+        `PasswordResetToken.used_at`'s own docstring."""
+        stmt = (
+            update(PasswordResetToken)
+            .where(PasswordResetToken.user_id == user_id, PasswordResetToken.used_at.is_(None))
+            .values(used_at=now)
+        )
+        self._session.execute(stmt)
+        self._session.flush()
+
+    def increment_failed_attempts(self, token_id: int) -> None:
+        """A single atomic `SET failed_attempts = failed_attempts + 1` -
+        safe under concurrent wrong-code submissions with no lost-update
+        risk, since the increment is evaluated by the database against
+        the current committed value at write time, not a value read
+        earlier in Python. A benign race could let this overshoot the
+        configured maximum by one or two under heavy concurrent guessing -
+        harmless, since only "is it >= the maximum" is ever checked, never
+        the exact value."""
+        stmt = (
+            update(PasswordResetToken)
+            .where(PasswordResetToken.id == token_id)
+            .values(failed_attempts=PasswordResetToken.failed_attempts + 1)
+        )
+        self._session.execute(stmt)
+        self._session.flush()
+
+    def claim_for_reset(self, token_id: int, *, now: datetime, max_attempts: int) -> bool:
+        """Atomically marks this row used - returns `True` only if THIS
+        call is the one that actually claimed it. A single conditional
+        `UPDATE`, not a `SELECT ... FOR UPDATE` first: the database
+        serializes concurrent claims against the same row, and only one
+        can ever see its own `WHERE` clause still match (`used_at IS
+        NULL`) once the winner's write has landed - the same "optimistic
+        claim, check rowcount" idiom this codebase's notification outbox
+        already uses for its own conditional updates, just for a single
+        contested row here rather than a shared pool. Re-checks `expires_
+        at`/`failed_attempts` in the same statement so a code that expired
+        or hit its attempt ceiling in the instant between being read and
+        being claimed can never still succeed.
+
+        `synchronize_session=False`: this statement's `WHERE` clause
+        compares `expires_at` (a real column) against `now` (an aware
+        Python `datetime`) - SQLAlchemy's default "evaluate" synchronize
+        strategy tries to re-check that comparison in Python against any
+        already-loaded `PasswordResetToken` instance in this session's
+        identity map (e.g. the very row `AuthService.reset_password` just
+        read via `get_live_for_user`), and SQLite drops tzinfo on
+        round-trip - comparing that naive, already-loaded value against
+        the aware `now` raises `TypeError: can't compare offset-naive and
+        offset-aware datetimes` (confirmed directly). The `UPDATE` itself
+        is unaffected either way - only in-memory object synchronization
+        is skipped - and nothing here relies on the loaded object
+        reflecting the new `used_at` without an explicit reload.
+        """
+        stmt = (
+            update(PasswordResetToken)
+            .where(
+                PasswordResetToken.id == token_id,
+                PasswordResetToken.used_at.is_(None),
+                PasswordResetToken.expires_at > now,
+                PasswordResetToken.failed_attempts < max_attempts,
+            )
+            .values(used_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        result = self._session.execute(stmt)
+        self._session.flush()
+        return result.rowcount == 1

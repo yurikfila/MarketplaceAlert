@@ -258,14 +258,47 @@ class Settings(BaseSettings):
     # stay valid forever."
     refresh_token_expire_days: int = 30
 
-    # Password-reset tokens are short-lived and single-use - long enough for
-    # someone to receive and act on a reset link, short enough that a
-    # leaked link (e.g. via a proxy log) stops being useful quickly. Email
-    # delivery itself is a separate, later phase (this backend cannot send
-    # email yet) - this setting exists now so the token/TTL model can be
-    # built and tested ahead of that, per the approved authentication
-    # design.
-    password_reset_token_expire_minutes: int = 30
+    # Password-reset verification codes are short-lived and single-use -
+    # long enough for someone to receive the email and type the code back
+    # in, short enough that a leaked/observed code (e.g. via a proxy log)
+    # stops being useful quickly. 10 minutes, not the original 256-bit-
+    # opaque-token design's 30: a 6-digit code's whole UX model is "check
+    # email right now, come right back", not "click a link whenever
+    # convenient" (see the approved 6-digit-code password-reset design).
+    # Email delivery itself is still a separate, later phase (this backend
+    # cannot send email yet) - `AuthService.request_password_reset`/
+    # `reset_password` (this phase) are fully built and tested ahead of it.
+    password_reset_token_expire_minutes: int = 10
+
+    # Bounds brute force against the verification code's much smaller
+    # keyspace (~1,000,000 possible 6-digit values, vs. the refresh/access
+    # token's 256 bits) - see `PasswordResetToken.failed_attempts`'s own
+    # docstring. Matches `max_failed_login_attempts`'s existing default for
+    # consistency - both mean "how many wrong guesses before this specific
+    # credential attempt is locked out."
+    password_reset_max_attempts: int = 5
+
+    # Resend throttling: a repeat `request_password_reset` call for the
+    # same account within this many seconds of the last one is silently
+    # suppressed (no new code, no new email) rather than rejected with a
+    # visible error - the outward response must stay identical either way
+    # (see `AuthService.request_password_reset`'s docstring). Enforced
+    # from persisted `PasswordResetToken.created_at` values
+    # (`PasswordResetTokenRepository.get_most_recent_for_user`), not an
+    # in-memory counter - a Render Free Web Service can restart/redeploy
+    # at any time, which would silently reset any in-process-only limiter.
+    password_reset_resend_cooldown_seconds: float = 60.0
+
+    # A second, coarser DB-backed cap alongside the cooldown above: no more
+    # than this many codes issued to one account within a rolling hour,
+    # regardless of the cooldown being individually respected every time.
+    # Bounds total email volume/cost and repeated-request abuse against one
+    # specific real account. Deliberately does not address abuse via many
+    # *different*/fabricated email addresses - see the design audit for why
+    # that's a distinct, explicitly accepted category at this project's
+    # current scale (nothing is ever persisted for an email with no
+    # matching account, so there is nothing here to count against it).
+    password_reset_max_per_hour: int = 5
 
     # Brute-force login protection (Phase 2 - `core/auth/service.py`,
     # `User.failed_login_attempts`/`locked_until`). After this many

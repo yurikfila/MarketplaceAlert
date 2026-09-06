@@ -1,7 +1,8 @@
 """Tests for `core/auth/service.py`: `AuthService` - signup, login,
-refresh (rotation + reuse detection), logout, and access-token
-validation. The business-logic layer; `tests/test_auth_security.py` and
-`tests/test_auth_repository.py` cover the primitives this composes.
+refresh (rotation + reuse detection), logout, access-token validation,
+and password-reset request/verification. The business-logic layer;
+`tests/test_auth_security.py` and `tests/test_auth_repository.py` cover
+the primitives this composes.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -9,9 +10,15 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from marketplace_alert.core.auth import service as auth_service_module
-from marketplace_alert.core.auth.models import RefreshToken
+from marketplace_alert.core.auth.models import PasswordResetToken, RefreshToken, User
 from marketplace_alert.core.auth.repository import RefreshTokenRepository, UserRepository
-from marketplace_alert.core.auth.security import InvalidAccessTokenError, decode_access_token, hash_token
+from marketplace_alert.core.auth.security import (
+    InvalidAccessTokenError,
+    decode_access_token,
+    hash_password,
+    hash_token,
+    verify_password,
+)
 from marketplace_alert.core.auth.service import (
     AuthService,
     EmailAlreadyRegisteredError,
@@ -19,7 +26,10 @@ from marketplace_alert.core.auth.service import (
     InactiveAccountError,
     InvalidCredentialsError,
     InvalidRefreshTokenError,
+    InvalidResetCodeError,
+    PasswordResetRequestResult,
     RefreshTokenReusedError,
+    WeakNewPasswordError,
 )
 
 _SECRET = "test-secret-key-at-least-32-characters-long"
@@ -32,6 +42,10 @@ def _service(session, **overrides) -> AuthService:
         refresh_token_expire_days=30,
         max_failed_login_attempts=3,
         account_lockout_minutes=15,
+        password_reset_token_expire_minutes=10,
+        password_reset_max_attempts=5,
+        password_reset_resend_cooldown_seconds=60,
+        password_reset_max_per_hour=5,
     )
     defaults.update(overrides)
     return AuthService(session, **defaults)
@@ -585,3 +599,627 @@ def test_get_current_user_rejects_a_token_for_an_inactive_user(db_session) -> No
 
     with pytest.raises(InvalidAccessTokenError):
         service.get_current_user(tokens.access_token)
+
+
+# =====================================================================
+# PasswordResetRequestResult - the should_deliver/raw_code contract
+# =====================================================================
+
+
+def test_password_reset_request_result_accepts_a_consistent_deliverable_result() -> None:
+    result = PasswordResetRequestResult(should_deliver=True, raw_code="123456")
+    assert result.should_deliver is True
+    assert result.raw_code == "123456"
+
+
+def test_password_reset_request_result_accepts_a_consistent_suppressed_result() -> None:
+    result = PasswordResetRequestResult(should_deliver=False, raw_code=None)
+    assert result.should_deliver is False
+    assert result.raw_code is None
+
+
+def test_password_reset_request_result_rejects_should_deliver_true_with_no_code() -> None:
+    with pytest.raises(ValueError, match="should_deliver=True requires a real raw_code"):
+        PasswordResetRequestResult(should_deliver=True, raw_code=None)
+
+
+def test_password_reset_request_result_rejects_should_deliver_false_with_a_code() -> None:
+    with pytest.raises(ValueError, match="should_deliver=False must never carry a raw_code"):
+        PasswordResetRequestResult(should_deliver=False, raw_code="123456")
+
+
+# =====================================================================
+# request_password_reset - issuance
+# =====================================================================
+
+
+def _issue_code(service: AuthService, email: str) -> str:
+    result = service.request_password_reset(email=email)
+    assert result.should_deliver is True
+    assert result.raw_code is not None
+    return result.raw_code
+
+
+def test_request_password_reset_issues_a_code_for_an_active_known_user(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="issue-active@example.com", password_hash=hash_password("irrelevant"))
+    db_session.commit()
+
+    service = _service(db_session)
+    result = service.request_password_reset(email=user.email)
+
+    assert result.should_deliver is True
+    assert result.raw_code is not None
+    assert len(result.raw_code) == 6
+    assert result.raw_code.isdigit()
+
+    row = db_session.query(PasswordResetToken).filter_by(user_id=user.id).one()
+    assert row.token_hash == hash_token(result.raw_code)
+    assert row.token_hash != result.raw_code  # raw code is never stored
+    assert row.used_at is None
+    assert row.failed_attempts == 0
+
+
+def test_request_password_reset_does_nothing_for_an_unknown_email(db_session) -> None:
+    service = _service(db_session)
+    result = service.request_password_reset(email="nobody-at-all@example.com")
+
+    assert result.should_deliver is False
+    assert result.raw_code is None
+    assert db_session.query(PasswordResetToken).count() == 0
+
+
+def test_request_password_reset_does_nothing_for_an_inactive_user(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="inactive-issue@example.com", password_hash=hash_password("irrelevant"))
+    user.is_active = False
+    db_session.commit()
+
+    service = _service(db_session)
+    result = service.request_password_reset(email=user.email)
+
+    assert result.should_deliver is False
+    assert result.raw_code is None
+    assert db_session.query(PasswordResetToken).count() == 0
+
+
+def test_request_password_reset_is_suppressed_within_the_resend_cooldown(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="cooldown@example.com", password_hash=hash_password("irrelevant"))
+    db_session.commit()
+
+    service = _service(db_session, password_reset_resend_cooldown_seconds=60)
+    first = service.request_password_reset(email=user.email)
+    assert first.should_deliver is True
+    assert first.raw_code is not None
+
+    second = service.request_password_reset(email=user.email)
+
+    assert second.should_deliver is False
+    assert second.raw_code is None
+    assert db_session.query(PasswordResetToken).count() == 1
+
+
+def test_request_password_reset_can_issue_again_after_the_cooldown_elapses(db_session) -> None:
+    """Time is controlled by backdating the persisted `created_at`
+    directly - the same technique this codebase's notification-outbox
+    tests already use for lease/throttle expiry - never a real sleep."""
+    users = UserRepository(db_session)
+    user = users.create(email="cooldown-elapsed@example.com", password_hash=hash_password("irrelevant"))
+    db_session.commit()
+
+    service = _service(db_session, password_reset_resend_cooldown_seconds=60)
+    first = service.request_password_reset(email=user.email)
+    assert first.should_deliver is True
+    assert first.raw_code is not None
+
+    row = db_session.query(PasswordResetToken).filter_by(user_id=user.id).one()
+    row.created_at = datetime.now(timezone.utc) - timedelta(seconds=61)
+    db_session.commit()
+
+    second = service.request_password_reset(email=user.email)
+
+    assert second.should_deliver is True
+    assert second.raw_code is not None
+    assert db_session.query(PasswordResetToken).count() == 2
+
+
+def test_request_password_reset_stops_after_the_hourly_cap(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="hourly-cap@example.com", password_hash=hash_password("irrelevant"))
+    db_session.commit()
+
+    service = _service(db_session, password_reset_resend_cooldown_seconds=0, password_reset_max_per_hour=5)
+    for _ in range(5):
+        result = service.request_password_reset(email=user.email)
+        assert result.should_deliver is True
+        assert result.raw_code is not None
+
+    sixth = service.request_password_reset(email=user.email)
+
+    assert sixth.should_deliver is False
+    assert sixth.raw_code is None
+    assert db_session.query(PasswordResetToken).filter_by(user_id=user.id).count() == 5
+
+
+def test_request_password_reset_resumes_after_the_hourly_window_passes(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="hourly-resume@example.com", password_hash=hash_password("irrelevant"))
+    db_session.commit()
+
+    service = _service(db_session, password_reset_resend_cooldown_seconds=0, password_reset_max_per_hour=5)
+    for _ in range(5):
+        result = service.request_password_reset(email=user.email)
+        assert result.should_deliver is True
+        assert result.raw_code is not None
+
+    blocked = service.request_password_reset(email=user.email)
+    assert blocked.should_deliver is False
+    assert blocked.raw_code is None
+
+    db_session.query(PasswordResetToken).filter_by(user_id=user.id).update(
+        {"created_at": datetime.now(timezone.utc) - timedelta(hours=2)}
+    )
+    db_session.commit()
+
+    resumed = service.request_password_reset(email=user.email)
+    assert resumed.should_deliver is True
+    assert resumed.raw_code is not None
+
+
+def test_new_issuance_supersedes_the_prior_unused_row(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="supersede@example.com", password_hash=hash_password("irrelevant"))
+    db_session.commit()
+
+    service = _service(db_session, password_reset_resend_cooldown_seconds=0)
+    service.request_password_reset(email=user.email)
+    first_row = db_session.query(PasswordResetToken).filter_by(user_id=user.id).one()
+    first_row_id = first_row.id
+
+    service.request_password_reset(email=user.email)
+
+    db_session.refresh(first_row)
+    assert first_row.used_at is not None  # superseded, not deleted
+
+    all_rows = db_session.query(PasswordResetToken).filter_by(user_id=user.id).all()
+    assert len(all_rows) == 2  # both still present
+
+    live_rows = [row for row in all_rows if row.used_at is None]
+    assert len(live_rows) == 1  # at most one live row after issuance
+    assert live_rows[0].id != first_row_id
+
+
+# =====================================================================
+# Collision safety - two different users sharing the exact same code
+# =====================================================================
+
+
+def test_two_different_users_can_receive_the_same_raw_code(db_session, monkeypatch: pytest.MonkeyPatch) -> None:
+    users = UserRepository(db_session)
+    user_a = users.create(email="collision-a@example.com", password_hash=hash_password("password-a"))
+    user_b = users.create(email="collision-b@example.com", password_hash=hash_password("password-b"))
+    db_session.commit()
+
+    monkeypatch.setattr(auth_service_module, "generate_reset_code", lambda: "555444")
+
+    service = _service(db_session)
+    result_a = service.request_password_reset(email=user_a.email)
+    result_b = service.request_password_reset(email=user_b.email)
+
+    assert result_a.should_deliver is True
+    assert result_b.should_deliver is True
+    assert result_a.raw_code == "555444"
+    assert result_b.raw_code == "555444"
+
+    rows = db_session.query(PasswordResetToken).filter_by(token_hash=hash_token("555444")).all()
+    assert len(rows) == 2
+    assert {row.user_id for row in rows} == {user_a.id, user_b.id}
+
+
+def test_one_users_shared_code_cannot_reset_a_different_user(db_session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The core safety property of the (user_id, token_hash)-scoped
+    lookup: even though both users have the exact same raw code, a
+    submission naming user A's email must only ever affect user A - never
+    user B, regardless of the shared hash. B's own row remains live and
+    independently redeemable with B's own email."""
+    users = UserRepository(db_session)
+    user_a = users.create(email="collision-reset-a@example.com", password_hash=hash_password("password-a"))
+    user_b = users.create(email="collision-reset-b@example.com", password_hash=hash_password("password-b"))
+    db_session.commit()
+
+    monkeypatch.setattr(auth_service_module, "generate_reset_code", lambda: "111222")
+
+    service = _service(db_session)
+    service.request_password_reset(email=user_a.email)
+    service.request_password_reset(email=user_b.email)
+
+    service.reset_password(email=user_a.email, code="111222", new_password="new-password-for-a")
+
+    db_session.refresh(user_a)
+    db_session.refresh(user_b)
+    assert verify_password("new-password-for-a", user_a.password_hash) is True
+    assert verify_password("password-b", user_b.password_hash) is True  # untouched
+
+    service.reset_password(email=user_b.email, code="111222", new_password="new-password-for-b")
+    db_session.refresh(user_b)
+    assert verify_password("new-password-for-b", user_b.password_hash) is True
+
+
+# =====================================================================
+# reset_password - verification
+# =====================================================================
+
+
+def test_reset_password_succeeds_with_the_correct_code(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="verify-correct@example.com", password_hash=hash_password("old-password"))
+    db_session.commit()
+
+    service = _service(db_session)
+    code = _issue_code(service, user.email)
+    service.reset_password(email=user.email, code=code, new_password="a-new-strong-password")
+
+    db_session.refresh(user)
+    assert verify_password("a-new-strong-password", user.password_hash) is True
+
+
+def test_reset_password_fails_generically_for_a_wrong_code(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="verify-wrong@example.com", password_hash=hash_password("old-password"))
+    db_session.commit()
+
+    service = _service(db_session)
+    code = _issue_code(service, user.email)
+    wrong_code = "111111" if code != "111111" else "222222"
+
+    with pytest.raises(InvalidResetCodeError, match="Invalid or expired verification code"):
+        service.reset_password(email=user.email, code=wrong_code, new_password="a-new-strong-password")
+
+
+def test_reset_password_wrong_code_increments_failed_attempts(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="verify-attempts@example.com", password_hash=hash_password("old-password"))
+    db_session.commit()
+
+    service = _service(db_session)
+    code = _issue_code(service, user.email)
+    wrong_code = "111111" if code != "111111" else "222222"
+
+    with pytest.raises(InvalidResetCodeError):
+        service.reset_password(email=user.email, code=wrong_code, new_password="a-new-strong-password")
+
+    row = db_session.query(PasswordResetToken).filter_by(user_id=user.id).one()
+    assert row.failed_attempts == 1
+
+
+def test_reset_password_fails_once_max_attempts_reached_even_with_the_correct_code(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="verify-exhausted@example.com", password_hash=hash_password("old-password"))
+    db_session.commit()
+
+    service = _service(db_session, password_reset_max_attempts=3)
+    code = _issue_code(service, user.email)
+    wrong_code = "111111" if code != "111111" else "222222"
+
+    for _ in range(3):
+        with pytest.raises(InvalidResetCodeError):
+            service.reset_password(email=user.email, code=wrong_code, new_password="a-new-strong-password")
+
+    with pytest.raises(InvalidResetCodeError):
+        service.reset_password(email=user.email, code=code, new_password="a-new-strong-password")
+
+    db_session.refresh(user)
+    assert verify_password("old-password", user.password_hash) is True
+
+
+@pytest.mark.parametrize("malformed", ["12345", "1234567", "abcdef", "", "12 345", "123-45"])
+def test_reset_password_rejects_a_malformed_code(db_session, malformed: str) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="malformed-code@example.com", password_hash=hash_password("old-password"))
+    db_session.commit()
+
+    service = _service(db_session)
+    _issue_code(service, user.email)
+
+    with pytest.raises(InvalidResetCodeError):
+        service.reset_password(email=user.email, code=malformed, new_password="a-new-strong-password")
+
+
+def test_reset_password_fails_for_an_expired_code(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="verify-expired@example.com", password_hash=hash_password("old-password"))
+    db_session.commit()
+
+    service = _service(db_session)
+    code = _issue_code(service, user.email)
+    row = db_session.query(PasswordResetToken).filter_by(user_id=user.id).one()
+    row.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    db_session.commit()
+
+    with pytest.raises(InvalidResetCodeError):
+        service.reset_password(email=user.email, code=code, new_password="a-new-strong-password")
+
+
+def test_reset_password_fails_for_a_superseded_code(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="verify-superseded@example.com", password_hash=hash_password("old-password"))
+    db_session.commit()
+
+    service = _service(db_session, password_reset_resend_cooldown_seconds=0)
+    old_code = _issue_code(service, user.email)
+    _issue_code(service, user.email)  # supersedes old_code
+
+    with pytest.raises(InvalidResetCodeError):
+        service.reset_password(email=user.email, code=old_code, new_password="a-new-strong-password")
+
+
+def test_reset_password_fails_generically_for_an_unknown_email(db_session) -> None:
+    service = _service(db_session)
+
+    with pytest.raises(InvalidResetCodeError, match="Invalid or expired verification code"):
+        service.reset_password(
+            email="never-signed-up@example.com", code="123456", new_password="a-new-strong-password"
+        )
+
+
+def test_reset_password_fails_generically_for_an_inactive_user(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="verify-inactive@example.com", password_hash=hash_password("old-password"))
+    db_session.commit()
+
+    service = _service(db_session)
+    code = _issue_code(service, user.email)
+    user.is_active = False
+    db_session.commit()
+
+    with pytest.raises(InvalidResetCodeError):
+        service.reset_password(email=user.email, code=code, new_password="a-new-strong-password")
+
+
+def test_reset_password_rejects_a_too_short_new_password_without_consuming_the_code(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="weak-password@example.com", password_hash=hash_password("old-password"))
+    db_session.commit()
+
+    service = _service(db_session)
+    code = _issue_code(service, user.email)
+
+    with pytest.raises(WeakNewPasswordError):
+        service.reset_password(email=user.email, code=code, new_password="short")
+
+    row = db_session.query(PasswordResetToken).filter_by(user_id=user.id).one()
+    assert row.used_at is None
+    assert row.failed_attempts == 0
+
+    service.reset_password(email=user.email, code=code, new_password="a-sufficiently-long-password")
+    db_session.refresh(user)
+    assert verify_password("a-sufficiently-long-password", user.password_hash) is True
+
+
+# =====================================================================
+# Password change
+# =====================================================================
+
+
+def test_reset_password_old_password_no_longer_verifies(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="old-pw-check@example.com", password_hash=hash_password("the-old-password"))
+    db_session.commit()
+
+    service = _service(db_session)
+    code = _issue_code(service, user.email)
+    service.reset_password(email=user.email, code=code, new_password="the-new-password")
+
+    db_session.refresh(user)
+    assert verify_password("the-old-password", user.password_hash) is False
+
+
+def test_reset_password_new_password_verifies(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="new-pw-check@example.com", password_hash=hash_password("the-old-password"))
+    db_session.commit()
+
+    service = _service(db_session)
+    code = _issue_code(service, user.email)
+    service.reset_password(email=user.email, code=code, new_password="the-new-password")
+
+    db_session.refresh(user)
+    assert verify_password("the-new-password", user.password_hash) is True
+
+
+def test_reset_password_stores_a_hash_never_the_plaintext(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="hash-check@example.com", password_hash=hash_password("the-old-password"))
+    db_session.commit()
+
+    service = _service(db_session)
+    code = _issue_code(service, user.email)
+    service.reset_password(email=user.email, code=code, new_password="the-new-plaintext-password")
+
+    db_session.refresh(user)
+    assert user.password_hash != "the-new-plaintext-password"
+    assert "the-new-plaintext-password" not in user.password_hash
+
+
+# =====================================================================
+# Session revocation
+# =====================================================================
+
+
+def test_reset_password_revokes_all_refresh_tokens_for_the_user(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="revoke-mine@example.com", password_hash=hash_password("old-password"))
+    db_session.commit()
+
+    refresh_tokens = RefreshTokenRepository(db_session)
+    token_1 = refresh_tokens.create(
+        user_id=user.id, token_hash="mine-1", expires_at=datetime.now(timezone.utc) + timedelta(days=30)
+    )
+    token_2 = refresh_tokens.create(
+        user_id=user.id, token_hash="mine-2", expires_at=datetime.now(timezone.utc) + timedelta(days=30)
+    )
+    db_session.commit()
+
+    service = _service(db_session)
+    code = _issue_code(service, user.email)
+    service.reset_password(email=user.email, code=code, new_password="a-new-strong-password")
+
+    db_session.refresh(token_1)
+    db_session.refresh(token_2)
+    assert token_1.revoked_at is not None
+    assert token_2.revoked_at is not None
+
+
+def test_reset_password_does_not_revoke_another_users_refresh_tokens(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="revoke-target@example.com", password_hash=hash_password("old-password"))
+    other_user = users.create(email="revoke-bystander@example.com", password_hash=hash_password("other-password"))
+    db_session.commit()
+
+    refresh_tokens = RefreshTokenRepository(db_session)
+    other_token = refresh_tokens.create(
+        user_id=other_user.id, token_hash="bystander-1", expires_at=datetime.now(timezone.utc) + timedelta(days=30)
+    )
+    db_session.commit()
+
+    service = _service(db_session)
+    code = _issue_code(service, user.email)
+    service.reset_password(email=user.email, code=code, new_password="a-new-strong-password")
+
+    db_session.refresh(other_token)
+    assert other_token.revoked_at is None
+
+
+# =====================================================================
+# Single use
+# =====================================================================
+
+
+def test_reset_password_code_cannot_be_reused_after_a_successful_reset(db_session) -> None:
+    users = UserRepository(db_session)
+    user = users.create(email="single-use@example.com", password_hash=hash_password("old-password"))
+    db_session.commit()
+
+    service = _service(db_session)
+    code = _issue_code(service, user.email)
+    service.reset_password(email=user.email, code=code, new_password="first-new-password")
+
+    with pytest.raises(InvalidResetCodeError):
+        service.reset_password(email=user.email, code=code, new_password="second-new-password")
+
+    db_session.refresh(user)
+    assert verify_password("first-new-password", user.password_hash) is True
+    assert verify_password("second-new-password", user.password_hash) is False
+
+
+# =====================================================================
+# Transaction safety
+# =====================================================================
+
+
+def test_reset_password_rolls_back_completely_if_a_step_after_the_claim_fails(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulates the real request-scoped session's own behavior
+    (`core/persistence/database.py:get_db_session` rolls back on any
+    unhandled exception before re-raising) - proves a failure after the
+    atomic claim but before the final commit leaves the whole attempt as
+    if it never happened: the code is still unconsumed, the password is
+    unchanged, and no refresh token was revoked."""
+    users = UserRepository(db_session)
+    user = users.create(email="rollback-safety@example.com", password_hash=hash_password("the-original-password"))
+    db_session.commit()
+
+    refresh_tokens = RefreshTokenRepository(db_session)
+    existing_token = refresh_tokens.create(
+        user_id=user.id,
+        token_hash="rollback-safety-token",
+        expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+    )
+    db_session.commit()
+
+    service = _service(db_session)
+    code = _issue_code(service, user.email)
+
+    def _boom(_password):
+        raise RuntimeError("simulated failure after the claim")
+
+    monkeypatch.setattr(auth_service_module, "hash_password", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated failure after the claim"):
+        service.reset_password(email=user.email, code=code, new_password="a-new-strong-password")
+
+    # The claim's UPDATE was flushed but never committed - roll back
+    # exactly like the real get_db_session() dependency would on any
+    # unhandled exception.
+    db_session.rollback()
+
+    row = db_session.query(PasswordResetToken).filter_by(user_id=user.id).one()
+    assert row.used_at is None
+
+    db_session.refresh(user)
+    assert verify_password("the-original-password", user.password_hash) is True
+
+    db_session.refresh(existing_token)
+    assert existing_token.revoked_at is None
+
+
+# =====================================================================
+# Concurrency
+# =====================================================================
+
+
+def test_concurrent_reset_submissions_for_the_same_code_the_second_loses_the_claim_race(
+    session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulates the race directly - the same stale-read-monkeypatch
+    technique already used for `ListingRepository.get_or_create`/
+    `NotificationOutboxRepository.enqueue()` elsewhere in this codebase:
+    session B's own pre-claim read is forced to report the same stale
+    "still live" state it would have seen had it genuinely run a moment
+    before session A committed its own claim. `claim_for_reset`'s
+    conditional UPDATE still runs against the REAL, current database
+    state regardless of what B's cached object claims - proving at most
+    one of two concurrent successful-looking submissions can ever
+    actually change the password."""
+    setup_session = session_factory()
+    user = User(email="race-reset@example.com", password_hash=hash_password("original-password"))
+    setup_session.add(user)
+    setup_session.commit()
+    user_id = user.id
+    email = user.email
+    setup_session.close()
+
+    setup_session = session_factory()
+    setup_result = _service(setup_session).request_password_reset(email=email)
+    assert setup_result.should_deliver is True
+    raw_code = setup_result.raw_code
+    assert raw_code is not None
+    setup_session.close()
+
+    session_b = session_factory()
+    service_b = _service(session_b)
+    # B's own "stale" read - captured while the row is still genuinely
+    # live, as if B's own check had run a moment before A's claim below.
+    stale_live_token = service_b._password_reset_tokens.get_live_for_user(
+        user_id, now=datetime.now(timezone.utc)
+    )
+    assert stale_live_token is not None
+
+    session_a = session_factory()
+    service_a = _service(session_a)
+    service_a.reset_password(email=email, code=raw_code, new_password="password-one")
+    session_a.close()
+
+    monkeypatch.setattr(service_b._password_reset_tokens, "get_live_for_user", lambda *a, **k: stale_live_token)
+
+    with pytest.raises(InvalidResetCodeError):
+        service_b.reset_password(email=email, code=raw_code, new_password="password-two")
+    session_b.close()
+
+    verify_session = session_factory()
+    verify_user = UserRepository(verify_session).get_by_email(email)
+    assert verify_password("password-one", verify_user.password_hash) is True
+    assert verify_password("password-two", verify_user.password_hash) is False
+    verify_session.close()

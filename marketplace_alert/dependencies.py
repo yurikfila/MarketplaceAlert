@@ -74,6 +74,11 @@ def get_auth_service(session: Session = Depends(get_db_session)) -> AuthService:
     `get_saved_search_service`. `core/auth/dependencies.py`'s
     `get_current_user` also depends on this, for `/api/v1/auth/me` and
     any later route that needs to know who's calling.
+
+    Also wires `AuthService`'s password-reset settings (no `/forgot-
+    password`/`/reset-password` route exists yet in this phase - this is
+    required so the five existing routes' construction of `AuthService`
+    keeps working at all, since its constructor now needs these too).
     """
     return AuthService(
         session,
@@ -82,6 +87,10 @@ def get_auth_service(session: Session = Depends(get_db_session)) -> AuthService:
         refresh_token_expire_days=settings.refresh_token_expire_days,
         max_failed_login_attempts=settings.max_failed_login_attempts,
         account_lockout_minutes=settings.account_lockout_minutes,
+        password_reset_token_expire_minutes=settings.password_reset_token_expire_minutes,
+        password_reset_max_attempts=settings.password_reset_max_attempts,
+        password_reset_resend_cooldown_seconds=settings.password_reset_resend_cooldown_seconds,
+        password_reset_max_per_hour=settings.password_reset_max_per_hour,
     )
 
 

@@ -17,6 +17,7 @@ from marketplace_alert.core.auth.security import (
     InvalidAccessTokenError,
     create_access_token,
     decode_access_token,
+    generate_reset_code,
     generate_token,
     hash_password,
     hash_token,
@@ -229,3 +230,65 @@ def test_hash_token_produces_a_sha256_hex_digest() -> None:
     digest = hash_token("some-token-value")
     assert len(digest) == 64
     assert all(c in "0123456789abcdef" for c in digest)
+
+
+# =====================================================================
+# Password-reset verification codes
+# =====================================================================
+
+
+def test_generate_reset_code_is_always_exactly_six_digits() -> None:
+    for _ in range(200):
+        code = generate_reset_code()
+        assert len(code) == 6
+        assert code.isdigit()
+
+
+def test_generate_reset_code_zero_pads_small_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(security.secrets, "randbelow", lambda _: 483)
+    assert generate_reset_code() == "000483"
+
+
+def test_generate_reset_code_zero_is_structurally_valid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`000000` must be a valid, correctly-shaped code if randomly
+    generated - never rejected or reformatted just because every digit
+    happens to be zero."""
+    monkeypatch.setattr(security.secrets, "randbelow", lambda _: 0)
+    code = generate_reset_code()
+    assert code == "000000"
+    assert len(code) == 6
+
+
+def test_generate_reset_code_handles_the_maximum_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(security.secrets, "randbelow", lambda _: 999999)
+    assert generate_reset_code() == "999999"
+
+
+def test_generate_reset_code_uses_secrets_randbelow_over_the_full_six_digit_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Must use `secrets.randbelow` - never `random.random()`, a UUID, or
+    anything timestamp-derived, all of which are either predictable or the
+    wrong shape entirely - called with exactly `1_000_000` (the full
+    6-digit range), not some other modulus."""
+    calls = []
+    real_randbelow = security.secrets.randbelow
+
+    def spy(n):
+        calls.append(n)
+        return real_randbelow(n)
+
+    monkeypatch.setattr(security.secrets, "randbelow", spy)
+    generate_reset_code()
+
+    assert calls == [1_000_000]
+
+
+def test_generate_reset_code_is_random_across_calls() -> None:
+    codes = {generate_reset_code() for _ in range(50)}
+    assert len(codes) > 1
+
+
+def test_generate_reset_code_hash_never_equals_the_raw_code() -> None:
+    code = generate_reset_code()
+    assert hash_token(code) != code

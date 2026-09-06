@@ -49,6 +49,9 @@ __all__ = [
     "TokenPairOut",
     "UserPublic",
     "AuthResponse",
+    "ForgotPasswordRequest",
+    "ForgotPasswordResponse",
+    "ResetPasswordRequest",
 ]
 
 
@@ -246,6 +249,60 @@ class AuthResponse(BaseModel):
 
     user: UserPublic
     tokens: TokenPairOut
+
+
+# --- Password reset (`/api/v1/auth/forgot-password`, `/reset-password`) -
+#
+# See `core/auth/service.py`'s `AuthService.request_password_reset`/
+# `reset_password` for the actual business/security rules - both schemas
+# below are thin request/response shapes around them, same discipline as
+# every other schema in this module. `PasswordResetRequestResult` (that
+# service's internal-only return type) is deliberately never referenced
+# here at all - `ForgotPasswordResponse` is a fixed, generic shape that
+# never varies with what that call actually did internally.
+
+
+class ForgotPasswordRequest(BaseModel):
+    """`POST /api/v1/auth/forgot-password` request body. Same shape as
+    `LoginRequest.email` - non-empty only, no format validation (the
+    backend's job is never to reject something a real account might
+    have)."""
+
+    email: str = Field(min_length=1)
+
+
+class ForgotPasswordResponse(BaseModel):
+    """What `POST /api/v1/auth/forgot-password` always returns - the
+    exact same message regardless of whether the email is registered,
+    active, on cooldown, or already at its hourly issuance limit. No
+    field here may ever vary with account state - see the route's own
+    docstring."""
+
+    message: str
+
+
+class ResetPasswordRequest(BaseModel):
+    """`POST /api/v1/auth/reset-password` request body.
+
+    `code` is always a `str`, never parsed as an int - a leading zero
+    (e.g. `"000483"`) must remain exactly as issued; accepting it as a
+    number would silently lose that digit. `new_password`'s minimum
+    length mirrors `SignupRequest.password`'s existing rule exactly (not
+    a second, incompatible policy). Deliberately no `confirm_password`
+    field - matching two password fields is mobile/UI-only validation,
+    never sent to or checked by this backend.
+    """
+
+    email: str = Field(min_length=1)
+    code: str
+    new_password: str = Field(min_length=8)
+
+    @field_validator("code")
+    @classmethod
+    def validate_code(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9]{6}", value):
+            raise ValueError("code must be exactly 6 digits")
+        return value
 
 
 # --- Notification preferences (`/api/v1/notification-preferences/me`) --

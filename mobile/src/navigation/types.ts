@@ -4,6 +4,9 @@ import type { NavigatorScreenParams } from '@react-navigation/native';
 export type AuthStackParamList = {
   Login: undefined;
   Signup: undefined;
+  ForgotPassword: undefined;
+  /** `email` carries forward the address entered on ForgotPasswordScreen so the user never has to retype it here. */
+  ResetPassword: { email: string };
 };
 
 export type TabParamList = {

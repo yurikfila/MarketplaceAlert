@@ -1,4 +1,7 @@
-import { fireEvent } from '@testing-library/react-native';
+import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import { fireEvent, render } from '@testing-library/react-native';
+import { Text } from 'react-native';
 
 import { ApiError } from '../api/client';
 import { useAuth } from '../auth/AuthContext';
@@ -6,6 +9,30 @@ import { renderWithNavigation } from '../testUtils/renderWithNavigation';
 import { LoginScreen } from './LoginScreen';
 
 jest.mock('../auth/AuthContext');
+
+/**
+ * Renders the real LoginScreen alongside a stub "ForgotPassword" route in
+ * a real stack, so pressing "Forgot password?" (wired to
+ * `navigation.navigate('ForgotPassword')`) has somewhere real to land -
+ * `renderWithNavigation` only ever registers a single route. Mirrors the
+ * harness in SavedSearchesScreen.test.tsx.
+ */
+function renderWithForgotPasswordRoute() {
+  const Stack = createNativeStackNavigator();
+
+  function StubForgotPasswordScreen() {
+    return <Text>stub-forgot-password-screen</Text>;
+  }
+
+  return render(
+    <NavigationContainer>
+      <Stack.Navigator screenOptions={{ headerShown: false }}>
+        <Stack.Screen name="Login" component={LoginScreen} />
+        <Stack.Screen name="ForgotPassword" component={StubForgotPasswordScreen} />
+      </Stack.Navigator>
+    </NavigationContainer>,
+  );
+}
 
 const mockedUseAuth = useAuth as jest.MockedFunction<typeof useAuth>;
 const mockLogin = jest.fn();
@@ -88,5 +115,19 @@ describe('LoginScreen', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(mockLogin).toHaveBeenCalledWith('shopper@example.com', 'hunter2');
+  });
+
+  it('shows a "Forgot password?" link', async () => {
+    const { getByText } = await renderWithNavigation(LoginScreen);
+
+    expect(getByText('Forgot password?')).toBeTruthy();
+  });
+
+  it('navigates to ForgotPassword when "Forgot password?" is pressed', async () => {
+    const { getByText, findByText } = await renderWithForgotPasswordRoute();
+
+    await fireEvent.press(getByText('Forgot password?'));
+
+    expect(await findByText('stub-forgot-password-screen')).toBeTruthy();
   });
 });

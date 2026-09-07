@@ -63,3 +63,55 @@ export function validateSignupForm(values: { email: string; password: string }):
 
   return { valid: Object.keys(errors).length === 0, errors };
 }
+
+/** Shared by ForgotPasswordScreen - only email-blank is checked client-side, same rationale as validateEmailField above. */
+export function validateForgotPasswordForm(values: { email: string }): AuthValidationResult {
+  const errors: AuthFieldErrors = {};
+
+  const emailError = validateEmailField(values.email);
+  if (emailError) {
+    errors.email = emailError;
+  }
+
+  return { valid: Object.keys(errors).length === 0, errors };
+}
+
+export const RESET_CODE_LENGTH = 6;
+
+export type ResetPasswordFieldErrors = Partial<Record<'code' | 'newPassword' | 'confirmPassword', string>>;
+
+export interface ResetPasswordValidationResult {
+  valid: boolean;
+  errors: ResetPasswordFieldErrors;
+}
+
+/**
+ * ResetPasswordScreen's form - the new-password rule intentionally
+ * matches `validateSignupForm`'s (`MIN_SIGNUP_PASSWORD_LENGTH`), mirroring
+ * the backend's own `_MIN_NEW_PASSWORD_LENGTH` for reset, which is the
+ * same value as signup's `Field(min_length=8)` - never a different rule
+ * for reset than for signup.
+ */
+export function validateResetPasswordForm(values: {
+  code: string;
+  newPassword: string;
+  confirmPassword: string;
+}): ResetPasswordValidationResult {
+  const errors: ResetPasswordFieldErrors = {};
+
+  if (values.code.length === 0) {
+    errors.code = 'Enter the verification code sent to your email.';
+  } else if (!/^\d{6}$/.test(values.code)) {
+    errors.code = `Enter the ${RESET_CODE_LENGTH}-digit code exactly as sent.`;
+  }
+
+  if (values.newPassword.length < MIN_SIGNUP_PASSWORD_LENGTH) {
+    errors.newPassword = `Password must be at least ${MIN_SIGNUP_PASSWORD_LENGTH} characters.`;
+  }
+
+  if (values.confirmPassword !== values.newPassword) {
+    errors.confirmPassword = 'Passwords do not match.';
+  }
+
+  return { valid: Object.keys(errors).length === 0, errors };
+}

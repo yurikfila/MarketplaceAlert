@@ -159,3 +159,24 @@ export interface LoginInput {
   email: string;
   password: string;
 }
+
+/** POST /api/v1/auth/forgot-password body. */
+export interface ForgotPasswordInput {
+  email: string;
+}
+
+/**
+ * POST /api/v1/auth/forgot-password response - always this same generic
+ * message, whether or not the email is actually registered (the backend
+ * is deliberately enumeration-safe - see ForgotPasswordScreen).
+ */
+export interface ForgotPasswordResponse {
+  message: string;
+}
+
+/** POST /api/v1/auth/reset-password body. */
+export interface ResetPasswordInput {
+  email: string;
+  code: string;
+  new_password: string;
+}

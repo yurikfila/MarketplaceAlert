@@ -1,6 +1,8 @@
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 
+import { ForgotPasswordScreen } from '../screens/ForgotPasswordScreen';
 import { LoginScreen } from '../screens/LoginScreen';
+import { ResetPasswordScreen } from '../screens/ResetPasswordScreen';
 import { SignupScreen } from '../screens/SignupScreen';
 import { colors } from '../theme/colors';
 import type { AuthStackParamList } from './types';
@@ -13,6 +15,16 @@ export function AuthNavigator() {
     <Stack.Navigator screenOptions={{ headerTintColor: colors.primary, headerShown: false }}>
       <Stack.Screen name="Login" component={LoginScreen} />
       <Stack.Screen name="Signup" component={SignupScreen} options={{ headerShown: true, title: 'Create Account' }} />
+      <Stack.Screen
+        name="ForgotPassword"
+        component={ForgotPasswordScreen}
+        options={{ headerShown: true, title: 'Reset Password' }}
+      />
+      <Stack.Screen
+        name="ResetPassword"
+        component={ResetPasswordScreen}
+        options={{ headerShown: true, title: 'Reset Password' }}
+      />
     </Stack.Navigator>
   );
 }

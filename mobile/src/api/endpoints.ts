@@ -8,11 +8,14 @@
 import { apiRequest } from './client';
 import type {
   AuthResponse,
+  ForgotPasswordInput,
+  ForgotPasswordResponse,
   ListingListResponse,
   ListListingsParams,
   LoginInput,
   MarketplaceInfo,
   MobileStatus,
+  ResetPasswordInput,
   SavedSearch,
   SavedSearchCreateInput,
   SavedSearchRunResult,
@@ -101,4 +104,21 @@ export function logout(refreshTokenValue: string): Promise<void> {
 
 export function getCurrentUser(): Promise<UserPublic> {
   return apiRequest<UserPublic>('/auth/me');
+}
+
+/**
+ * Always resolves with the backend's generic message, whether or not
+ * `input.email` is actually registered - never branch on account
+ * existence here (see ForgotPasswordScreen). Also used by
+ * ResetPasswordScreen's "Send a new code" action - the backend's own
+ * resend cooldown governs whether a new code is actually issued, not a
+ * separate resend endpoint.
+ */
+export function forgotPassword(input: ForgotPasswordInput): Promise<ForgotPasswordResponse> {
+  return apiRequest<ForgotPasswordResponse>('/auth/forgot-password', { method: 'POST', body: input });
+}
+
+/** Resolves with no value on success (backend returns 204 No Content). */
+export function resetPassword(input: ResetPasswordInput): Promise<void> {
+  return apiRequest<void>('/auth/reset-password', { method: 'POST', body: input });
 }

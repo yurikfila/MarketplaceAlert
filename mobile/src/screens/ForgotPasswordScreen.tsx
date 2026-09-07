@@ -1,43 +1,42 @@
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { ApiError } from '../api/client';
-import { useAuth } from '../auth/AuthContext';
-import { PasswordInput } from '../components/PasswordInput';
+import { forgotPassword } from '../api/endpoints';
 import { PrimaryButton } from '../components/PrimaryButton';
 import { Screen } from '../components/Screen';
 import type { AuthStackParamList } from '../navigation/types';
 import { colors, fontSize, radius, spacing } from '../theme/colors';
-import { validateLoginForm, type AuthFieldErrors } from '../utils/authValidation';
+import { validateForgotPasswordForm, type AuthFieldErrors } from '../utils/authValidation';
 
-export function LoginScreen() {
+export function ForgotPasswordScreen() {
   const navigation = useNavigation<NativeStackNavigationProp<AuthStackParamList>>();
-  const { login } = useAuth();
 
   const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<AuthFieldErrors>({});
 
   async function handleSubmit() {
-    const validation = validateLoginForm({ email, password });
+    const validation = validateForgotPasswordForm({ email });
     setFieldErrors(validation.errors);
     if (!validation.valid) {
       return;
     }
 
+    const trimmedEmail = email.trim();
     setSubmitError(null);
     setSubmitting(true);
     try {
-      await login(email.trim(), password);
-      // No manual navigation needed - RootNavigator swaps to the
-      // authenticated stack automatically once `status` becomes
-      // 'authenticated' (see AuthContext).
+      await forgotPassword({ email: trimmedEmail });
+      // The backend's response is deliberately identical whether or not
+      // this email is registered (enumeration-safe) - always proceed to
+      // the code-entry screen, never branch on "does this account exist".
+      navigation.navigate('ResetPassword', { email: trimmedEmail });
     } catch (error) {
-      setSubmitError(error instanceof ApiError ? error.message : 'Could not sign in.');
+      setSubmitError(error instanceof ApiError ? error.message : 'Could not send the verification code.');
     } finally {
       setSubmitting(false);
     }
@@ -46,7 +45,8 @@ export function LoginScreen() {
   return (
     <Screen padded={false}>
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-        <Text style={styles.appTitle}>MarketplaceAlert</Text>
+        <Text style={styles.title}>Reset password</Text>
+        <Text style={styles.explanation}>Enter the email address associated with your MarketplaceAlert account.</Text>
 
         <View style={styles.field}>
           <Text style={styles.label}>Email</Text>
@@ -61,39 +61,16 @@ export function LoginScreen() {
             autoCorrect={false}
             keyboardType="email-address"
             textContentType="username"
-            returnKeyType="next"
-          />
-          {fieldErrors.email ? <Text style={styles.fieldError}>{fieldErrors.email}</Text> : null}
-          <Text style={styles.helperText}>Your email is your login.</Text>
-        </View>
-
-        <View style={styles.field}>
-          <Text style={styles.label}>Password</Text>
-          <PasswordInput
-            value={password}
-            onChangeText={setPassword}
-            placeholder="Your password"
-            placeholderTextColor={colors.textMuted}
-            accessibilityLabel="Password"
-            textContentType="password"
             returnKeyType="done"
             onSubmitEditing={handleSubmit}
           />
-          {fieldErrors.password ? <Text style={styles.fieldError}>{fieldErrors.password}</Text> : null}
+          {fieldErrors.email ? <Text style={styles.fieldError}>{fieldErrors.email}</Text> : null}
         </View>
-
-        <Pressable
-          onPress={() => navigation.navigate('ForgotPassword')}
-          accessibilityRole="link"
-          style={styles.forgotPasswordLink}
-        >
-          <Text style={styles.forgotPasswordText}>Forgot password?</Text>
-        </Pressable>
 
         {submitError ? <Text style={styles.submitError}>{submitError}</Text> : null}
 
-        <PrimaryButton label="Sign in" onPress={handleSubmit} loading={submitting} />
-        <PrimaryButton label="Create an account" onPress={() => navigation.navigate('Signup')} variant="secondary" />
+        <PrimaryButton label="Send verification code" onPress={handleSubmit} loading={submitting} />
+        <PrimaryButton label="Back to sign in" onPress={() => navigation.navigate('Login')} variant="secondary" />
       </ScrollView>
     </Screen>
   );
@@ -105,12 +82,17 @@ const styles = StyleSheet.create({
     gap: spacing.xl,
     paddingBottom: spacing.xxl,
   },
-  appTitle: {
+  title: {
     fontSize: fontSize.xxl,
     fontWeight: '800',
     color: colors.textPrimary,
     textAlign: 'center',
     marginTop: spacing.xl,
+  },
+  explanation: {
+    fontSize: fontSize.md,
+    color: colors.textSecondary,
+    textAlign: 'center',
   },
   field: {
     gap: spacing.sm,
@@ -133,18 +115,6 @@ const styles = StyleSheet.create({
   fieldError: {
     fontSize: fontSize.sm,
     color: colors.danger,
-  },
-  helperText: {
-    fontSize: fontSize.sm,
-    color: colors.textMuted,
-  },
-  forgotPasswordLink: {
-    alignSelf: 'flex-end',
-  },
-  forgotPasswordText: {
-    fontSize: fontSize.sm,
-    color: colors.primary,
-    fontWeight: '600',
   },
   submitError: {
     fontSize: fontSize.md,

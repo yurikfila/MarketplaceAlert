@@ -9,6 +9,7 @@ codes, response shapes, headers, and that nothing sensitive ever reaches a
 response body.
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -20,6 +21,22 @@ from marketplace_alert.core.auth.security import create_access_token, hash_token
 from marketplace_alert.notifications.email.provider import PasswordResetEmailError
 
 _FORGOT_PASSWORD_GENERIC_BODY = {"message": "If that email is registered, a verification code has been sent."}
+
+
+@pytest.fixture(autouse=True)
+def _ensure_auth_route_logger_is_enabled():
+    """Alembic's `Config`, used by `tests/test_alembic_migrations.py`, calls
+    `logging.config.fileConfig(alembic.ini)` - which, with Python logging's
+    default `disable_existing_loggers=True`, disables every logger not
+    explicitly listed in that ini (root/sqlalchemy/alembic only) for the
+    rest of the process. If that test module happens to run before this one
+    in the same session, `api/v1/auth.py`'s logger would otherwise go
+    silent with no error - `caplog` simply captures zero records, which
+    would make a real logging regression indistinguishable from this
+    ordering artifact. Same issue, same fix, as `tests/test_relevance.py`'s
+    identical fixture for its own logger."""
+    logging.getLogger("marketplace_alert.api.v1.auth").disabled = False
+    yield
 
 
 def _signup(client, email="person@example.com", password="a-strong-password"):
@@ -766,6 +783,79 @@ def test_forgot_password_every_delivery_outcome_produces_the_identical_response(
     responses = [success_response, disabled_response, failure_response]
     assert all(r.status_code == 200 for r in responses)
     assert all(r.json() == _FORGOT_PASSWORD_GENERIC_BODY for r in responses)
+
+
+# =====================================================================
+# Delivery-outcome logging - safe, secret-free signal for diagnosing a
+# production delivery gap (e.g. missing Resend config) without database
+# access or weakening enumeration-safety at the HTTP response level.
+# =====================================================================
+
+
+def test_forgot_password_logs_a_delivery_attempt_when_the_sender_is_enabled(
+    client, fake_password_reset_email_sender, caplog: pytest.LogCaptureFixture
+) -> None:
+    _signup(client, email="log-attempted@example.com")
+
+    with caplog.at_level("INFO"):
+        response = _forgot_password(client, email="log-attempted@example.com")
+
+    assert response.status_code == 200
+    assert "Password reset email delivery attempted" in caplog.text
+    assert len(fake_password_reset_email_sender.calls) == 1
+
+
+def test_forgot_password_logs_configuration_missing_when_sender_is_disabled(
+    client, fake_password_reset_email_sender, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake_password_reset_email_sender.is_enabled = False
+    _signup(client, email="log-config-missing@example.com")
+
+    with caplog.at_level("INFO"):
+        response = _forgot_password(client, email="log-config-missing@example.com")
+
+    assert response.status_code == 200
+    assert "Password reset email skipped because sender is not configured" in caplog.text
+    # The "attempted" line must never ALSO appear here - the two are mutually exclusive.
+    assert "Password reset email delivery attempted" not in caplog.text
+    assert fake_password_reset_email_sender.calls == []
+
+
+def test_forgot_password_logs_suppression_for_an_unknown_email_without_revealing_it(
+    client, fake_password_reset_email_sender, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`should_deliver=False` (here: no account for this email at all) -
+    must log the generic suppression line, never the specific reason or
+    the email itself - the same enumeration-safety guarantee the HTTP
+    response already has, now also true of the server-side log line."""
+    with caplog.at_level("INFO"):
+        response = _forgot_password(client, email="log-suppressed-unknown@example.com")
+
+    assert response.status_code == 200
+    assert (
+        "Password reset code issuance suppressed (unknown/inactive account, resend cooldown, "
+        "or hourly cap already reached)" in caplog.text
+    )
+    assert "log-suppressed-unknown@example.com" not in caplog.text
+    assert fake_password_reset_email_sender.calls == []
+
+
+def test_forgot_password_logs_suppression_during_the_resend_cooldown(
+    client, fake_password_reset_email_sender, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Same suppression log line as the unknown-email case above, for a
+    DIFFERENT should_deliver=False reason - the log text is identical
+    either way, by design (see _deliver_password_reset_code's docstring)."""
+    _signup(client, email="log-suppressed-cooldown@example.com")
+    _forgot_password(client, email="log-suppressed-cooldown@example.com")
+    assert len(fake_password_reset_email_sender.calls) == 1
+
+    with caplog.at_level("INFO"):
+        second_response = _forgot_password(client, email="log-suppressed-cooldown@example.com")
+
+    assert second_response.status_code == 200
+    assert "Password reset code issuance suppressed" in caplog.text
+    assert len(fake_password_reset_email_sender.calls) == 1  # still just the first attempt
 
 
 def test_forgot_password_never_makes_a_real_http_call(client, monkeypatch: pytest.MonkeyPatch) -> None:

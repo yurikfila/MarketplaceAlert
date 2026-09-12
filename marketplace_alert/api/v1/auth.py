@@ -193,15 +193,27 @@ def _deliver_password_reset_code(
     Resend exists. Called from `forgot_password()` below; never affects
     what that route returns, regardless of outcome.
 
-    - `should_deliver=False`: nothing to send - return immediately.
-      `result.raw_code` is never inspected beyond the dataclass's own
-      already-enforced invariant.
+    - `should_deliver=False`: nothing to send - logs one generic,
+      non-identifying line (never which of the possible reasons applied,
+      never the email) and returns immediately. `result.raw_code` is
+      never inspected beyond the dataclass's own already-enforced
+      invariant. Added so an operator reading server logs can tell "this
+      request was never a delivery candidate at all" apart from "delivery
+      was attempted" below - previously indistinguishable from outside,
+      which made a real production delivery gap (missing Resend config)
+      hard to tell apart from ordinary enumeration-safety suppression
+      (unknown email, resend cooldown, hourly cap) without database
+      access. Still fully enumeration-safe: this line's text is fixed
+      and never varies with which reason actually applied.
     - `should_deliver=True` but `sender.is_enabled` is `False`: nothing
       configured to send with - a sanitized, non-identifying log line
       only, never the email/code.
-    - `should_deliver=True` and enabled: call `send_password_reset_code`
-      exactly once. That method already retries transient failures
-      internally (Phase 4B) - this function adds no second retry loop.
+    - `should_deliver=True` and enabled: logs that delivery is being
+      attempted (fixed text, no email/code), then calls
+      `send_password_reset_code` exactly once. That method already logs
+      the provider's own accept/reject outcome (see its own docstring)
+      and retries transient failures internally (Phase 4B) - this
+      function adds no second retry loop.
     - `PasswordResetEmailError`: swallowed here, with a sanitized log
       line only (no email, no code, no exception text - see that
       exception's own docstring for why its message could still be
@@ -210,10 +222,15 @@ def _deliver_password_reset_code(
       still surface normally as a 500, never silently swallowed.
     """
     if not result.should_deliver:
+        logger.info(
+            "Password reset code issuance suppressed (unknown/inactive account, resend cooldown, "
+            "or hourly cap already reached)"
+        )
         return
     if not sender.is_enabled:
         logger.info("Password reset email skipped because sender is not configured")
         return
+    logger.info("Password reset email delivery attempted")
     try:
         sender.send_password_reset_code(
             email=email,

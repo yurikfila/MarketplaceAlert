@@ -69,6 +69,18 @@ class User(Base):
     # contradict.
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
+    # Grants access to the read-only admin user-management API
+    # (`api/v1/admin.py`, gated by `core/auth/dependencies.py:
+    # require_admin`) - nothing else in this codebase checks this field.
+    # **Defaults to `False` for every new/existing account, with no code
+    # path that ever sets it to `True` at runtime** - the only way an
+    # account becomes an admin is a server operator directly running
+    # `scripts/set_admin.py` against the database. Never settable through
+    # `SignupRequest`/any other request body (neither schema even has this
+    # field), and never read from anywhere but this column - not a client-
+    # supplied header, not the account's email address.
+    is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )

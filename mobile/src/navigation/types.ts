@@ -20,6 +20,8 @@ export type RootStackParamList = {
   Tabs: NavigatorScreenParams<TabParamList>;
   CreateSearch: undefined;
   SavedSearchDetail: { id: number };
+  /** Reached only from AccountScreen's Admin entry point, itself only shown when `useAuth().user?.is_admin` is true - see AccountScreen.tsx. The route is always registered (same as every other screen here); it's the entry point that's gated, not the route's existence. */
+  AdminUsers: undefined;
 };
 
 // Lets useNavigation()/navigation.navigate() infer route names/params

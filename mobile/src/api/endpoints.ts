@@ -7,6 +7,8 @@
 
 import { apiRequest } from './client';
 import type {
+  AdminStatsResponse,
+  AdminUserListResponse,
   AuthResponse,
   ForgotPasswordInput,
   ForgotPasswordResponse,
@@ -121,4 +123,22 @@ export function forgotPassword(input: ForgotPasswordInput): Promise<ForgotPasswo
 /** Resolves with no value on success (backend returns 204 No Content). */
 export function resetPassword(input: ResetPasswordInput): Promise<void> {
   return apiRequest<void>('/auth/reset-password', { method: 'POST', body: input });
+}
+
+/**
+ * Admin-only - the backend rejects this with 401 (no/invalid token) or
+ * 403 (a valid token for a non-admin account) exactly like any other
+ * authenticated request; `apiRequest` attaches the current access token
+ * automatically (see api/client.ts), same as every other authenticated
+ * endpoint here. Never call this to *decide* whether to show admin UI -
+ * that decision is `useAuth().user?.is_admin` (see AccountScreen.tsx);
+ * this is only reached once that gate has already passed.
+ */
+export function listAdminUsers(): Promise<AdminUserListResponse> {
+  return apiRequest<AdminUserListResponse>('/admin/users');
+}
+
+/** Same authorization as listAdminUsers() above. */
+export function getAdminStats(): Promise<AdminStatsResponse> {
+  return apiRequest<AdminStatsResponse>('/admin/stats');
 }

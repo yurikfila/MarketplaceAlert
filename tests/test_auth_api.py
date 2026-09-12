@@ -422,7 +422,7 @@ def test_me_response_contains_no_sensitive_fields(client) -> None:
     response = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {access_token}"})
     body = response.json()
 
-    assert set(body.keys()) == {"id", "email", "created_at"}
+    assert set(body.keys()) == {"id", "email", "created_at", "is_admin"}
 
 
 def test_me_response_is_active_not_exposed(client) -> None:
@@ -432,6 +432,39 @@ def test_me_response_is_active_not_exposed(client) -> None:
     response = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {access_token}"})
 
     assert "is_active" not in response.json()
+
+
+def test_signup_defaults_to_non_admin(client) -> None:
+    body = _signup(client).json()
+
+    assert body["user"]["is_admin"] is False
+
+
+def test_signup_cannot_set_is_admin_via_extra_request_field(client, db_session) -> None:
+    """`SignupRequest` has no `is_admin` field at all - an attacker-supplied
+    one in the raw JSON body must be silently ignored, never reach
+    `AuthService.signup`, and never end up `True` in the database."""
+    response = client.post(
+        "/api/v1/auth/signup",
+        json={"email": "wannabe-admin@example.com", "password": "a-strong-password", "is_admin": True},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["user"]["is_admin"] is False
+
+    user = db_session.query(User).filter_by(email="wannabe-admin@example.com").one()
+    assert user.is_admin is False
+
+
+def test_login_response_reflects_is_admin(client, db_session) -> None:
+    _signup(client)
+    user = db_session.query(User).filter_by(email="person@example.com").one()
+    user.is_admin = True
+    db_session.commit()
+
+    body = _login(client).json()
+
+    assert body["user"]["is_admin"] is True
 
 
 # =====================================================================

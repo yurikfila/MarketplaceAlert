@@ -9,7 +9,7 @@
  */
 
 import { apiRequest } from './client';
-import { forgotPassword, resetPassword } from './endpoints';
+import { forgotPassword, getAdminStats, listAdminUsers, resetPassword } from './endpoints';
 
 jest.mock('./client');
 
@@ -48,5 +48,48 @@ describe('resetPassword', () => {
       body: { email: 'shopper@example.com', code: '123456', new_password: 'a-strong-password' },
     });
     expect(result).toBeUndefined();
+  });
+});
+
+describe('listAdminUsers', () => {
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('GETs /admin/users with no query and no body - authorization comes only from the bearer token apiRequest already attaches', async () => {
+    const response = {
+      total_users: 1,
+      users: [
+        {
+          id: 1,
+          email: 'admin@example.com',
+          created_at: '2026-01-01T00:00:00Z',
+          is_admin: true,
+          is_active: true,
+          saved_search_count: 0,
+        },
+      ],
+    };
+    mockedApiRequest.mockResolvedValue(response);
+
+    const result = await listAdminUsers();
+
+    expect(mockedApiRequest).toHaveBeenCalledWith('/admin/users');
+    expect(result).toEqual(response);
+  });
+});
+
+describe('getAdminStats', () => {
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('GETs /admin/stats', async () => {
+    mockedApiRequest.mockResolvedValue({ total_users: 5, total_saved_searches: 12 });
+
+    const result = await getAdminStats();
+
+    expect(mockedApiRequest).toHaveBeenCalledWith('/admin/stats');
+    expect(result).toEqual({ total_users: 5, total_saved_searches: 12 });
   });
 });

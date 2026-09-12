@@ -54,6 +54,7 @@ def test_user_minimal_creation_has_expected_defaults(db_session) -> None:
 
     assert user.id is not None
     assert user.is_active is True
+    assert user.is_admin is False
     assert isinstance(user.created_at, datetime)
     assert isinstance(user.updated_at, datetime)
 

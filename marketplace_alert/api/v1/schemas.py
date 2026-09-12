@@ -52,6 +52,9 @@ __all__ = [
     "ForgotPasswordRequest",
     "ForgotPasswordResponse",
     "ResetPasswordRequest",
+    "AdminUserOut",
+    "AdminUserListResponse",
+    "AdminStatsResponse",
 ]
 
 
@@ -220,17 +223,26 @@ class TokenPairOut(BaseModel):
 
 class UserPublic(BaseModel):
     """The only user-shaped data any `/api/v1/auth/*` response ever
-    returns - deliberately just `id`/`email`/`created_at`. Never
-    `password_hash`, never `failed_login_attempts`/`locked_until`, never
-    `is_active` - none of that is this API's business to expose, and
-    listing exactly these three fields here (rather than reaching for
+    returns - deliberately just `id`/`email`/`created_at`/`is_admin`.
+    Never `password_hash`, never `failed_login_attempts`/`locked_until`,
+    never `is_active` - none of that is this API's business to expose,
+    and listing exactly these fields here (rather than reaching for
     `from_attributes`) means a new, more sensitive `User` column added
     later can't silently start being serialized.
+
+    `is_admin` is included deliberately - the mobile app needs a
+    server-authoritative way to decide whether to show its Admin entry
+    point (see `api/v1/admin.py`'s own module docstring), and comparing
+    an email address client-side would not be that. Read-only from this
+    API's perspective: nothing that returns `UserPublic` (signup, login,
+    `/me`) ever accepts `is_admin` as input - see `SignupRequest`/
+    `LoginRequest` above, neither of which has such a field at all.
     """
 
     id: int
     email: str
     created_at: datetime
+    is_admin: bool
 
     @field_validator("created_at")
     @classmethod
@@ -303,6 +315,60 @@ class ResetPasswordRequest(BaseModel):
         if not re.fullmatch(r"[0-9]{6}", value):
             raise ValueError("code must be exactly 6 digits")
         return value
+
+
+# --- Admin (`/api/v1/admin/*`) -----------------------------------------
+#
+# See `core/admin/repository.py`'s `AdminRepository`/`AdminUserRow` for
+# the actual query logic - every schema below is a thin, field-by-field
+# response shape around it (never `from_attributes` on a raw `User` row -
+# same discipline as `UserPublic` above). Both routes require
+# `core/auth/dependencies.py:require_admin` - see `api/v1/admin.py`'s own
+# module docstring for the full authorization story.
+
+
+class AdminUserOut(BaseModel):
+    """One row of `GET /api/v1/admin/users` - built field-by-field from
+    `AdminUserRow` only. Never `password_hash`, never any token/code
+    hash, never `failed_login_attempts`/`locked_until` - none of that is
+    ever selected by `AdminRepository` in the first place, let alone
+    exposed here."""
+
+    id: int
+    email: str
+    created_at: datetime
+    is_admin: bool
+    is_active: bool
+    saved_search_count: int
+
+    @field_validator("created_at")
+    @classmethod
+    def ensure_utc(cls, value: datetime) -> datetime:
+        # SQLite drops tzinfo on round-trip even for DateTime(timezone=True)
+        # columns; every value written is UTC - same rule as UserPublic/
+        # ListingOut/SavedSearchRead.
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
+
+class AdminUserListResponse(BaseModel):
+    """`GET /api/v1/admin/users` response. `total_users` is simply
+    `len(users)` - included alongside the list itself so a mobile client
+    can render a "Users: <total>" header without a second round trip."""
+
+    total_users: int
+    users: list[AdminUserOut]
+
+
+class AdminStatsResponse(BaseModel):
+    """`GET /api/v1/admin/stats` response - aggregate counts only, no
+    per-user data. `total_saved_searches` counts every saved search,
+    owned or not (see `AdminRepository.count_saved_searches`'s own
+    docstring)."""
+
+    total_users: int
+    total_saved_searches: int
 
 
 # --- Notification preferences (`/api/v1/notification-preferences/me`) --

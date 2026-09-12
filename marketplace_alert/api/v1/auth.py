@@ -85,7 +85,7 @@ _FORGOT_PASSWORD_GENERIC_MESSAGE = "If that email is registered, a verification 
 
 
 def _user_public(user: User) -> UserPublic:
-    return UserPublic(id=user.id, email=user.email, created_at=user.created_at)
+    return UserPublic(id=user.id, email=user.email, created_at=user.created_at, is_admin=user.is_admin)
 
 
 def _token_pair_out(tokens: TokenPair) -> TokenPairOut:

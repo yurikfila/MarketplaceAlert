@@ -1197,13 +1197,18 @@ def _insert_password_reset_token(
     ).scalar_one()
 
 
-def test_upgrade_head_reaches_the_new_password_reset_token_revision(
+def test_upgrade_to_30fc5cd97dad_reaches_that_password_reset_token_revision(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Superseded as the "current head" check by
+    `test_upgrade_head_reaches_the_is_admin_revision` below once
+    `7b3f0a1d9c44` was added on top of this revision - kept as its own,
+    explicitly-targeted-revision test rather than deleted outright, so
+    this migration's own correctness is still directly covered."""
     db_path = tmp_path / "alembic_password_reset_token_head_test.db"
     cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
 
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "30fc5cd97dad")
 
     engine = create_db_engine(f"sqlite:///{db_path}")
     try:
@@ -1498,3 +1503,124 @@ def test_password_reset_token_upgrade_downgrade_reupgrade_succeeds_on_a_compatib
     assert row.user_id == user_id
     assert row.token_hash == "round-trip-hash"
     assert row.failed_attempts == 0
+
+
+# =====================================================================
+# `7b3f0a1d9c44` - add `users.is_admin`
+# =====================================================================
+
+
+def test_upgrade_head_reaches_the_is_admin_revision(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "alembic_is_admin_head_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert version == "7b3f0a1d9c44"
+
+
+def test_upgrade_head_adds_is_admin_column_not_null(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "alembic_is_admin_column_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        columns = {col["name"]: col for col in inspect(engine).get_columns("users")}
+    finally:
+        engine.dispose()
+
+    assert "is_admin" in columns
+    assert columns["is_admin"]["nullable"] is False
+
+
+def test_is_admin_defaults_to_false_for_a_row_inserted_after_migration(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh account (no `is_admin` value supplied at insert time, the
+    same way `_insert_user` below does it) must default to non-admin -
+    the whole point of `server_default=sa.false()` on this column."""
+    db_path = tmp_path / "alembic_is_admin_default_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_id = _insert_user(conn, "is-admin-default@example.com")
+    engine.dispose()
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            is_admin = conn.execute(
+                sa.text("SELECT is_admin FROM users WHERE id = :id"), {"id": user_id}
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert is_admin in (False, 0)
+
+
+def test_is_admin_defaults_to_false_for_a_pre_existing_row_migrated_forward(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The important case for a real production cutover: a `users` row
+    that existed BEFORE this migration ran must become a definite,
+    correct `False` once `is_admin` is added - never `NULL`, and never
+    left for the application layer to paper over."""
+    db_path = tmp_path / "alembic_is_admin_preexisting_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "30fc5cd97dad")  # before is_admin existed
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_id = _insert_user(conn, "pre-existing-account@example.com")
+    engine.dispose()
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            is_admin = conn.execute(
+                sa.text("SELECT is_admin FROM users WHERE id = :id"), {"id": user_id}
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert is_admin in (False, 0)
+
+
+def test_is_admin_round_trips_through_downgrade_and_re_upgrade(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "alembic_is_admin_round_trip_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+    command.downgrade(cfg, "30fc5cd97dad")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        columns = {col["name"] for col in inspect(engine).get_columns("users")}
+    finally:
+        engine.dispose()
+    assert "is_admin" not in columns
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        columns = {col["name"]: col for col in inspect(engine).get_columns("users")}
+    finally:
+        engine.dispose()
+    assert "is_admin" in columns
+    assert columns["is_admin"]["nullable"] is False

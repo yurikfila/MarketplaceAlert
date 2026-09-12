@@ -1,12 +1,16 @@
+import { useNavigation } from '@react-navigation/native';
+import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 
 import { useAuth } from '../auth/AuthContext';
 import { PrimaryButton } from '../components/PrimaryButton';
 import { Screen } from '../components/Screen';
+import type { RootStackParamList } from '../navigation/types';
 import { colors, fontSize, radius, spacing } from '../theme/colors';
 
 export function AccountScreen() {
+  const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
   const { user, logout } = useAuth();
   const [signingOut, setSigningOut] = useState(false);
 
@@ -26,6 +30,17 @@ export function AccountScreen() {
           <Text style={styles.label}>Signed in as</Text>
           <Text style={styles.email}>{user?.email ?? '—'}</Text>
         </View>
+
+        {/* Server-authoritative only - never an email comparison. The
+            backend enforces this independently on every admin request
+            regardless of what this button does (see AdminUsersScreen). */}
+        {user?.is_admin ? (
+          <PrimaryButton
+            label="Admin: User Management"
+            onPress={() => navigation.navigate('AdminUsers')}
+            variant="secondary"
+          />
+        ) : null}
 
         <PrimaryButton label="Log out" onPress={handleLogout} loading={signingOut} variant="danger" />
       </View>

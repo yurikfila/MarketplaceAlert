@@ -127,11 +127,19 @@ export interface ListListingsParams {
  * deliberately minimal, mirroring the backend's `UserPublic` schema
  * exactly (marketplace_alert/api/v1/schemas.py) - never a password hash,
  * never account-lockout state, nothing beyond what the backend itself
- * ever returns. */
+ * ever returns.
+ *
+ * `is_admin` is the ONLY thing this app ever uses to decide whether to
+ * show admin UI (AccountScreen's Admin entry point) - never derived by
+ * comparing `email` client-side. It's also read-only from here: nothing
+ * this app sends (SignupInput/LoginInput below) has such a field, and
+ * the backend enforces server-side on every admin request regardless of
+ * what this value says (see AdminUsersScreen.tsx). */
 export interface UserPublic {
   id: number;
   email: string;
   created_at: string;
+  is_admin: boolean;
 }
 
 /** What POST /auth/signup, /auth/login, and /auth/refresh all return -
@@ -179,4 +187,33 @@ export interface ResetPasswordInput {
   email: string;
   code: string;
   new_password: string;
+}
+
+/**
+ * One row of `GET /api/v1/admin/users` - mirrors the backend's
+ * `AdminUserOut` exactly (marketplace_alert/api/v1/schemas.py). Never a
+ * password hash, never a token/code hash, never failed-login/lockout
+ * state - the backend itself never selects any of that into this shape
+ * (see core/admin/repository.py), so there is nothing sensitive for this
+ * app to accidentally render even if a bug tried to.
+ */
+export interface AdminUserOut {
+  id: number;
+  email: string;
+  created_at: string;
+  is_admin: boolean;
+  is_active: boolean;
+  saved_search_count: number;
+}
+
+/** GET /api/v1/admin/users response - mirrors the backend's `AdminUserListResponse`. */
+export interface AdminUserListResponse {
+  total_users: number;
+  users: AdminUserOut[];
+}
+
+/** GET /api/v1/admin/stats response - mirrors the backend's `AdminStatsResponse`. */
+export interface AdminStatsResponse {
+  total_users: number;
+  total_saved_searches: number;
 }

@@ -7,6 +7,7 @@ import type { ComponentProps } from 'react';
 import { useAuth } from '../auth/AuthContext';
 import { LoadingView } from '../components/LoadingView';
 import { AccountScreen } from '../screens/AccountScreen';
+import { AdminUsersScreen } from '../screens/AdminUsersScreen';
 import { CreateSearchScreen } from '../screens/CreateSearchScreen';
 import { HomeScreen } from '../screens/HomeScreen';
 import { ListingsScreen } from '../screens/ListingsScreen';
@@ -53,6 +54,7 @@ function AuthenticatedNavigator() {
       <Stack.Screen name="Tabs" component={Tabs} options={{ headerShown: false }} />
       <Stack.Screen name="CreateSearch" component={CreateSearchScreen} options={{ title: 'Create Search' }} />
       <Stack.Screen name="SavedSearchDetail" component={SavedSearchDetailScreen} options={{ title: 'Saved Search' }} />
+      <Stack.Screen name="AdminUsers" component={AdminUsersScreen} options={{ title: 'User Management' }} />
     </Stack.Navigator>
   );
 }

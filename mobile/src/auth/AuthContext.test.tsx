@@ -23,7 +23,7 @@ jest.mock('./tokenStorage');
 const mockedEndpoints = endpoints as jest.Mocked<typeof endpoints>;
 const mockedTokenStorage = tokenStorage as jest.Mocked<typeof tokenStorage>;
 
-const USER: UserPublic = { id: 1, email: 'shopper@example.com', created_at: '2026-01-01T00:00:00Z' };
+const USER: UserPublic = { id: 1, email: 'shopper@example.com', created_at: '2026-01-01T00:00:00Z', is_admin: false };
 
 type Auth = ReturnType<typeof useAuth>;
 
@@ -333,7 +333,12 @@ describe('AuthContext - session generation guard (logout/login vs. stale refresh
     await waitFor(() => expect(mockedEndpoints.refreshToken).toHaveBeenCalledTimes(1));
     expect(getAuth().status).toBe('restoring');
 
-    const NEW_USER: UserPublic = { id: 2, email: 'newaccount@example.com', created_at: '2026-02-01T00:00:00Z' };
+    const NEW_USER: UserPublic = {
+      id: 2,
+      email: 'newaccount@example.com',
+      created_at: '2026-02-01T00:00:00Z',
+      is_admin: false,
+    };
     mockedEndpoints.login.mockResolvedValue({
       user: NEW_USER,
       tokens: { access_token: 'login-access', refresh_token: 'login-refresh', token_type: 'bearer' },

@@ -9,6 +9,7 @@ this API reports.
 """
 
 from marketplace_alert.core.auth.models import User
+from marketplace_alert.notifications.email.provider import PasswordResetEmailError
 
 
 def _signup(client, email="person@example.com", password="a-strong-password"):
@@ -229,3 +230,116 @@ def test_existing_login_and_me_behavior_is_unaffected_by_the_admin_api(client) -
         "/api/v1/auth/login", json={"email": "person@example.com", "password": "a-strong-password"}
     )
     assert login_response.status_code == 200
+
+
+# =====================================================================
+# TEMPORARY DIAGNOSTIC - POST /api/v1/admin/email-delivery-test
+#
+# Remove this whole section together with the route in api/v1/admin.py,
+# PasswordResetEmailSender.send_diagnostic_test_email, and the
+# FakePasswordResetEmailSender.send_diagnostic_test_email/.diagnostic_calls
+# additions in tests/conftest.py, once no longer needed.
+# =====================================================================
+
+_DIAGNOSTIC_ENDPOINT = "/api/v1/admin/email-delivery-test"
+_DIAGNOSTIC_RECIPIENT = "yurik70@walla.co.il"
+
+
+def test_email_delivery_test_without_authorization_header_returns_401(client) -> None:
+    response = client.post(_DIAGNOSTIC_ENDPOINT)
+    assert response.status_code == 401
+
+
+def test_email_delivery_test_with_a_normal_users_token_returns_403(client) -> None:
+    body = _signup(client).json()
+    token = body["tokens"]["access_token"]
+
+    response = client.post(_DIAGNOSTIC_ENDPOINT, headers=_auth_headers(token))
+
+    assert response.status_code == 403
+
+
+def test_email_delivery_test_with_an_admin_token_calls_the_provider_exactly_once(
+    client, db_session, fake_password_reset_email_sender
+) -> None:
+    token = _signup_admin(client, db_session)
+
+    response = client.post(_DIAGNOSTIC_ENDPOINT, headers=_auth_headers(token))
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "accepted"}
+    assert len(fake_password_reset_email_sender.diagnostic_calls) == 1
+
+
+def test_email_delivery_test_recipient_is_always_the_hardcoded_walla_address(
+    client, db_session, fake_password_reset_email_sender
+) -> None:
+    """The route accepts no request body at all - proves the recipient
+    can't be influenced by the caller even if one is sent anyway."""
+    token = _signup_admin(client, db_session)
+
+    client.post(_DIAGNOSTIC_ENDPOINT, headers=_auth_headers(token), json={"to": "someone-else@example.com"})
+
+    assert len(fake_password_reset_email_sender.diagnostic_calls) == 1
+    assert fake_password_reset_email_sender.diagnostic_calls[0].to == _DIAGNOSTIC_RECIPIENT
+
+
+def test_email_delivery_test_body_is_plain_text_with_no_code_or_link(monkeypatch) -> None:
+    """Directly verifies the real PasswordResetEmailSender's diagnostic
+    payload (not the fake) - plain text, fixed subject/body, no reset
+    code, no link, no HTML tag."""
+    import httpx
+
+    from marketplace_alert.notifications.email.provider import PasswordResetEmailSender
+
+    captured_payload = {}
+
+    def _fake_post(url, json, headers, timeout):
+        captured_payload.update(json)
+        return httpx.Response(200, json={"id": "irrelevant"})
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    sender = PasswordResetEmailSender(api_key="fake-key", from_address="MarketplaceAlert <no-reply@marketplacealert.app>")
+    sender.send_diagnostic_test_email(to=_DIAGNOSTIC_RECIPIENT)
+
+    assert captured_payload["to"] == [_DIAGNOSTIC_RECIPIENT]
+    assert captured_payload["subject"] == "MarketplaceAlert Test"
+    assert "text" in captured_payload
+    assert "html" not in captured_payload
+    body = captured_payload["text"]
+    assert "http://" not in body and "https://" not in body
+    assert "<a " not in body and "<html" not in body
+    # No 6-digit reset-code-shaped substring anywhere in the body.
+    import re
+
+    assert re.search(r"\b\d{6}\b", body) is None
+
+
+def test_email_delivery_test_provider_failure_returns_502_without_leaking_secrets(
+    client, db_session, fake_password_reset_email_sender, caplog
+) -> None:
+    token = _signup_admin(client, db_session)
+    fake_password_reset_email_sender.error = PasswordResetEmailError("simulated delivery failure")
+
+    with caplog.at_level("INFO"):
+        response = client.post(_DIAGNOSTIC_ENDPOINT, headers=_auth_headers(token))
+
+    assert response.status_code == 502
+    assert "fake-key" not in response.text
+    assert "fake-key" not in caplog.text
+    for forbidden in ("resend_api_key", "RESEND_API_KEY", "Authorization", "Bearer "):
+        assert forbidden not in response.text
+        assert forbidden not in caplog.text
+
+
+def test_email_delivery_test_when_sender_is_disabled_returns_503(
+    client, db_session, fake_password_reset_email_sender
+) -> None:
+    token = _signup_admin(client, db_session)
+    fake_password_reset_email_sender.is_enabled = False
+
+    response = client.post(_DIAGNOSTIC_ENDPOINT, headers=_auth_headers(token))
+
+    assert response.status_code == 503
+    assert fake_password_reset_email_sender.diagnostic_calls == []

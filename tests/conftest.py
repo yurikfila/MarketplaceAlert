@@ -89,6 +89,14 @@ class _RecordedPasswordResetEmailCall:
     expires_minutes: int
 
 
+@dataclass
+class _RecordedDiagnosticTestEmailCall:
+    """TEMPORARY DIAGNOSTIC - see `FakePasswordResetEmailSender.
+    send_diagnostic_test_email` below; remove together."""
+
+    to: str
+
+
 class FakePasswordResetEmailSender:
     """Records calls instead of sending real email via Resend - the
     `PasswordResetEmailSender` the `client` fixture overrides
@@ -109,9 +117,19 @@ class FakePasswordResetEmailSender:
         self.calls: list[_RecordedPasswordResetEmailCall] = []
         self.is_enabled = True
         self.error: PasswordResetEmailError | None = None
+        # TEMPORARY DIAGNOSTIC - see send_diagnostic_test_email below.
+        self.diagnostic_calls: list[_RecordedDiagnosticTestEmailCall] = []
 
     def send_password_reset_code(self, *, email: str, code: str, expires_minutes: int) -> None:
         self.calls.append(_RecordedPasswordResetEmailCall(email=email, code=code, expires_minutes=expires_minutes))
+        if self.error is not None:
+            raise self.error
+
+    # ===== TEMPORARY DIAGNOSTIC - remove this method (and the route in
+    # api/v1/admin.py + PasswordResetEmailSender.send_diagnostic_test_email
+    # it fakes) together once no longer needed.
+    def send_diagnostic_test_email(self, *, to: str) -> None:
+        self.diagnostic_calls.append(_RecordedDiagnosticTestEmailCall(to=to))
         if self.error is not None:
             raise self.error
 

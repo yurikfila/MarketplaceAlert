@@ -71,12 +71,6 @@ _USER_AGENT = f"MarketplaceAlert/{__version__}"
 
 _SUBJECT = "MarketplaceAlert password reset code"
 
-# ===== TEMPORARY DIAGNOSTIC - see send_diagnostic_test_email below and
-# api/v1/admin.py's `/email-delivery-test` route. Remove together.
-_DIAGNOSTIC_SUBJECT = "MarketplaceAlert Test"
-_DIAGNOSTIC_BODY = "Hello,\n\nThis is a simple MarketplaceAlert email delivery test."
-# ===== END TEMPORARY DIAGNOSTIC (constants)
-
 # HTTP statuses worth retrying: 429 (rate limited - Resend's own
 # `Retry-After` is honored when present, see `_retry_wait_seconds`) and
 # 5xx (transient server-side trouble). Everything else (400 malformed
@@ -253,96 +247,6 @@ class PasswordResetEmailSender:
         # Unreachable: the loop above always returns or raises before
         # exhausting `total_attempts` iterations.
         raise PasswordResetEmailError("Password-reset email request failed")
-
-    # ===== TEMPORARY DIAGNOSTIC - remove this method (and the route in
-    # api/v1/admin.py that calls it) once Walla.co.il deliverability has
-    # been confirmed and this diagnostic is no longer needed.
-    #
-    # Deliberately NOT sharing a refactored-out helper with
-    # `send_password_reset_code` above - that method is unchanged, byte
-    # for byte, by this addition. This is an intentional near-duplicate of
-    # its request-building/retry loop (reusing this class's own `_api_key`/
-    # `_from_address`/`_reply_to`/timeout/retry config, and its already
-    # generic `_retry_wait`/`_retry_wait_seconds`/`_backoff_seconds`
-    # helpers unchanged) rather than a real risk to already-reviewed,
-    # already-tested password-reset delivery behavior for the sake of a
-    # temporary, soon-to-be-deleted code path.
-    def send_diagnostic_test_email(self, *, to: str) -> None:
-        """Send one fixed, plain-text diagnostic test email to `to` - no
-        password-reset code, no HTML, no links. Same security discipline
-        as `send_password_reset_code`: never logs the recipient, the
-        payload, or a response body - only the numeric HTTP status and
-        `type(exc).__name__` on failure. Raises `PasswordResetEmailError`
-        under the exact same conditions (not configured, permanent
-        provider failure, or transient failure exhausting retries).
-        """
-        if not self.is_enabled:
-            raise PasswordResetEmailError("Password-reset email sender is not configured")
-
-        url = f"{_RESEND_API_BASE}/emails"
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "User-Agent": _USER_AGENT,
-            "Idempotency-Key": secrets.token_urlsafe(32),
-        }
-        payload: dict[str, object] = {
-            "from": self._from_address,
-            "to": [to],
-            "subject": _DIAGNOSTIC_SUBJECT,
-            "text": _DIAGNOSTIC_BODY,
-        }
-        if self._reply_to:
-            payload["reply_to"] = self._reply_to
-
-        total_attempts = self._max_retries + 1
-
-        for attempt in range(1, total_attempts + 1):
-            try:
-                response = httpx.post(url, json=payload, headers=headers, timeout=self._timeout)
-            except httpx.HTTPError as exc:
-                if attempt >= total_attempts:
-                    logger.error(
-                        "Diagnostic test email request failed permanently after %d attempt(s) (%s)",
-                        attempt,
-                        type(exc).__name__,
-                    )
-                    raise PasswordResetEmailError("Diagnostic test email request failed") from None
-                self._retry_wait(
-                    attempt, total_attempts, self._backoff_seconds(attempt), reason=type(exc).__name__
-                )
-                continue
-
-            if response.status_code < 300:
-                logger.info("Diagnostic test email sent (attempt %d/%d)", attempt, total_attempts)
-                return
-
-            if response.status_code in _RETRIABLE_STATUS_CODES:
-                if attempt >= total_attempts:
-                    logger.error(
-                        "Diagnostic test email provider returned HTTP %s - giving up after %d attempt(s)",
-                        response.status_code,
-                        attempt,
-                    )
-                    raise PasswordResetEmailError(
-                        f"Diagnostic test email provider returned HTTP {response.status_code}"
-                    )
-                wait_seconds = self._retry_wait_seconds(response, attempt)
-                self._retry_wait(
-                    attempt, total_attempts, wait_seconds, reason=f"HTTP {response.status_code}"
-                )
-                continue
-
-            logger.error(
-                "Diagnostic test email provider returned HTTP %s (permanent failure, not retrying)",
-                response.status_code,
-            )
-            raise PasswordResetEmailError(f"Diagnostic test email provider returned HTTP {response.status_code}")
-
-        # Unreachable: the loop above always returns or raises before
-        # exhausting `total_attempts` iterations.
-        raise PasswordResetEmailError("Diagnostic test email request failed")
-
-    # ===== END TEMPORARY DIAGNOSTIC (send_diagnostic_test_email)
 
     def _retry_wait(self, attempt: int, total_attempts: int, wait_seconds: float, reason: str) -> None:
         logger.warning(

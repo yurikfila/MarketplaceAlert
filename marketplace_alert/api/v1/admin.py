@@ -24,37 +24,15 @@ already selects only safe fields into `AdminUserRow`; `api/v1/schemas.py`'s
 "a new, more sensitive column can't silently start being serialized."
 """
 
-import logging
-
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from marketplace_alert.api.v1.schemas import (
-    AdminEmailDeliveryTestResponse,
-    AdminStatsResponse,
-    AdminUserListResponse,
-    AdminUserOut,
-)
+from marketplace_alert.api.v1.schemas import AdminStatsResponse, AdminUserListResponse, AdminUserOut
 from marketplace_alert.core.admin.repository import AdminRepository, AdminUserRow
 from marketplace_alert.core.auth.dependencies import require_admin
-from marketplace_alert.core.auth.models import User
 from marketplace_alert.core.persistence.database import get_db_session
-from marketplace_alert.dependencies import get_password_reset_email_sender
-from marketplace_alert.notifications.email.provider import PasswordResetEmailError, PasswordResetEmailSender
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["Mobile API - Admin"], dependencies=[Depends(require_admin)])
-
-# ===== TEMPORARY DIAGNOSTIC - see email_delivery_test() below. Remove this
-# constant together with that route once email deliverability has been
-# confirmed and the diagnostic is no longer needed.
-#
-# Fixed, server-side only - never accepted from the request. The whole
-# point of this endpoint is a controlled, one-recipient deliverability
-# check; accepting an arbitrary recipient would turn an admin-only
-# diagnostic into a general-purpose "send email to anyone" primitive.
-_DIAGNOSTIC_RECIPIENT = "yurikfila@gmail.com"
 
 
 def _user_out(row: AdminUserRow) -> AdminUserOut:
@@ -94,50 +72,3 @@ def get_stats(session: Session = Depends(get_db_session)) -> AdminStatsResponse:
         total_users=repo.count_users(),
         total_saved_searches=repo.count_saved_searches(),
     )
-
-
-# ===== TEMPORARY DIAGNOSTIC - remove this route (and
-# PasswordResetEmailSender.send_diagnostic_test_email/_DIAGNOSTIC_RECIPIENT/
-# AdminEmailDeliveryTestResponse it depends on) once email deliverability
-# has been confirmed and this diagnostic is no longer needed.
-@router.post(
-    "/email-delivery-test",
-    summary="TEMPORARY: send one fixed diagnostic test email (admin only)",
-    description=(
-        "TEMPORARY diagnostic endpoint - sends exactly one fixed, plain-text "
-        "test email to a hard-coded recipient, using the application's "
-        "existing Resend configuration (PasswordResetEmailSender, the same "
-        "sender /forgot-password uses). Accepts no request body - the "
-        "recipient, subject, and body are never client-supplied, and this "
-        "never touches password-reset behavior. Same authorization as every "
-        "other /admin/* route (401 unauthenticated, 403 non-admin)."
-    ),
-)
-def email_delivery_test(
-    current_user: User = Depends(require_admin),
-    email_sender: PasswordResetEmailSender = Depends(get_password_reset_email_sender),
-) -> AdminEmailDeliveryTestResponse:
-    # Logs the caller's id (not email - this codebase never logs a user's
-    # email address anywhere, see PasswordResetEmailSender's own docstring)
-    # and only the recipient's domain, never the full address.
-    logger.info(
-        "Admin email delivery diagnostic requested (user_id=%s, target_domain=gmail.com)",
-        current_user.id,
-    )
-    if not email_sender.is_enabled:
-        logger.info("Admin email delivery diagnostic skipped - sender is not configured")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Email delivery is not configured"
-        )
-    try:
-        email_sender.send_diagnostic_test_email(to=_DIAGNOSTIC_RECIPIENT)
-    except PasswordResetEmailError:
-        logger.error("Admin email delivery diagnostic failed")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail="Email provider failed to accept the test email"
-        ) from None
-    logger.info("Admin email delivery diagnostic accepted by provider")
-    return AdminEmailDeliveryTestResponse(status="accepted")
-
-
-# ===== END TEMPORARY DIAGNOSTIC (email_delivery_test)

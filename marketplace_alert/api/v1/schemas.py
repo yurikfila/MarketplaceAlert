@@ -55,7 +55,6 @@ __all__ = [
     "AdminUserOut",
     "AdminUserListResponse",
     "AdminStatsResponse",
-    "AdminEmailDeliveryTestResponse",
 ]
 
 
@@ -370,18 +369,6 @@ class AdminStatsResponse(BaseModel):
 
     total_users: int
     total_saved_searches: int
-
-
-# ===== TEMPORARY DIAGNOSTIC - see api/v1/admin.py's `/email-delivery-test`
-# route. Remove this schema together with that route once no longer needed.
-class AdminEmailDeliveryTestResponse(BaseModel):
-    """`POST /api/v1/admin/email-delivery-test` response - deliberately
-    just a status string. The current email provider does not expose a
-    provider-assigned message id (see `PasswordResetEmailSender`'s own
-    docstring on why response bodies are never parsed), so this never
-    includes one - never any other Resend response detail either."""
-
-    status: str
 
 
 # --- Notification preferences (`/api/v1/notification-preferences/me`) --

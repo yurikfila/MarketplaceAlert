@@ -242,7 +242,7 @@ def test_existing_login_and_me_behavior_is_unaffected_by_the_admin_api(client) -
 # =====================================================================
 
 _DIAGNOSTIC_ENDPOINT = "/api/v1/admin/email-delivery-test"
-_DIAGNOSTIC_RECIPIENT = "yurik70@walla.co.il"
+_DIAGNOSTIC_RECIPIENT = "yurikfila@gmail.com"
 
 
 def test_email_delivery_test_without_authorization_header_returns_401(client) -> None:

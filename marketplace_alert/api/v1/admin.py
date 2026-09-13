@@ -47,14 +47,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["Mobile API - Admin"], dependencies=[Depends(require_admin)])
 
 # ===== TEMPORARY DIAGNOSTIC - see email_delivery_test() below. Remove this
-# constant together with that route once Walla.co.il deliverability has
-# been confirmed and the diagnostic is no longer needed.
+# constant together with that route once email deliverability has been
+# confirmed and the diagnostic is no longer needed.
 #
 # Fixed, server-side only - never accepted from the request. The whole
 # point of this endpoint is a controlled, one-recipient deliverability
 # check; accepting an arbitrary recipient would turn an admin-only
 # diagnostic into a general-purpose "send email to anyone" primitive.
-_DIAGNOSTIC_RECIPIENT = "yurik70@walla.co.il"
+_DIAGNOSTIC_RECIPIENT = "yurikfila@gmail.com"
 
 
 def _user_out(row: AdminUserRow) -> AdminUserOut:
@@ -98,8 +98,8 @@ def get_stats(session: Session = Depends(get_db_session)) -> AdminStatsResponse:
 
 # ===== TEMPORARY DIAGNOSTIC - remove this route (and
 # PasswordResetEmailSender.send_diagnostic_test_email/_DIAGNOSTIC_RECIPIENT/
-# AdminEmailDeliveryTestResponse it depends on) once Walla.co.il
-# deliverability has been confirmed and this diagnostic is no longer needed.
+# AdminEmailDeliveryTestResponse it depends on) once email deliverability
+# has been confirmed and this diagnostic is no longer needed.
 @router.post(
     "/email-delivery-test",
     summary="TEMPORARY: send one fixed diagnostic test email (admin only)",
@@ -121,7 +121,7 @@ def email_delivery_test(
     # email address anywhere, see PasswordResetEmailSender's own docstring)
     # and only the recipient's domain, never the full address.
     logger.info(
-        "Admin email delivery diagnostic requested (user_id=%s, target_domain=walla.co.il)",
+        "Admin email delivery diagnostic requested (user_id=%s, target_domain=gmail.com)",
         current_user.id,
     )
     if not email_sender.is_enabled:

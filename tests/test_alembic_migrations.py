@@ -8,6 +8,7 @@ produces exactly the same tables the app's own `Base.metadata` defines -
 i.e. the baseline genuinely represents the current model schema.
 """
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -1624,3 +1625,44 @@ def test_is_admin_round_trips_through_downgrade_and_re_upgrade(
         engine.dispose()
     assert "is_admin" in columns
     assert columns["is_admin"]["nullable"] is False
+
+
+# =====================================================================
+# Regression: running a migration must not silence application loggers
+# =====================================================================
+
+
+def test_running_a_migration_does_not_disable_other_application_loggers(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real, previously-confirmed production bug: `alembic/env.py` calls
+    `fileConfig(alembic.ini)` as part of running any migration (including
+    the exact `command.upgrade(cfg, "head")` call this test itself makes,
+    and the one `core/persistence/migrations.py:run_pending_migrations`
+    makes at every production startup) - with the stdlib default
+    `disable_existing_loggers=True`, that call silently and permanently
+    disabled every application logger not explicitly listed in
+    `alembic.ini`'s `[loggers]` section (root/sqlalchemy/alembic only),
+    including `marketplace_alert.api.v1.auth` and `marketplace_alert.
+    notifications.email.provider` - meaning their `logger.info(...)`/
+    `logger.error(...)` calls silently became no-ops, with no indication
+    anywhere that this had happened. Fixed by `env.py` passing
+    `disable_existing_loggers=False`; this test proves it stays fixed by
+    running a real migration and checking the actual loggers used for the
+    password-reset delivery diagnostics."""
+    db_path = tmp_path / "alembic_logger_regression_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    auth_logger = logging.getLogger("marketplace_alert.api.v1.auth")
+    email_logger = logging.getLogger("marketplace_alert.notifications.email.provider")
+    # Defensive - some other test/module elsewhere in this same process
+    # may have already tripped this bug before this fix existed; start
+    # from a known-good state so this test only ever proves what THIS
+    # migration run itself does, not a leftover from earlier in the suite.
+    auth_logger.disabled = False
+    email_logger.disabled = False
+
+    command.upgrade(cfg, "head")
+
+    assert auth_logger.disabled is False
+    assert email_logger.disabled is False

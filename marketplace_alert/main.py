@@ -123,6 +123,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # PROJECT_CONTEXT.md decision #20 (Render Free has no Pre-Deploy
     # Command, so this replaces what that would have done).
     run_pending_migrations(engine)
+    # Alembic's env.py runs `fileConfig(alembic.ini)` as part of the
+    # migration above (see that file's own comment) - alembic.ini's own
+    # `[logger_root]` section legitimately reconfigures root's level and
+    # handler (WARNING, plain-text-to-stderr) as part of that, independent
+    # of `disable_existing_loggers`. Re-applying this app's own logging
+    # config immediately afterward restores the intended level/handler
+    # (JSON-to-stdout, `settings.log_level`) for the rest of the process -
+    # without this, every application log line at INFO (including the
+    # password-reset delivery diagnostics) would otherwise go missing from
+    # every request served after the very first startup migration run.
+    configure_logging(settings.log_level)
     # init_db() only actually does anything for SQLite (local dev/tests) -
     # it no-ops for PostgreSQL, whose schema is managed by the Alembic
     # migration above instead. See database.py's docstring.

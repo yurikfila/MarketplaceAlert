@@ -35,8 +35,24 @@ config = context.config
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
+#
+# `disable_existing_loggers=False` - the stdlib default (True) disables
+# every already-instantiated logger not explicitly listed in this ini's
+# `[loggers]` section (root/sqlalchemy/alembic only) for the rest of the
+# process. Harmless for a short-lived `alembic upgrade head` CLI
+# invocation, but `marketplace_alert/core/persistence/migrations.py:
+# run_pending_migrations()` runs this exact env.py - via `command.upgrade()`
+# - from inside the actual long-running production app at every startup
+# (see that module's docstring). Without this flag, that single call
+# permanently disabled every application logger (e.g.
+# `marketplace_alert.api.v1.auth`, `marketplace_alert.notifications.
+# email.provider`) for the rest of that process's life - confirmed
+# directly, not assumed. `main.py`'s `lifespan()` re-applies
+# `configure_logging()` right after migrations run, to also restore root's
+# level/handler (this ini's own `[logger_root]` still legitimately
+# reconfigures those, independent of this flag).
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

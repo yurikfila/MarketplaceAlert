@@ -279,6 +279,7 @@ def test_lifespan_runs_migrations_before_init_db_before_legacy_migration_before_
 
     order: list[str] = []
     monkeypatch.setattr(main_module, "run_pending_migrations", lambda *a, **k: order.append("migrations"))
+    monkeypatch.setattr(main_module, "configure_logging", lambda *a, **k: order.append("configure_logging"))
     monkeypatch.setattr(main_module, "init_db", lambda *a, **k: order.append("init_db"))
     monkeypatch.setattr(
         main_module, "migrate_legacy_marketplace_column", lambda *a, **k: order.append("legacy_migration")
@@ -292,7 +293,50 @@ def test_lifespan_runs_migrations_before_init_db_before_legacy_migration_before_
 
     asyncio.run(_run())
 
-    assert order == ["migrations", "init_db", "legacy_migration", "scanner_start", "scanner_stop"]
+    assert order == [
+        "migrations",
+        "configure_logging",
+        "init_db",
+        "legacy_migration",
+        "scanner_start",
+        "scanner_stop",
+    ]
+
+
+def test_lifespan_reapplies_logging_config_immediately_after_migrations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real, previously-confirmed production bug, reproduced and fixed:
+    Alembic's `env.py` (run as part of `run_pending_migrations()`, at
+    every production startup) calls `fileConfig(alembic.ini)`, whose own
+    `[logger_root]` section legitimately reconfigures root's level/handler
+    (to WARNING, plain-text-to-stderr) independent of
+    `disable_existing_loggers`. Without re-applying this app's own
+    `configure_logging(settings.log_level)` immediately afterward, every
+    application log line at INFO (including the password-reset delivery
+    diagnostics in `api/v1/auth.py`) would silently stop appearing for the
+    rest of that process's life, for every request served after the very
+    first startup migration run. This test proves `lifespan()` calls
+    `configure_logging` with the app's own configured level, exactly once,
+    right after migrations - `configure_logging` itself is replaced with a
+    recording stub, so this never touches the real root logger."""
+    import marketplace_alert.main as main_module
+
+    recorded_levels: list[str] = []
+    monkeypatch.setattr(main_module, "run_pending_migrations", lambda *a, **k: None)
+    monkeypatch.setattr(main_module, "configure_logging", lambda level: recorded_levels.append(level))
+    monkeypatch.setattr(main_module, "init_db", lambda *a, **k: None)
+    monkeypatch.setattr(main_module, "migrate_legacy_marketplace_column", lambda *a, **k: None)
+    monkeypatch.setattr(main_module._background_scanner, "start", lambda *a, **k: None)
+    monkeypatch.setattr(main_module._background_scanner, "stop", lambda *a, **k: None)
+
+    async def _run() -> None:
+        async with main_module.lifespan(main_module.app):
+            pass
+
+    asyncio.run(_run())
+
+    assert recorded_levels == [settings.log_level]
 
 
 def test_lifespan_migration_failure_prevents_the_rest_of_startup(monkeypatch: pytest.MonkeyPatch) -> None:

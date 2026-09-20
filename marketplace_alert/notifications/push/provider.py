@@ -210,6 +210,20 @@ class ExpoPushProvider(NotificationProvider):
         included in any exception (see this module's own docstring).
         A malformed/unparseable/empty response body is treated as its
         own distinct error, never as silent success.
+
+        **`data` is a list *or* a single object, per Expo's own
+        documented behavior** - "an array of push tickets ... (or one
+        push ticket object, if you send a single message to a single
+        recipient)". `send_listing_alert` above always sends to exactly
+        one recipient (`to` is never a batch array here), so the
+        single-object shape is what Expo actually returns in practice;
+        the list shape is handled too since it's the other documented
+        possibility. Confirmed root cause of a real-device production
+        bug: assuming the list shape unconditionally raised an unhandled
+        `KeyError` (`tickets[0]` on a dict looks up the key `0`) *after*
+        Expo had already accepted and delivered the push - the delivery
+        succeeded while this method's caller saw an exception and
+        reported failure.
         """
         try:
             body = response.json()
@@ -218,7 +232,9 @@ class ExpoPushProvider(NotificationProvider):
         tickets = body.get("data") if isinstance(body, dict) else None
         if not tickets:
             return "no_ticket_data"
-        ticket = tickets[0]
+        ticket = tickets[0] if isinstance(tickets, list) else tickets
+        if not isinstance(ticket, dict):
+            return "malformed_response"
         if ticket.get("status") == "ok":
             return None
         details = ticket.get("details")

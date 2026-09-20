@@ -46,12 +46,29 @@ def _listing(**overrides: object) -> Listing:
 
 
 def _ok_response() -> httpx.Response:
+    """The list-wrapped shape Expo documents for a batch send."""
     return httpx.Response(200, json={"data": [{"status": "ok", "id": "ticket-1"}]})
+
+
+def _ok_response_single_object() -> httpx.Response:
+    """The shape Expo actually returns for a single-recipient send - this
+    provider's only real usage (`send_listing_alert` always sends to
+    exactly one `to`) - a plain ticket object, not list-wrapped. See
+    `ExpoPushProvider._ticket_error`'s own docstring for the real-device
+    production bug this shape's absence from these tests once caused."""
+    return httpx.Response(200, json={"data": {"status": "ok", "id": "ticket-1"}})
 
 
 def _error_ticket_response(error_code: str = "DeviceNotRegistered") -> httpx.Response:
     return httpx.Response(
         200, json={"data": [{"status": "error", "message": "some free text", "details": {"error": error_code}}]}
+    )
+
+
+def _error_ticket_response_single_object(error_code: str = "DeviceNotRegistered") -> httpx.Response:
+    """The single-recipient counterpart of `_error_ticket_response` above."""
+    return httpx.Response(
+        200, json={"data": {"status": "error", "message": "some free text", "details": {"error": error_code}}}
     )
 
 
@@ -155,8 +172,26 @@ def test_send_payload_carries_the_destination_title_body_and_listing_data(
 
 
 def test_send_succeeds_on_a_2xx_response_with_an_ok_ticket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The list-wrapped shape (a batch send)."""
     monkeypatch.setattr(httpx, "post", lambda *a, **k: _ok_response())
     _provider().send_listing_alert(_listing(), "ExponentPushToken[abc]")  # must not raise
+
+
+def test_send_succeeds_on_a_2xx_response_with_a_single_object_ok_ticket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shape Expo actually returns in practice, since this provider
+    only ever sends to one recipient at a time - see
+    `_ok_response_single_object`'s own docstring."""
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _ok_response_single_object())
+    _provider().send_listing_alert(_listing(), "ExponentPushToken[abc]")  # must not raise
+
+
+def test_send_raises_on_a_2xx_response_with_a_single_object_error_ticket(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        httpx, "post", lambda *a, **k: _error_ticket_response_single_object("DeviceNotRegistered")
+    )
+
+    with pytest.raises(NotificationError, match="DeviceNotRegistered"):
+        _provider().send_listing_alert(_listing(), "ExponentPushToken[abc]")
 
 
 def test_send_raises_on_a_2xx_response_with_an_error_ticket_never_retrying(

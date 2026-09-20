@@ -57,6 +57,7 @@ __all__ = [
     "AdminStatsResponse",
     "DeviceRegisterRequest",
     "DeviceUnregisterRequest",
+    "TestPushResponse",
 ]
 
 
@@ -439,3 +440,14 @@ class DeviceUnregisterRequest(BaseModel):
     already gone (or never existed) is not an error."""
 
     expo_push_token: str = Field(min_length=1)
+
+
+class TestPushResponse(BaseModel):
+    """`POST /api/v1/devices/test-push` response - **TEMPORARY, Phase 1
+    manual-verification diagnostic, see `api/v1/devices.py:send_test_push`
+    for removal notes.** Deliberately never includes a token value or any
+    other device-identifying detail - just enough to confirm whether
+    there was anything to send to, and whether the provider accepted it."""
+
+    sent: bool
+    device_count: int

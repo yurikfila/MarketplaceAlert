@@ -1511,11 +1511,16 @@ def test_password_reset_token_upgrade_downgrade_reupgrade_succeeds_on_a_compatib
 # =====================================================================
 
 
-def test_upgrade_head_reaches_the_is_admin_revision(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_upgrade_to_7b3f0a1d9c44_reaches_that_is_admin_revision(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Superseded as the "current head" check by
+    `test_upgrade_head_reaches_the_device_tokens_revision` below once
+    `3f9c1a5b7d2e` was added on top of this revision - kept as its own,
+    explicitly-targeted-revision test rather than deleted outright, same
+    precedent as `30fc5cd97dad`'s own superseded head test."""
     db_path = tmp_path / "alembic_is_admin_head_test.db"
     cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
 
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "7b3f0a1d9c44")
 
     engine = create_db_engine(f"sqlite:///{db_path}")
     try:
@@ -1666,3 +1671,173 @@ def test_running_a_migration_does_not_disable_other_application_loggers(
 
     assert auth_logger.disabled is False
     assert email_logger.disabled is False
+
+
+# =====================================================================
+# `3f9c1a5b7d2e` - add `device_tokens` and `pending_notifications` push columns
+# =====================================================================
+
+
+def test_upgrade_head_reaches_the_device_tokens_revision(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "alembic_device_tokens_head_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert version == "3f9c1a5b7d2e"
+
+
+def test_upgrade_head_creates_device_tokens_table(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "alembic_device_tokens_table_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        inspector = inspect(engine)
+        columns = {col["name"]: col for col in inspector.get_columns("device_tokens")}
+        foreign_keys = {fk["constrained_columns"][0]: fk for fk in inspector.get_foreign_keys("device_tokens")}
+        unique_constraints = inspector.get_unique_constraints("device_tokens")
+        index_names = {idx["name"] for idx in inspector.get_indexes("device_tokens")}
+    finally:
+        engine.dispose()
+
+    for column_name in ("id", "user_id", "expo_push_token", "platform", "created_at", "last_seen_at"):
+        assert column_name in columns
+    assert columns["user_id"]["nullable"] is False
+    assert columns["expo_push_token"]["nullable"] is False
+
+    assert foreign_keys["user_id"]["referred_table"] == "users"
+    assert foreign_keys["user_id"]["options"].get("ondelete") == "CASCADE"
+
+    assert len(unique_constraints) == 1
+    assert unique_constraints[0]["column_names"] == ["expo_push_token"]
+
+    assert "ix_device_tokens_user_id" in index_names
+
+
+def test_upgrade_head_adds_push_columns_to_pending_notifications(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "alembic_push_columns_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        columns = {col["name"]: col for col in inspect(engine).get_columns("pending_notifications")}
+        index_names = {idx["name"] for idx in inspect(engine).get_indexes("pending_notifications")}
+    finally:
+        engine.dispose()
+
+    for column_name in (
+        "push_status",
+        "push_attempt_count",
+        "push_claimed_at",
+        "push_last_attempted_at",
+        "push_last_error",
+        "push_sent_at",
+    ):
+        assert column_name in columns
+    assert columns["push_status"]["nullable"] is False
+    assert columns["push_attempt_count"]["nullable"] is False
+    assert "ix_pending_notifications_push_status" in index_names
+
+    # Every existing Telegram-oriented column must survive completely untouched.
+    for column_name in ("status", "attempt_count", "claimed_at", "last_attempted_at", "last_error", "sent_at"):
+        assert column_name in columns
+
+
+def test_push_status_defaults_to_pending_for_a_pre_existing_row_migrated_forward(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The important case for a real production cutover: a
+    `pending_notifications` row that existed BEFORE this migration ran
+    must become a definite, correct `pending` push_status once the
+    column is added - immediately eligible for the push drain, never
+    left NULL or requiring a backfill."""
+    db_path = tmp_path / "alembic_push_default_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+    command.upgrade(cfg, "7b3f0a1d9c44")  # before the push columns existed
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        user_id = _insert_user(conn, "pre-existing-push-user@example.com")
+        conn.execute(
+            sa.text(
+                "INSERT INTO discovered_listings "
+                "(marketplace, external_listing_id, title, listing_url, first_discovered_at, last_seen_at) "
+                "VALUES ('mock', 'pre-existing-ext-id', 'Listing', 'https://example.com/pre-existing', "
+                "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+            )
+        )
+        listing_id = conn.execute(
+            sa.text("SELECT id FROM discovered_listings WHERE external_listing_id = 'pre-existing-ext-id'")
+        ).scalar_one()
+        conn.execute(
+            sa.text(
+                "INSERT INTO pending_notifications "
+                "(discovered_listing_id, user_id, status, attempt_count, created_at) "
+                "VALUES (:listing_id, :user_id, 'pending', 0, '2026-01-01T00:00:00+00:00')"
+            ),
+            {"listing_id": listing_id, "user_id": user_id},
+        )
+        notification_id = conn.execute(
+            sa.text("SELECT id FROM pending_notifications WHERE discovered_listing_id = :listing_id"),
+            {"listing_id": listing_id},
+        ).scalar_one()
+    engine.dispose()
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text(
+                    "SELECT push_status, push_attempt_count FROM pending_notifications WHERE id = :id"
+                ),
+                {"id": notification_id},
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert row.push_status == "pending"
+    assert row.push_attempt_count == 0
+
+
+def test_device_tokens_and_push_columns_round_trip_through_downgrade_and_re_upgrade(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "alembic_device_tokens_round_trip_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+    command.downgrade(cfg, "7b3f0a1d9c44")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        table_names = set(inspect(engine).get_table_names())
+        pending_columns = {col["name"] for col in inspect(engine).get_columns("pending_notifications")}
+    finally:
+        engine.dispose()
+    assert "device_tokens" not in table_names
+    assert "push_status" not in pending_columns
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        table_names = set(inspect(engine).get_table_names())
+        pending_columns = {col["name"] for col in inspect(engine).get_columns("pending_notifications")}
+    finally:
+        engine.dispose()
+    assert "device_tokens" in table_names
+    assert "push_status" in pending_columns

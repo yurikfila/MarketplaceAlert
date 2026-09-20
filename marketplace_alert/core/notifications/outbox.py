@@ -132,9 +132,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from marketplace_alert.core.notifications.base import NotificationError, NotificationProvider
-from marketplace_alert.core.notifications.models import NotificationPreference
+from marketplace_alert.core.notifications.models import DeviceToken, NotificationPreference
 from marketplace_alert.core.persistence.models import (
     NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG,
+    NOTIFICATION_ERROR_NO_DEVICE_REGISTERED,
     NOTIFICATION_ERROR_OWNER_UNRESOLVED,
 )
 from marketplace_alert.core.persistence.notification_outbox import ClaimedNotification, NotificationOutboxRepository
@@ -407,6 +408,268 @@ def drain_pending_notifications(
             result.sent_count += 1
         elif error == NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG:
             result.awaiting_destination_config_count += 1
+        elif error == NOTIFICATION_ERROR_OWNER_UNRESOLVED:
+            result.unresolved_owner_count += 1
+        else:
+            result.failed_count += 1
+
+    return result
+
+
+# =========================================================================
+# Push channel (Expo Notifications) - Phase 1 of native mobile push.
+#
+# Everything below is a deliberate, near-exact mirror of the Telegram
+# claim/resolve/deliver/complete functions above - same three-phase
+# pattern, same "no database session open during delivery" discipline,
+# same non-failing "awaiting" treatment for a plausibly-temporary missing
+# destination - but reading/writing the `push_*` columns on
+# `PendingNotification` and resolving against `DeviceToken` instead of
+# `NotificationPreference`. Nothing above this section was changed by
+# this addition - every existing Telegram function, dataclass, and
+# behavior is untouched, byte for byte.
+#
+# **Why a parallel set of functions rather than parameterizing the
+# existing ones**: the two channels must be provably independent - a
+# missing Telegram destination must never affect push, and vice versa
+# (see `PendingNotification`'s push-columns docstring). Duplicating this
+# small amount of orchestration logic is the safest way to guarantee
+# that by construction, and keeps every existing Telegram code path (and
+# every existing test exercising it) completely unaffected by this
+# feature existing at all.
+#
+# A user can have more than one registered device (`DeviceToken` is one
+# row per token, not per user - see that model's docstring), so
+# `ResolvedPushDestinations.tokens` is a list, not a single value, and
+# `_deliver_push` fans out to every one of them: the row is considered
+# delivered (`push_status=sent`) if *at least one* device received it,
+# not only if all of them did - one device with a stale/uninstalled
+# token must never prevent delivery to the user's other, working device.
+# =========================================================================
+
+
+@dataclass
+class ResolvedPushDestinations:
+    """Outcome of resolving one claimed notification's push destinations -
+    the push-channel counterpart of `ResolvedDestination` above.
+
+    `tokens` is every currently-registered Expo push token for the
+    resolved owner - empty, one, or more than one. Empty with
+    `unresolved_reason` set to `NOTIFICATION_ERROR_NO_DEVICE_REGISTERED`
+    means the owner is known but has no registered device yet (Case A's
+    push counterpart); `NOTIFICATION_ERROR_OWNER_UNRESOLVED` means
+    ownership itself could not be established (Case B, identical to the
+    Telegram path).
+    """
+
+    tokens: list[str]
+    unresolved_reason: str | None = None
+
+
+@dataclass
+class PushDrainResult:
+    """The push-channel counterpart of `DrainResult` above."""
+
+    claimed_count: int = 0
+    sent_count: int = 0
+    failed_count: int = 0
+    awaiting_device_count: int = 0
+    unresolved_owner_count: int = 0
+
+
+def claim_due_push_notifications(
+    session_factory: Callable[[], Session],
+    *,
+    limit: int,
+    lease_seconds: float,
+    no_destination_retry_seconds: float,
+) -> list[ClaimedNotification]:
+    """Push-channel counterpart of `claim_due_notifications` - same
+    open-commit-close-immediately discipline, via
+    `NotificationOutboxRepository.claim_push_batch`."""
+    session = session_factory()
+    try:
+        claimed = NotificationOutboxRepository(session).claim_push_batch(
+            limit=limit, lease_seconds=lease_seconds, no_destination_retry_seconds=no_destination_retry_seconds
+        )
+        session.commit()
+        return claimed
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def resolve_push_destinations(
+    session_factory: Callable[[], Session],
+    *,
+    user_id: int | None,
+    discovered_by_saved_search_id: int | None,
+) -> ResolvedPushDestinations:
+    """Resolves every Expo push token belonging to the user this
+    notification is for - the push-channel counterpart of
+    `resolve_destination`. Same two-path ownership resolution (stamped
+    `user_id` preferred, falling back to `SavedSearch.user_id` for
+    historical rows) - see that function's own docstring for the full
+    reasoning, unchanged here.
+
+    Once an owner is resolved, looks up every `DeviceToken` row for
+    them via `DeviceTokenRepository`-equivalent inline query (a plain
+    `SELECT`, no repository indirection needed for this single read) -
+    zero tokens is Case A's push counterpart
+    (`NOTIFICATION_ERROR_NO_DEVICE_REGISTERED`), plausibly temporary
+    (the user hasn't opened the app / granted notification permission
+    yet), so it gets the same indefinitely-retried-but-throttled
+    treatment as an unconfigured Telegram destination.
+    """
+    if user_id is None and discovered_by_saved_search_id is None:
+        return ResolvedPushDestinations([], NOTIFICATION_ERROR_OWNER_UNRESOLVED)
+
+    session = session_factory()
+    try:
+        resolved_user_id = user_id
+        if resolved_user_id is None:
+            resolved_user_id = session.execute(
+                select(SavedSearch.user_id).where(SavedSearch.id == discovered_by_saved_search_id)
+            ).scalar_one_or_none()
+            if resolved_user_id is None:
+                return ResolvedPushDestinations([], NOTIFICATION_ERROR_OWNER_UNRESOLVED)
+
+        tokens = list(
+            session.execute(
+                select(DeviceToken.expo_push_token).where(DeviceToken.user_id == resolved_user_id)
+            ).scalars()
+        )
+        if not tokens:
+            return ResolvedPushDestinations([], NOTIFICATION_ERROR_NO_DEVICE_REGISTERED)
+
+        return ResolvedPushDestinations(tokens)
+    finally:
+        session.close()
+
+
+def complete_push_notification(
+    session_factory: Callable[[], Session],
+    *,
+    notification_id: int,
+    success: bool,
+    error: str | None,
+    max_attempts: int,
+) -> None:
+    """Push-channel counterpart of `complete_notification` - via
+    `NotificationOutboxRepository.complete_push`."""
+    session = session_factory()
+    try:
+        NotificationOutboxRepository(session).complete_push(
+            notification_id=notification_id, success=success, error=error, max_attempts=max_attempts
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def _deliver_push(
+    provider: NotificationProvider, claimed: ClaimedNotification, resolved: ResolvedPushDestinations
+) -> tuple[bool, str | None]:
+    """Push-channel counterpart of `_deliver` - no database session open
+    here either. Fans out to every resolved token (see this section's
+    own module-level docstring for why): the row is reported as
+    delivered if *any* token succeeded, and as failed (carrying the last
+    token's error) only if every single one failed. A push provider
+    failure on one of a user's several devices must never be treated the
+    same as a genuine, total delivery failure.
+    """
+    if not resolved.tokens:
+        logger.info(
+            "No device token for push notification %s (%s listing %s): %s - left for retry, never "
+            "using a global fallback",
+            claimed.notification_id,
+            claimed.listing.marketplace,
+            claimed.listing.external_listing_id,
+            resolved.unresolved_reason,
+        )
+        return False, resolved.unresolved_reason
+
+    any_success = False
+    last_error: str | None = None
+    for token in resolved.tokens:
+        try:
+            provider.send_listing_alert(claimed.listing, token)
+            any_success = True
+        except NotificationError as exc:
+            last_error = str(exc)
+            logger.exception(
+                "Failed to deliver push notification %s for %s listing %s to one device",
+                claimed.notification_id,
+                claimed.listing.marketplace,
+                claimed.listing.external_listing_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad device can't block the rest of the batch
+            last_error = str(exc)
+            logger.exception(
+                "Unexpected error delivering push notification %s for %s listing %s to one device",
+                claimed.notification_id,
+                claimed.listing.marketplace,
+                claimed.listing.external_listing_id,
+            )
+
+    if any_success:
+        return True, None
+    return False, last_error or "Push delivery failed for every registered device"
+
+
+def drain_pending_push_notifications(
+    session_factory: Callable[[], Session],
+    provider: NotificationProvider,
+    *,
+    batch_size: int,
+    lease_seconds: float,
+    max_attempts: int,
+    no_destination_retry_seconds: float,
+) -> PushDrainResult:
+    """Push-channel counterpart of `drain_pending_notifications` - one
+    full drain pass over the `push_*` columns, completely independent of
+    the Telegram pass above (a separate call, from
+    `scripts/drain_notification_outbox.py`, never invoked by or invoking
+    `drain_pending_notifications`).
+
+    Returns immediately, claiming nothing, if `provider.is_enabled` is
+    `False` - same convention as the Telegram drain.
+    """
+    if not provider.is_enabled:
+        logger.info("Push notification provider is disabled - skipping push outbox drain")
+        return PushDrainResult()
+
+    claimed = claim_due_push_notifications(
+        session_factory,
+        limit=batch_size,
+        lease_seconds=lease_seconds,
+        no_destination_retry_seconds=no_destination_retry_seconds,
+    )
+    result = PushDrainResult(claimed_count=len(claimed))
+
+    for notification in claimed:
+        resolved = resolve_push_destinations(
+            session_factory,
+            user_id=notification.user_id,
+            discovered_by_saved_search_id=notification.discovered_by_saved_search_id,
+        )
+        success, error = _deliver_push(provider, notification, resolved)
+        complete_push_notification(
+            session_factory,
+            notification_id=notification.notification_id,
+            success=success,
+            error=error,
+            max_attempts=max_attempts,
+        )
+        if success:
+            result.sent_count += 1
+        elif error == NOTIFICATION_ERROR_NO_DEVICE_REGISTERED:
+            result.awaiting_device_count += 1
         elif error == NOTIFICATION_ERROR_OWNER_UNRESOLVED:
             result.unresolved_owner_count += 1
         else:

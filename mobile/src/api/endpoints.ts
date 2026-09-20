@@ -10,6 +10,8 @@ import type {
   AdminStatsResponse,
   AdminUserListResponse,
   AuthResponse,
+  DeviceRegisterInput,
+  DeviceUnregisterInput,
   ForgotPasswordInput,
   ForgotPasswordResponse,
   ListingListResponse,
@@ -141,4 +143,19 @@ export function listAdminUsers(): Promise<AdminUserListResponse> {
 /** Same authorization as listAdminUsers() above. */
 export function getAdminStats(): Promise<AdminStatsResponse> {
   return apiRequest<AdminStatsResponse>('/admin/stats');
+}
+
+// --- Push notification device registration ------------------------------
+//
+// See src/utils/pushNotifications.ts for how these are actually used -
+// screens never call these directly.
+
+/** Resolves with no value on success (backend returns 204 No Content). */
+export function registerDeviceToken(input: DeviceRegisterInput): Promise<void> {
+  return apiRequest<void>('/devices', { method: 'POST', body: input });
+}
+
+/** Resolves with no value on success (backend returns 204 No Content). */
+export function unregisterDeviceToken(input: DeviceUnregisterInput): Promise<void> {
+  return apiRequest<void>('/devices', { method: 'DELETE', body: input });
 }

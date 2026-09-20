@@ -217,3 +217,19 @@ export interface AdminStatsResponse {
   total_users: number;
   total_saved_searches: number;
 }
+
+/**
+ * POST /api/v1/devices body - mirrors the backend's `DeviceRegisterRequest`.
+ * Re-registering the exact same token under a different authenticated user
+ * transfers ownership to that user (see backend's `DeviceToken` docstring) -
+ * this app never needs to worry about "unregister the old owner first".
+ */
+export interface DeviceRegisterInput {
+  expo_push_token: string;
+  platform?: string;
+}
+
+/** DELETE /api/v1/devices body - mirrors the backend's `DeviceUnregisterRequest`. */
+export interface DeviceUnregisterInput {
+  expo_push_token: string;
+}

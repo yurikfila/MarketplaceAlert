@@ -68,6 +68,7 @@ import {
   signup as signupRequest,
 } from '../api/endpoints';
 import type { UserPublic } from '../api/types';
+import { unregisterCurrentDeviceToken } from '../utils/pushNotifications';
 import * as tokenStorage from './tokenStorage';
 
 export type AuthStatus = 'restoring' | 'authenticated' | 'unauthenticated' | 'restoration-error';
@@ -367,6 +368,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // not be able to reinstall credentials once logout has started, no
     // matter how long its own network call takes relative to this one.
     beginNewGeneration();
+    // Best-effort, and deliberately BEFORE clearSession(): unregistering
+    // this device's push token calls an authenticated endpoint, so it
+    // must run while the access token set by this session is still live -
+    // see unregisterCurrentDeviceToken's own docstring.
+    await unregisterCurrentDeviceToken();
     const stored = await tokenStorage.getRefreshToken();
     if (stored) {
       try {

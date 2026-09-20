@@ -55,6 +55,8 @@ __all__ = [
     "AdminUserOut",
     "AdminUserListResponse",
     "AdminStatsResponse",
+    "DeviceRegisterRequest",
+    "DeviceUnregisterRequest",
 ]
 
 
@@ -410,3 +412,30 @@ class NotificationPreferenceUpdate(BaseModel):
                 "telegram_chat_id must be a Telegram chat id - digits, optionally prefixed with '-' (for a group chat)"
             )
         return stripped
+
+
+# --- Device registration (`/api/v1/devices`) - native mobile push, Phase 1 -
+#
+# Always the authenticated caller's own device - see `api/v1/devices.py`.
+# No `user_id` field on either schema, ever - ownership is derived
+# exclusively from the bearer token, never accepted from the client (same
+# rule as the notification-preferences schemas above).
+
+
+class DeviceRegisterRequest(BaseModel):
+    """`POST /api/v1/devices` request body - registers or updates (upserts)
+    the caller's Expo push token. Re-registering the exact same token
+    under a different authenticated user transfers ownership to that
+    user - see `core/notifications/models.py:DeviceToken`'s own
+    docstring for why."""
+
+    expo_push_token: str = Field(min_length=1)
+    platform: str | None = None
+
+
+class DeviceUnregisterRequest(BaseModel):
+    """`DELETE /api/v1/devices` request body - removes one of the
+    caller's own registered tokens. Idempotent: removing a token that's
+    already gone (or never existed) is not an error."""
+
+    expo_push_token: str = Field(min_length=1)

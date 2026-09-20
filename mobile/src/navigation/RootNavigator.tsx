@@ -15,7 +15,9 @@ import { RestorationErrorScreen } from '../screens/RestorationErrorScreen';
 import { SavedSearchDetailScreen } from '../screens/SavedSearchDetailScreen';
 import { SavedSearchesScreen } from '../screens/SavedSearchesScreen';
 import { colors } from '../theme/colors';
+import { usePushNotificationSetup } from '../utils/pushNotifications';
 import { AuthNavigator } from './AuthNavigator';
+import { navigationRef } from './navigationRef';
 import type { RootStackParamList, TabParamList } from './types';
 
 const Tab = createBottomTabNavigator<TabParamList>();
@@ -67,6 +69,7 @@ function AuthenticatedNavigator() {
  */
 function RootNavigatorContent() {
   const { status } = useAuth();
+  usePushNotificationSetup(status);
 
   if (status === 'restoring') {
     return <LoadingView label="Loading…" />;
@@ -82,7 +85,7 @@ function RootNavigatorContent() {
 
 export function RootNavigator() {
   return (
-    <NavigationContainer>
+    <NavigationContainer ref={navigationRef}>
       <RootNavigatorContent />
     </NavigationContainer>
   );

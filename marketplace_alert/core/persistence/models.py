@@ -239,6 +239,14 @@ NOTIFICATION_STATUS_PROCESSING = "processing"
 NOTIFICATION_STATUS_SENT = "sent"
 NOTIFICATION_STATUS_FAILED = "failed"
 
+# Push-channel counterpart of `NOTIFICATION_ERROR_AWAITING_DESTINATION_
+# CONFIG` below - the owner is resolved, but they have no registered Expo
+# device token yet (see `core/notifications/device_repository.py`,
+# `core/notifications/outbox.py`'s push drain). Same non-failing,
+# indefinitely-retried-but-throttled treatment as Case A for Telegram -
+# see `PendingNotification.push_status`'s own docstring.
+NOTIFICATION_ERROR_NO_DEVICE_REGISTERED = "Owning user has no registered device for push notifications yet"
+
 # Distinct, matchable `last_error` sentinels for the two reasons a
 # notification can go undelivered with no Telegram call ever made - see
 # `core/notifications/outbox.py`'s "SECURITY RULE" docstring section for
@@ -410,3 +418,28 @@ class PendingNotification(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # --- Push channel (Expo Notifications) - Phase 1 of native mobile push.
+    #
+    # A second, fully independent claim/deliver/complete lifecycle on the
+    # SAME row, so this one enqueue event can be delivered over Telegram
+    # and/or push without either channel's state affecting the other -
+    # see `core/notifications/outbox.py`'s push drain functions and
+    # `core/notifications/device_repository.py`. Every column here
+    # mirrors its `status`/`attempt_count`/`claimed_at`/`last_attempted_at`/
+    # `last_error`/`sent_at` sibling above exactly, one-for-one, but for
+    # push instead of Telegram - deliberately NOT reusing those columns:
+    # a row must be able to be `status=pending` (Telegram not yet
+    # attempted) while simultaneously `push_status=sent` (push already
+    # delivered), or any other independent combination, which a single
+    # shared set of columns could never represent. Nothing above this
+    # table (enqueue()) needs to change - these all default exactly like
+    # their Telegram counterparts, so a freshly-enqueued row is
+    # immediately eligible for both channels' claim queries without any
+    # enqueue-side code change.
+    push_status: Mapped[str] = mapped_column(String, nullable=False, default=NOTIFICATION_STATUS_PENDING, index=True)
+    push_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    push_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    push_last_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    push_last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    push_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

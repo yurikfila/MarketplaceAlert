@@ -39,15 +39,20 @@ from sqlalchemy import text
 from marketplace_alert.core.auth.models import User
 from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.notifications.base import NotificationError, NotificationProvider
+from marketplace_alert.core.notifications.device_repository import DeviceTokenRepository
 from marketplace_alert.core.notifications.outbox import (
     DrainResult,
+    PushDrainResult,
     claim_due_notifications,
+    claim_due_push_notifications,
     drain_pending_notifications,
+    drain_pending_push_notifications,
     resolve_destination,
 )
 from marketplace_alert.core.notifications.preferences_repository import NotificationPreferenceRepository
 from marketplace_alert.core.persistence.models import (
     NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG,
+    NOTIFICATION_ERROR_NO_DEVICE_REGISTERED,
     NOTIFICATION_ERROR_OWNER_UNRESOLVED,
     NOTIFICATION_STATUS_FAILED,
     NOTIFICATION_STATUS_PENDING,
@@ -168,6 +173,28 @@ def _stamped_notification(session_factory, external_id: str, *, telegram_chat_id
 
 def _drain(session_factory, provider, *, max_attempts: int = 5, no_destination_retry_seconds: float = _NO_THROTTLE_TESTING):
     return drain_pending_notifications(
+        session_factory,
+        provider,
+        batch_size=10,
+        lease_seconds=120,
+        max_attempts=max_attempts,
+        no_destination_retry_seconds=no_destination_retry_seconds,
+    )
+
+
+def _register_device_token(session_factory, user_id: int, expo_push_token: str = "ExponentPushToken[test]") -> None:
+    session = session_factory()
+    try:
+        DeviceTokenRepository(session).upsert(user_id=user_id, expo_push_token=expo_push_token, platform="android")
+        session.commit()
+    finally:
+        session.close()
+
+
+def _drain_push(
+    session_factory, provider, *, max_attempts: int = 5, no_destination_retry_seconds: float = _NO_THROTTLE_TESTING
+):
+    return drain_pending_push_notifications(
         session_factory,
         provider,
         batch_size=10,
@@ -1313,3 +1340,180 @@ def test_case_b_eventually_becomes_failed_after_max_attempts(session_factory) ->
     # Terminal - a later drain must never pick a `failed` row up again.
     result_after = _drain(session_factory, provider, max_attempts=3)
     assert result_after.claimed_count == 0
+
+
+# =====================================================================
+# Push channel (Expo Notifications) - Phase 1 of native mobile push.
+#
+# The load-bearing property under test throughout this section: the
+# push and Telegram channels are provably independent - a missing
+# Telegram destination must never prevent push delivery, and a missing
+# device token must never prevent Telegram delivery. Every test below
+# proves this by actually draining BOTH channels for the same row and
+# checking each one's own outcome, never assuming independence from the
+# code structure alone.
+# =====================================================================
+
+
+def test_push_delivers_successfully_with_no_telegram_preference_configured_at_all(session_factory) -> None:
+    user_id = _create_user(session_factory, "push-only@example.com")
+    saved_search_id = _create_owned_saved_search(session_factory, user_id)
+    _register_device_token(session_factory, user_id)
+    # Deliberately no _set_telegram_preference call at all - this user
+    # has never configured Telegram.
+    notification_id = _persist_and_enqueue(
+        session_factory, "push-only-1", saved_search_id=saved_search_id, user_id=user_id
+    )
+
+    push_provider = RecordingProvider()
+    push_result = _drain_push(session_factory, push_provider)
+
+    assert push_result.sent_count == 1
+    assert push_result.awaiting_device_count == 0
+    assert push_provider.destinations == ["ExponentPushToken[test]"]
+
+    verify = session_factory()
+    row = verify.get(PendingNotification, notification_id)
+    assert row.push_status == NOTIFICATION_STATUS_SENT
+    assert row.status == NOTIFICATION_STATUS_PENDING  # Telegram channel untouched by the push drain
+    verify.close()
+
+
+def test_telegram_delivers_successfully_with_no_device_token_registered_at_all(session_factory) -> None:
+    user_id = _create_user(session_factory, "telegram-only@example.com")
+    saved_search_id = _create_owned_saved_search(session_factory, user_id)
+    _set_telegram_preference(session_factory, user_id, "555")
+    # Deliberately no _register_device_token call - this user has never
+    # opened the app / granted notification permission.
+    notification_id = _persist_and_enqueue(
+        session_factory, "telegram-only-1", saved_search_id=saved_search_id, user_id=user_id
+    )
+
+    telegram_provider = RecordingProvider()
+    telegram_result = _drain(session_factory, telegram_provider)
+
+    assert telegram_result.sent_count == 1
+    assert telegram_provider.destinations == ["555"]
+
+    verify = session_factory()
+    row = verify.get(PendingNotification, notification_id)
+    assert row.status == NOTIFICATION_STATUS_SENT
+    assert row.push_status == NOTIFICATION_STATUS_PENDING  # push channel untouched by the Telegram drain
+    verify.close()
+
+
+def test_push_awaiting_device_never_advances_telegrams_own_state_and_vice_versa(session_factory) -> None:
+    """Both channels unconfigured - drain each independently and confirm
+    neither channel's outcome leaks into the other's columns."""
+    user_id = _create_user(session_factory, "neither-configured@example.com")
+    saved_search_id = _create_owned_saved_search(session_factory, user_id)
+    notification_id = _persist_and_enqueue(
+        session_factory, "neither-1", saved_search_id=saved_search_id, user_id=user_id
+    )
+
+    telegram_result = _drain(session_factory, NeverCalledProvider())
+    push_result = _drain_push(session_factory, NeverCalledProvider())
+
+    assert telegram_result.awaiting_destination_config_count == 1
+    assert push_result.awaiting_device_count == 1
+
+    verify = session_factory()
+    row = verify.get(PendingNotification, notification_id)
+    assert row.status == NOTIFICATION_STATUS_PENDING
+    assert row.last_error == NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG
+    assert row.push_status == NOTIFICATION_STATUS_PENDING
+    assert row.push_last_error == NOTIFICATION_ERROR_NO_DEVICE_REGISTERED
+    verify.close()
+
+
+def test_push_failure_does_not_prevent_or_affect_a_successful_telegram_delivery(session_factory) -> None:
+    user_id = _create_user(session_factory, "push-fails-telegram-ok@example.com")
+    saved_search_id = _create_owned_saved_search(session_factory, user_id)
+    _set_telegram_preference(session_factory, user_id, "777")
+    _register_device_token(session_factory, user_id)
+    notification_id = _persist_and_enqueue(
+        session_factory, "mixed-1", saved_search_id=saved_search_id, user_id=user_id
+    )
+
+    push_result = _drain_push(session_factory, AlwaysFailingProvider(), max_attempts=1)
+    telegram_result = _drain(session_factory, RecordingProvider())
+
+    assert push_result.failed_count == 1
+    assert telegram_result.sent_count == 1
+
+    verify = session_factory()
+    row = verify.get(PendingNotification, notification_id)
+    assert row.push_status == NOTIFICATION_STATUS_FAILED
+    assert row.status == NOTIFICATION_STATUS_SENT
+    verify.close()
+
+
+def test_push_disabled_provider_claims_nothing_same_convention_as_telegram(session_factory) -> None:
+    class DisabledProvider(NotificationProvider):
+        @property
+        def is_enabled(self) -> bool:
+            return False
+
+        def send_listing_alert(self, listing: Listing, destination: str) -> None:
+            raise AssertionError("must never be called while disabled")
+
+    user_id = _create_user(session_factory, "disabled-push@example.com")
+    saved_search_id = _create_owned_saved_search(session_factory, user_id)
+    _register_device_token(session_factory, user_id)
+    _persist_and_enqueue(session_factory, "disabled-1", saved_search_id=saved_search_id, user_id=user_id)
+
+    result = _drain_push(session_factory, DisabledProvider())
+
+    assert result == PushDrainResult()
+
+
+def test_push_fans_out_to_every_registered_device_and_succeeds_if_any_one_does(session_factory) -> None:
+    user_id = _create_user(session_factory, "multi-device@example.com")
+    saved_search_id = _create_owned_saved_search(session_factory, user_id)
+    _register_device_token(session_factory, user_id, "ExponentPushToken[device-1]")
+    _register_device_token(session_factory, user_id, "ExponentPushToken[device-2]")
+    _persist_and_enqueue(session_factory, "multi-1", saved_search_id=saved_search_id, user_id=user_id)
+
+    class FailsFirstDeviceOnly(NotificationProvider):
+        @property
+        def is_enabled(self) -> bool:
+            return True
+
+        def send_listing_alert(self, listing: Listing, destination: str) -> None:
+            if destination == "ExponentPushToken[device-1]":
+                raise NotificationError("simulated failure for this one device")
+
+    result = _drain_push(session_factory, FailsFirstDeviceOnly())
+
+    assert result.sent_count == 1  # the row as a whole is delivered - one working device is enough
+
+
+def test_push_claim_lease_mirrors_telegrams_own_behavior(session_factory) -> None:
+    """Not re-proving every Telegram concurrency/lease/retry edge case
+    (already exhaustively covered above) - just confirming the push
+    claim query uses the same claimed->processing->lease-reclaim
+    mechanics, since `claim_push_batch` is a near-duplicate of
+    `claim_batch` by design (see that method's own docstring)."""
+    user_id = _create_user(session_factory, "push-lease@example.com")
+    saved_search_id = _create_owned_saved_search(session_factory, user_id)
+    _register_device_token(session_factory, user_id)
+    notification_id = _persist_and_enqueue(
+        session_factory, "push-lease-1", saved_search_id=saved_search_id, user_id=user_id
+    )
+
+    claimed = claim_due_push_notifications(
+        session_factory, limit=10, lease_seconds=120, no_destination_retry_seconds=_NO_THROTTLE_TESTING
+    )
+    assert len(claimed) == 1
+
+    # Immediately re-claiming must see nothing - the row is `processing`, still within its lease.
+    reclaimed = claim_due_push_notifications(
+        session_factory, limit=10, lease_seconds=120, no_destination_retry_seconds=_NO_THROTTLE_TESTING
+    )
+    assert reclaimed == []
+
+    verify = session_factory()
+    row = verify.get(PendingNotification, notification_id)
+    assert row.push_status == NOTIFICATION_STATUS_PROCESSING
+    assert row.push_attempt_count == 1
+    verify.close()

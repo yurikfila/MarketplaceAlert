@@ -109,6 +109,28 @@ class Settings(BaseSettings):
     # promptly, not after a multi-hour wait.
     notification_no_destination_retry_seconds: float = 900.0
 
+    # Native mobile push (Expo Notifications) - Phase 1. A separate,
+    # independent channel alongside Telegram - see `core/notifications/
+    # outbox.py`'s push drain functions and `notifications/push/
+    # provider.py:ExpoPushProvider`. `expo_push_enabled` is a plain
+    # operator on/off switch, not a "is a credential configured" check -
+    # unlike Telegram/Resend, Expo's push API needs no credential at all
+    # to send (see `ExpoPushProvider`'s own docstring for why). Leave
+    # `EXPO_ACCESS_TOKEN` unset unless "push security" has been
+    # explicitly enabled in the EAS dashboard for this project - most
+    # deployments never need it.
+    expo_push_enabled: bool = True
+    expo_access_token: str | None = None
+    expo_push_max_retries: int = 3
+    expo_push_retry_base_seconds: float = 2.0
+
+    # Mirrors `notification_max_attempts` above, but counted
+    # independently on the push channel's own `push_attempt_count` - a
+    # deliberately separate setting (not reused) so push and Telegram
+    # retry ceilings can be tuned independently if the two channels'
+    # real-world failure characteristics ever diverge.
+    push_notification_max_attempts: int = 10
+
     # How often the background scanner checks for due saved searches
     # (polling granularity, not a per-search interval - see
     # core/saved_searches/schemas.py for the per-search minimum).

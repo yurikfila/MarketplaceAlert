@@ -23,6 +23,7 @@ from marketplace_alert.core.saved_searches.runner import SavedSearchRunner
 from marketplace_alert.core.saved_searches.service import SavedSearchService
 from marketplace_alert.core.scheduler.guard import SavedSearchRunGuard
 from marketplace_alert.notifications.email.provider import PasswordResetEmailSender
+from marketplace_alert.notifications.push.provider import ExpoPushProvider
 from marketplace_alert.notifications.telegram.provider import TelegramNotificationProvider
 
 # The concrete provider (Telegram) is chosen here, once, at startup - every
@@ -64,6 +65,20 @@ password_reset_email_sender = PasswordResetEmailSender(
     api_key=settings.resend_api_key,
     from_address=settings.password_reset_email_from,
     reply_to=settings.password_reset_email_reply_to,
+)
+
+# Native mobile push (Expo Notifications) - Phase 1. A module-level
+# singleton, same convention as `notification_provider`/`password_reset_
+# email_sender` above. Used directly by `scripts/drain_notification_
+# outbox.py` (mirroring how that script already uses `notification_
+# provider` directly, not `NotificationService` - see that script's own
+# docstring) - not wired into any FastAPI route in this phase, since
+# nothing here needs it.
+expo_push_provider = ExpoPushProvider(
+    enabled=settings.expo_push_enabled,
+    access_token=settings.expo_access_token,
+    max_retries=settings.expo_push_max_retries,
+    retry_base_seconds=settings.expo_push_retry_base_seconds,
 )
 
 

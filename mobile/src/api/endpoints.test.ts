@@ -9,7 +9,7 @@
  */
 
 import { apiRequest } from './client';
-import { forgotPassword, getAdminStats, listAdminUsers, resetPassword } from './endpoints';
+import { forgotPassword, getAdminStats, listAdminUsers, registerDeviceToken, resetPassword, unregisterDeviceToken } from './endpoints';
 
 jest.mock('./client');
 
@@ -91,5 +91,41 @@ describe('getAdminStats', () => {
 
     expect(mockedApiRequest).toHaveBeenCalledWith('/admin/stats');
     expect(result).toEqual({ total_users: 5, total_saved_searches: 12 });
+  });
+});
+
+describe('registerDeviceToken', () => {
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('POSTs to /devices with the token and platform', async () => {
+    mockedApiRequest.mockResolvedValue(undefined);
+
+    const result = await registerDeviceToken({ expo_push_token: 'ExponentPushToken[abc]', platform: 'android' });
+
+    expect(mockedApiRequest).toHaveBeenCalledWith('/devices', {
+      method: 'POST',
+      body: { expo_push_token: 'ExponentPushToken[abc]', platform: 'android' },
+    });
+    expect(result).toBeUndefined();
+  });
+});
+
+describe('unregisterDeviceToken', () => {
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('DELETEs /devices with the token', async () => {
+    mockedApiRequest.mockResolvedValue(undefined);
+
+    const result = await unregisterDeviceToken({ expo_push_token: 'ExponentPushToken[abc]' });
+
+    expect(mockedApiRequest).toHaveBeenCalledWith('/devices', {
+      method: 'DELETE',
+      body: { expo_push_token: 'ExponentPushToken[abc]' },
+    });
+    expect(result).toBeUndefined();
   });
 });

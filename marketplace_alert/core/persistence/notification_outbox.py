@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.persistence.models import (
     NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG,
+    NOTIFICATION_ERROR_NO_DEVICE_REGISTERED,
     NOTIFICATION_STATUS_FAILED,
     NOTIFICATION_STATUS_PENDING,
     NOTIFICATION_STATUS_PROCESSING,
@@ -267,6 +268,102 @@ class NotificationOutboxRepository:
         else:
             row.last_error = error
             row.status = NOTIFICATION_STATUS_FAILED if row.attempt_count >= max_attempts else NOTIFICATION_STATUS_PENDING
+        self._session.flush()
+
+    def claim_push_batch(
+        self, *, limit: int, lease_seconds: float, no_destination_retry_seconds: float
+    ) -> list[ClaimedNotification]:
+        """The push-channel counterpart of `claim_batch` above - identical
+        claim query shape and identical `FOR UPDATE SKIP LOCKED`/lease/
+        throttle semantics, but reading and writing the `push_*` columns
+        instead of the Telegram-oriented ones. Deliberately a separate
+        method (not a parameterized version of `claim_batch`) so the
+        existing Telegram claim query is provably untouched by this
+        addition - see `core/persistence/models.py:PendingNotification`'s
+        push-columns docstring for why the two channels never share
+        state. Returns the same `ClaimedNotification` shape as
+        `claim_batch` - channel-agnostic, nothing push-specific about it.
+        """
+        now = datetime.now(timezone.utc)
+        lease_cutoff = now - timedelta(seconds=lease_seconds)
+        no_destination_cutoff = now - timedelta(seconds=no_destination_retry_seconds)
+
+        stmt = (
+            select(PendingNotification, DiscoveredListing)
+            .join(DiscoveredListing, PendingNotification.discovered_listing_id == DiscoveredListing.id)
+            .where(
+                (
+                    (PendingNotification.push_status == NOTIFICATION_STATUS_PENDING)
+                    & (
+                        (PendingNotification.push_last_error != NOTIFICATION_ERROR_NO_DEVICE_REGISTERED)
+                        | (PendingNotification.push_last_attempted_at.is_(None))
+                        | (PendingNotification.push_last_attempted_at <= no_destination_cutoff)
+                    )
+                )
+                | (
+                    (PendingNotification.push_status == NOTIFICATION_STATUS_PROCESSING)
+                    & (PendingNotification.push_claimed_at < lease_cutoff)
+                )
+            )
+            .order_by(PendingNotification.created_at.asc())
+            .limit(limit)
+            .with_for_update(of=PendingNotification, skip_locked=True)
+        )
+        rows = self._session.execute(stmt).all()
+
+        claimed: list[ClaimedNotification] = []
+        for notification, listing_row in rows:
+            notification.push_status = NOTIFICATION_STATUS_PROCESSING
+            notification.push_claimed_at = now
+            notification.push_attempt_count += 1
+            claimed.append(
+                ClaimedNotification(
+                    notification_id=notification.id,
+                    listing=_to_listing(listing_row),
+                    user_id=notification.user_id,
+                    discovered_by_saved_search_id=listing_row.discovered_by_saved_search_id,
+                )
+            )
+        self._session.flush()
+        return claimed
+
+    def complete_push(
+        self,
+        *,
+        notification_id: int,
+        success: bool,
+        error: str | None,
+        max_attempts: int,
+    ) -> None:
+        """The push-channel counterpart of `complete` above - identical
+        outcome-recording logic, writing to `push_status`/`push_
+        attempt_count`/`push_last_attempted_at`/`push_last_error`/
+        `push_sent_at` instead of their Telegram-oriented siblings.
+        `NOTIFICATION_ERROR_NO_DEVICE_REGISTERED` plays exactly the role
+        `NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG` plays for
+        Telegram: never counted against `max_attempts`, always sent back
+        to `pending` rather than ever reaching `failed` solely because no
+        device is registered yet.
+        """
+        row = self._session.get(PendingNotification, notification_id)
+        if row is None:
+            return
+
+        now = datetime.now(timezone.utc)
+        row.push_last_attempted_at = now
+        if success:
+            row.push_status = NOTIFICATION_STATUS_SENT
+            row.push_sent_at = now
+            row.push_last_error = None
+        elif error == NOTIFICATION_ERROR_NO_DEVICE_REGISTERED:
+            row.push_attempt_count = max(0, row.push_attempt_count - 1)
+            row.push_last_error = error
+            row.push_status = NOTIFICATION_STATUS_PENDING
+        else:
+            row.push_last_error = error
+            row.push_status = (
+                NOTIFICATION_STATUS_FAILED if row.push_attempt_count >= max_attempts else NOTIFICATION_STATUS_PENDING
+            )
         self._session.flush()
 
     def list_all(self) -> list[PendingNotification]:

@@ -389,12 +389,77 @@ def test_makita_battery_holder_partial_brand_overlap_is_not_enough_for_a_drill_s
 
 def test_unregistered_product_category_falls_back_to_lenient_token_overlap() -> None:
     """Documented design tradeoff: for a query naming a product category
-    with no registered family/accessory entry, ANY shared token is treated
-    as a full match rather than a stricter proportional score. This keeps
-    the filter from silently rejecting legitimate results in categories
-    the vocabulary doesn't know about (this module only curates tool/
-    accessory terms) - see `evaluator.py`'s `_score_core_match`."""
+    with no registered family/accessory entry, sharing enough tokens is
+    treated as a full match rather than a stricter proportional score
+    (Phase 3: "enough" is 2+ distinct tokens for a multi-word query, 1 for
+    a single-word query - see `evaluator.py`'s `_score_core_match`). This
+    keeps the filter from silently rejecting legitimate results in
+    categories the vocabulary doesn't know about (this module only
+    curates tool/accessory terms), while no longer accepting a match on
+    one coincidental shared word alone - see the Phase 3 regression tests
+    below for the false-positive case this closed."""
     result = evaluate_relevance("vintage lamp", _listing("Antique Vintage Table Lamp"))
+    assert result.is_relevant is True
+
+
+# =====================================================================
+# Phase 3 (Relevance Quality) - lenient-fallback token-overlap regression
+#
+# Deliberately uses only product categories/words with no registered
+# brand/family/accessory vocabulary entry (existing or new) - the point
+# is to test the *generic* fallback mechanism itself, not any curated
+# domain. See `evaluator.py:_score_core_match`'s final branch.
+# =====================================================================
+
+
+def test_fallback_rejects_a_multi_word_query_matching_on_only_one_token() -> None:
+    """The real production false positive this phase fixes: a 4-core-token
+    query sharing exactly one coincidental word with a wholly unrelated
+    listing must no longer be accepted."""
+    result = evaluate_relevance("Nintendo Game Boy Advance SP", _listing("SP Repair Tool Kit"))
+    assert result.is_relevant is False
+
+
+def test_fallback_accepts_a_multi_word_query_sharing_two_distinct_tokens() -> None:
+    """A genuine, differently-worded/abbreviated listing that shares two
+    or more of the query's words ("nintendo" and "sp") is still accepted -
+    the fix raises the bar above one token, not above two."""
+    result = evaluate_relevance("Nintendo Game Boy Advance SP", _listing("Nintendo GBA SP Console"))
+    assert result.is_relevant is True
+
+
+def test_fallback_still_accepts_the_existing_two_token_query_two_token_match_case() -> None:
+    """Unchanged behavior for a 2-core-token query whose listing shares
+    both tokens - same case `test_unregistered_product_category_falls_back
+    _to_lenient_token_overlap` above already covers; kept here too as an
+    explicit Phase 3 regression anchor."""
+    result = evaluate_relevance("vintage lamp", _listing("Antique Vintage Table Lamp"))
+    assert result.is_relevant is True
+
+
+def test_fallback_single_core_token_query_still_only_needs_one_shared_token() -> None:
+    """A query with exactly one core token is unaffected by the Phase 3
+    change - there is nothing stricter to require than the one token
+    itself, so a single shared token remains sufficient."""
+    result = evaluate_relevance("lamp", _listing("Antique Table Lamp"))
+    assert result.is_relevant is True
+
+
+def test_fallback_non_english_rejects_a_one_token_match() -> None:
+    """Russian, 2-core-token query ("старый стул" - "old chair") sharing
+    only "стул" (chair) with an unrelated listing must be rejected, same
+    as the English case - the fallback fix applies uniformly regardless
+    of language, since it operates purely on token counts after
+    tokenization (see `text.py`), not on any curated (English-only)
+    vocabulary."""
+    result = evaluate_relevance("старый стул", _listing("Стул новый пластиковый"))
+    assert result.is_relevant is False
+
+
+def test_fallback_non_english_accepts_a_two_token_match() -> None:
+    """Same Russian query, this time sharing both "старый" (old) and
+    "стул" (chair) with a genuine matching listing - accepted."""
+    result = evaluate_relevance("старый стул", _listing("Старый деревянный стул"))
     assert result.is_relevant is True
 
 

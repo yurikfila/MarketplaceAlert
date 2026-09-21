@@ -272,15 +272,27 @@ def _score_core_match(
 
     # No registered family or accessory phrase applies - the query names a
     # product category this vocabulary doesn't know about. Deliberately
-    # lenient: ANY shared token counts as a full strong match rather than a
-    # score scaled by overlap fraction. A stricter/proportional fallback
-    # would silently reject legitimate results for every unregistered
-    # product category (this vocabulary only names tools/accessories
-    # explicitly), which is worse than the brand-conflict/accessory-penalty
-    # checks (applied independently, regardless of this branch) catching
-    # the cases that actually matter.
+    # lenient rather than a score scaled by overlap fraction - a stricter/
+    # proportional fallback would silently reject legitimate results for
+    # every unregistered product category (this vocabulary only names
+    # tools/accessories explicitly), which is worse than the brand-
+    # conflict/accessory-penalty checks (applied independently, regardless
+    # of this branch) catching the cases that actually matter.
+    #
+    # Phase 3 (Relevance Quality): a *single* shared token is only
+    # sufficient when the query itself has just one core token to offer -
+    # for a query with 2+ core tokens, at least 2 distinct ones must be
+    # shared. Closes a real false-positive class found in production
+    # (e.g. "Nintendo Game Boy Advance SP" matching a wholly unrelated
+    # "SP Repair Tool Kit" on the single token "sp") while still accepting
+    # genuine, differently-worded or abbreviated listings that share two
+    # or more of the query's words (e.g. "Nintendo GBA SP Console" sharing
+    # "nintendo"+"sp") - see tests/test_relevance.py's fallback regression
+    # tests. Single-core-token queries are unaffected: there is nothing
+    # stricter to require than the one token itself.
     overlap = [token for token in parsed_query.core_tokens if token in listing_tokens]
-    if overlap:
+    required_overlap = 1 if len(parsed_query.core_tokens) == 1 else 2
+    if len(set(overlap)) >= required_overlap:
         return STRONG_CORE_MATCH_SCORE, True, overlap, False
     return 0, False, [], False
 

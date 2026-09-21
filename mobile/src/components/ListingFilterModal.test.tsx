@@ -3,6 +3,27 @@ import { fireEvent, render } from '@testing-library/react-native';
 
 import { activeFilterCount, emptyListingFilters, ListingFilterModal, type ListingFilterValues } from './ListingFilterModal';
 
+/** A node from `render(...).toJSON()`'s tree - either a rendered host
+ * element or a plain text/number leaf. */
+type JsonNode = { type: string; props: Record<string, unknown>; children: JsonNode[] | null } | string | number;
+
+/** Depth-first search over a `toJSON()` tree for every host node whose
+ * type matches `type`. `react-native-safe-area-context` renders
+ * `SafeAreaProvider`/`SafeAreaView` down to real host components named
+ * exactly `"RNCSafeAreaProvider"`/`"RNCSafeAreaView"` (confirmed by
+ * inspecting real rendered output, not assumed) - these are the only
+ * public, stable signal this project's testing-library version exposes
+ * for "is this instance actually a SafeAreaProvider/SafeAreaView", since
+ * `UNSAFE_getByType`-style component-reference queries aren't available
+ * here (checked directly against this project's installed
+ * @testing-library/react-native and test-renderer type definitions). */
+function findAllByHostType(node: JsonNode | null, type: string): Array<{ type: string; props: Record<string, unknown> }> {
+  if (node === null || typeof node === 'string' || typeof node === 'number') return [];
+  const matches = node.type === type ? [{ type: node.type, props: node.props }] : [];
+  const childMatches = (node.children ?? []).flatMap((child) => findAllByHostType(child, type));
+  return [...matches, ...childMatches];
+}
+
 const MARKETPLACES = [
   { id: 'ebay', name: 'eBay' },
   { id: 'etsy', name: 'Etsy' },
@@ -64,6 +85,31 @@ describe('ListingFilterModal', () => {
   it('hides the saved-search section entirely when there are no saved searches', async () => {
     const { queryByText } = await renderModal({ availableSavedSearches: [] });
     expect(queryByText('Any saved search')).toBeNull();
+  });
+
+  describe('safe-area structure (Android status bar / navigation bar overlap fix)', () => {
+    /** Structural assertions, not visible-text ones - appropriate here
+     * since the structure itself (a nested `SafeAreaProvider` so insets
+     * are measured for the Modal's own Android window, and
+     * `SafeAreaView` on the correct edges) is exactly what was broken
+     * and exactly what this fix changes. See `ListingFilterModal.tsx`'s
+     * own comment above its `SafeAreaProvider` for the full reasoning. */
+
+    it('wraps its content in its own SafeAreaProvider, not just relying on one from an ancestor', async () => {
+      const { toJSON } = await renderModal();
+      expect(findAllByHostType(toJSON(), 'RNCSafeAreaProvider')).toHaveLength(1);
+    });
+
+    it('applies a top-edge SafeAreaView (header) and a bottom-edge SafeAreaView (footer)', async () => {
+      const { toJSON } = await renderModal();
+      const safeAreaViews = findAllByHostType(toJSON(), 'RNCSafeAreaView');
+      const edgesUsed = safeAreaViews.map((el) => el.props.edges);
+      // The library normalizes `edges={['top']}`/`['bottom']` into a
+      // per-side "off"/"additive" map on the actual rendered host node -
+      // confirmed by inspecting real rendered output, not assumed.
+      expect(edgesUsed).toContainEqual({ top: 'additive', right: 'off', bottom: 'off', left: 'off' });
+      expect(edgesUsed).toContainEqual({ top: 'off', right: 'off', bottom: 'additive', left: 'off' });
+    });
   });
 
   it('toggling a marketplace chip adds it to the draft', async () => {

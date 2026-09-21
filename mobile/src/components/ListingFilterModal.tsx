@@ -1,5 +1,11 @@
-import type { ReactNode } from 'react';
+import { useContext, type ReactNode } from 'react';
 import { Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import {
+  SafeAreaFrameContext,
+  SafeAreaInsetsContext,
+  SafeAreaProvider,
+  SafeAreaView,
+} from 'react-native-safe-area-context';
 
 import type { ListingSort } from '../api/types';
 import { colors, fontSize, radius, spacing } from '../theme/colors';
@@ -82,17 +88,47 @@ export function ListingFilterModal({
     });
   };
 
+  // React Native's `Modal` presents in its own separate native window on
+  // Android - the app's root `SafeAreaProvider` (App.tsx) measures insets
+  // for the *main* window only, and that stale value is what any
+  // `SafeAreaView` in here would otherwise read via inherited React
+  // context, never this window's own insets. `react-native-safe-area-
+  // context`'s own docs address exactly this: "You may need to add it in
+  // other places like the root of modals and routes." Re-mounting the
+  // provider below, inside the Modal, makes it measure and provide
+  // *this* window's real insets on Android.
+  //
+  // `initialMetrics` (seeded from whatever the outer provider already
+  // knows, read directly off context rather than the throwing
+  // `useSafeAreaInsets()`/`useSafeAreaFrame()` hooks, so this still works
+  // the one render before any ancestor provider exists) is required, not
+  // optional: `SafeAreaProvider` renders none of its children at all
+  // until its own `insets` state is non-null (see its source), and
+  // without a seed that only ever happens after a real native
+  // `onInsetsChange` event - which fires quickly in a real app, but never
+  // in a Jest test renderer, and could still cause a real, if brief,
+  // blank-modal flash on an actual device. Falling back to all-zero
+  // insets/a zero frame when no parent context exists guarantees this
+  // never blocks rendering, in tests or in the app.
+  const parentInsets = useContext(SafeAreaInsetsContext);
+  const parentFrame = useContext(SafeAreaFrameContext);
+  const initialMetrics = {
+    insets: parentInsets ?? { top: 0, right: 0, bottom: 0, left: 0 },
+    frame: parentFrame ?? { x: 0, y: 0, width: 0, height: 0 },
+  };
+
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
-      <View style={styles.container} testID="listing-filter-modal">
-        <View style={styles.header}>
-          <Text style={styles.headerTitle}>Filters &amp; sort</Text>
-          <Pressable onPress={onClose} accessibilityRole="button" accessibilityLabel="Close filters" hitSlop={12}>
-            <Text style={styles.closeLabel}>Done</Text>
-          </Pressable>
-        </View>
+      <SafeAreaProvider initialMetrics={initialMetrics}>
+        <View style={styles.container} testID="listing-filter-modal">
+          <SafeAreaView edges={['top']} style={styles.header}>
+            <Text style={styles.headerTitle}>Filters &amp; sort</Text>
+            <Pressable onPress={onClose} accessibilityRole="button" accessibilityLabel="Close filters" hitSlop={12}>
+              <Text style={styles.closeLabel}>Done</Text>
+            </Pressable>
+          </SafeAreaView>
 
-        <ScrollView contentContainerStyle={styles.content}>
+          <ScrollView contentContainerStyle={styles.content}>
           <Section title="Sort">
             <View style={styles.chipRow}>
               {SORT_OPTIONS.map((option) => (
@@ -184,11 +220,19 @@ export function ListingFilterModal({
           </Section>
         </ScrollView>
 
-        <View style={styles.footer}>
-          <PrimaryButton label="Clear all" onPress={onClear} variant="secondary" />
-          <PrimaryButton label="Apply filters" onPress={onApply} />
+          {/* `edges={['bottom']}` only - adds the device's real bottom
+              inset as extra padding on top of `styles.footer`'s own
+              `padding` (never replaces it) - see the `SafeAreaProvider`
+              comment above for why this now measures correctly. This row
+              was already outside the `ScrollView` above (a sibling, not
+              a child), so it was already fixed/"sticky" - nothing about
+              that structure needed to change. */}
+          <SafeAreaView edges={['bottom']} style={styles.footer}>
+            <PrimaryButton label="Clear all" onPress={onClear} variant="secondary" />
+            <PrimaryButton label="Apply filters" onPress={onApply} />
+          </SafeAreaView>
         </View>
-      </View>
+      </SafeAreaProvider>
     </Modal>
   );
 }

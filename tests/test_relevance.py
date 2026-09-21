@@ -464,6 +464,87 @@ def test_fallback_non_english_accepts_a_two_token_match() -> None:
 
 
 # =====================================================================
+# Phase 4 (Product relevance / accessory rejection) - C.1 (title-scoped
+# core-product matching) and C.2 (a compound family+accessory query's own
+# explicit accessory intent must not be discarded when the family half
+# doesn't match). See `evaluator.py`'s own module docstring and
+# `_score_core_match`/`_match_query_accessory_phrase` for the mechanism.
+#
+# Deliberately does NOT add "dust extractor"/"bit"/"chuck" (or any other
+# term) to accessories.py - "Bosch Drill Bit Set" and "Bosch Drill
+# Replacement Chuck" are a known, intentionally-untouched Phase 4 residual
+# gap (unregistered accessory/part vocabulary), not something this phase
+# claims to fix.
+# =====================================================================
+
+
+def test_bosch_drill_accepts_cordless_drill_driver_title() -> None:
+    result = evaluate_relevance("Bosch drill", _listing("Bosch 18V Cordless Drill Driver"))
+    assert result.is_relevant is True
+
+
+def test_bosch_drill_accepts_hammer_drill_title() -> None:
+    result = evaluate_relevance("Bosch drill", _listing("Bosch Hammer Drill"))
+    assert result.is_relevant is True
+
+
+def test_bosch_drill_rejects_dust_extractor_whose_description_only_mentions_drill() -> None:
+    """The real production false positive this phase fixes: the title
+    ("Hammer Drilling Dust Extractor") never actually names a drill -
+    "drilling" and "drill" are different tokens - only the *description*
+    mentions "drill". C.1: core-product evidence is title-only now, so a
+    description-only mention is no longer sufficient."""
+    result = evaluate_relevance(
+        "Bosch drill",
+        _listing(
+            "Bosch HDC200 Hammer Drilling Dust Extractor",
+            description="Compatible with Bosch drills and other major brands.",
+        ),
+    )
+    assert result.is_relevant is False
+    assert result.rejected_reason == "no_core_product_match"
+
+
+def test_bosch_drill_battery_accepts_a_plain_battery_listing() -> None:
+    """C.2: "Bosch drill" resolves to the registered "drill" family, and
+    "battery" is separately a recognized accessory phrase - a plain
+    battery listing (no "drill" anywhere in its title) must still match,
+    because the query itself explicitly asked for a battery."""
+    result = evaluate_relevance("Bosch drill battery", _listing("Bosch 18V Battery"))
+    assert result.is_relevant is True
+
+
+def test_bosch_drill_alone_still_rejects_a_plain_battery_listing() -> None:
+    """The other half of C.2's guarantee: without "battery" in the query
+    itself, "Bosch drill" must NOT start matching batteries - there is
+    nothing to fall back to. (`accessory_without_core_product_match`, not
+    `no_core_product_match`: the pre-existing, unchanged `rejected_reason`
+    precedence in `evaluate_relevance` checks the accessory penalty first -
+    "battery" is still a recognized accessory term in this title, so that
+    penalty independently applies too; the important, asserted fact is
+    `is_relevant is False` either way.)"""
+    result = evaluate_relevance("Bosch drill", _listing("Bosch 18V Battery"))
+    assert result.is_relevant is False
+    assert result.rejected_reason == "accessory_without_core_product_match"
+
+
+def test_fender_stratocaster_rejects_unrelated_gear_whose_description_only_mentions_stratocaster() -> None:
+    """C.1 generalizes beyond registered families to the lenient-fallback
+    path too (no "guitar"/"stratocaster" family is registered - see
+    families.py). Title names an amp cable, not a guitar; only the
+    description happens to mention "Stratocaster" in passing."""
+    result = evaluate_relevance(
+        "Fender Stratocaster",
+        _listing(
+            "Fender Amplifier Cable 10ft",
+            description="Great replacement cable for your Stratocaster amp setup.",
+        ),
+    )
+    assert result.is_relevant is False
+    assert result.rejected_reason == "no_core_product_match"
+
+
+# =====================================================================
 # Product-hardening audit regressions - real false positives/negatives
 # found by testing the exact queries named in that task: Makita/Bosch/
 # Milwaukee drill, Fender Stratocaster, Gibson Les Paul, DeWalt impact

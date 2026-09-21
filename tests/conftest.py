@@ -42,7 +42,7 @@ from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.notifications.base import NotificationProvider
 from marketplace_alert.core.notifications.service import NotificationService
 from marketplace_alert.core.persistence.database import Base, create_db_engine, get_db_session
-from marketplace_alert.dependencies import get_expo_push_provider, get_password_reset_email_sender
+from marketplace_alert.dependencies import get_password_reset_email_sender
 from marketplace_alert.main import app, get_notification_service
 from marketplace_alert.main import _saved_search_run_guard as saved_search_run_guard
 from marketplace_alert.notifications.email.provider import PasswordResetEmailError
@@ -168,21 +168,10 @@ def fake_password_reset_email_sender() -> FakePasswordResetEmailSender:
 
 
 @pytest.fixture()
-def fake_expo_push_provider() -> FakeNotificationProvider:
-    """The fake provider `POST /api/v1/devices/test-push` is wired to by
-    the `client` fixture below - a separate instance from
-    `fake_notification_provider` (Telegram's), same reasoning as
-    `fake_password_reset_email_sender` having its own instance. Inspect
-    `.sent_listings`; never a real Expo push from automated tests."""
-    return FakeNotificationProvider()
-
-
-@pytest.fixture()
 def client(
     db_engine: Engine,
     fake_notification_provider: FakeNotificationProvider,
     fake_password_reset_email_sender: FakePasswordResetEmailSender,
-    fake_expo_push_provider: FakeNotificationProvider,
 ) -> Iterator[TestClient]:
     """A TestClient whose /scan endpoint is wired to the isolated test engine
     and fake notification/password-reset-email providers - never the real
@@ -205,7 +194,6 @@ def client(
         fake_notification_provider
     )
     app.dependency_overrides[get_password_reset_email_sender] = lambda: fake_password_reset_email_sender
-    app.dependency_overrides[get_expo_push_provider] = lambda: fake_expo_push_provider
     # The manual /saved-searches/{id}/run overlap guard is a module-level
     # singleton (main.py), not request-scoped - reset it so a test that
     # exercises the "already running" 409 case can't leak state into a

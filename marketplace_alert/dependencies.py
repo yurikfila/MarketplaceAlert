@@ -17,7 +17,6 @@ from sqlalchemy.orm import Session
 from marketplace_alert.config import settings
 from marketplace_alert.connectors.registry import get_connector, is_marketplace_supported
 from marketplace_alert.core.auth.service import AuthService
-from marketplace_alert.core.notifications.base import NotificationProvider
 from marketplace_alert.core.notifications.service import NotificationService
 from marketplace_alert.core.persistence.database import get_db_session
 from marketplace_alert.core.saved_searches.runner import SavedSearchRunner
@@ -100,19 +99,6 @@ def get_password_reset_email_sender() -> PasswordResetEmailSender:
     tests/conftest.py.
     """
     return password_reset_email_sender
-
-
-def get_expo_push_provider() -> NotificationProvider:
-    """FastAPI dependency, overridden in tests with a fake provider - same
-    convention as `get_password_reset_email_sender` above. Added for
-    `POST /api/v1/devices/test-push` (`api/v1/devices.py:send_test_push`) -
-    the module-level `expo_push_provider` singleton itself still isn't
-    used by any other route; `scripts/drain_notification_outbox.py`
-    continues to import and use it directly, unaffected by this.
-
-    Never send a real Expo push from automated tests - see tests/conftest.py.
-    """
-    return expo_push_provider
 
 
 def get_saved_search_service(session: Session = Depends(get_db_session)) -> SavedSearchService:

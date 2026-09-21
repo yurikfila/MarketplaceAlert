@@ -122,6 +122,13 @@ class ExpoPushProvider(NotificationProvider):
         or falls back (see `NotificationProvider.send_listing_alert`'s
         own docstring); a caller with nothing to pass here must not call
         this method at all.
+
+        **Returns normally (does not raise) if a 2xx response's ticket
+        can't be interpreted due to an unexpected error** - by that point
+        Expo has already accepted the message, so this is treated as
+        "sent," never as a reason to retry (which could duplicate an
+        already-accepted, possibly already-delivered push). See the
+        try/except around `_ticket_error` below for the full reasoning.
         """
         if not self.is_enabled:
             raise NotificationError("Expo push provider is not enabled")
@@ -185,7 +192,32 @@ class ExpoPushProvider(NotificationProvider):
                 )
                 raise NotificationError(f"Expo push API returned HTTP {response.status_code}")
 
-            ticket_error = self._ticket_error(response)
+            try:
+                ticket_error = self._ticket_error(response)
+            except Exception as exc:  # noqa: BLE001 - see comment below; deliberately broader than _ticket_error's own handling
+                # Expo has already returned a 2xx by this point - per this
+                # module's own docstring, that means the message was
+                # accepted, independent of whether *this* code can fully
+                # interpret the ticket body afterward. An unexpected
+                # failure here (a bug in `_ticket_error`, an Expo response
+                # shape this code doesn't yet know about, anything) must
+                # never be treated as "the send failed, please retry" -
+                # retrying now could duplicate a push Expo may have
+                # already delivered, and there is no idempotency key to
+                # de-duplicate it on Expo's side. This is the general-case
+                # guard for the exact failure mode that once caused a real
+                # production incident via one specific bug in
+                # `_ticket_error` (see that method's own docstring) - this
+                # closes the class of bug, not just that one instance.
+                # Never logs the exception message/payload - only the
+                # exception's type name, which can't carry a token/secret.
+                logger.error(
+                    "Expo push ticket could not be interpreted after a 2xx response (%s) - "
+                    "treating as accepted, not retrying",
+                    type(exc).__name__,
+                )
+                return
+
             if ticket_error is None:
                 logger.info("Expo push sent (attempt %d/%d)", attempt, total_attempts)
                 return

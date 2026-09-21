@@ -212,6 +212,54 @@ def test_send_raises_on_a_2xx_response_with_an_error_ticket_never_retrying(
     assert sleep_calls == []
 
 
+def _raise_unexpectedly(self: ExpoPushProvider, response: httpx.Response) -> str | None:
+    """Stands in for `ExpoPushProvider._ticket_error` to simulate an
+    unforeseen bug/edge case in ticket interpretation - deliberately not
+    tied to any one specific malformed-response shape, since the
+    guarantee under test is general: *whatever* goes wrong interpreting
+    an already-2xx response must never cause a retry."""
+    raise RuntimeError("unexpected parsing failure - simulated for this test only")
+
+
+def test_send_returns_normally_when_ticket_interpretation_raises_unexpectedly_after_a_2xx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """By the time `_ticket_error` runs, Expo has already returned a
+    genuine 2xx - it already accepted the message. An unexpected failure
+    interpreting the ticket body must be treated as accepted, not as a
+    reason to retry (which could duplicate an already-delivered push) -
+    see `send_listing_alert`'s own docstring and the try/except around
+    `_ticket_error` inside it."""
+    calls = {"count": 0}
+
+    def fake_post(url, json, headers, timeout):
+        calls["count"] += 1
+        return _ok_response_single_object()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(ExpoPushProvider, "_ticket_error", _raise_unexpectedly)
+
+    _provider(max_retries=3).send_listing_alert(_listing(), "ExponentPushToken[abc]")  # must not raise
+
+    assert calls["count"] == 1  # never retried - exactly one send attempt
+
+
+def test_send_logs_nothing_sensitive_when_ticket_interpretation_raises_unexpectedly(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _ok_response_single_object())
+    monkeypatch.setattr(ExpoPushProvider, "_ticket_error", _raise_unexpectedly)
+
+    with caplog.at_level("DEBUG"):
+        _provider(access_token="super-secret-access-token", max_retries=0).send_listing_alert(
+            _listing(), "ExponentPushToken[do-not-log-me]"
+        )
+
+    assert "super-secret-access-token" not in caplog.text
+    assert "ExponentPushToken[do-not-log-me]" not in caplog.text
+    assert "unexpected parsing failure - simulated for this test only" not in caplog.text
+
+
 def test_send_never_includes_the_free_text_ticket_message_in_the_exception(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         httpx,

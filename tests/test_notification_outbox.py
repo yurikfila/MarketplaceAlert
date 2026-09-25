@@ -41,6 +41,7 @@ from marketplace_alert.core.models.listing import Listing
 from marketplace_alert.core.notifications.base import NotificationError, NotificationProvider
 from marketplace_alert.core.notifications.device_repository import DeviceTokenRepository
 from marketplace_alert.core.notifications.outbox import (
+    DEFAULT_NOTIFICATION_CHANNEL_ID,
     DrainResult,
     PushDrainResult,
     claim_due_notifications,
@@ -48,6 +49,7 @@ from marketplace_alert.core.notifications.outbox import (
     drain_pending_notifications,
     drain_pending_push_notifications,
     resolve_destination,
+    resolve_push_destinations,
 )
 from marketplace_alert.core.notifications.preferences_repository import NotificationPreferenceRepository
 from marketplace_alert.core.persistence.models import (
@@ -182,10 +184,21 @@ def _drain(session_factory, provider, *, max_attempts: int = 5, no_destination_r
     )
 
 
-def _register_device_token(session_factory, user_id: int, expo_push_token: str = "ExponentPushToken[test]") -> None:
+def _register_device_token(
+    session_factory,
+    user_id: int,
+    expo_push_token: str = "ExponentPushToken[test]",
+    *,
+    notification_channel_id: str | None = None,
+) -> None:
     session = session_factory()
     try:
-        DeviceTokenRepository(session).upsert(user_id=user_id, expo_push_token=expo_push_token, platform="android")
+        DeviceTokenRepository(session).upsert(
+            user_id=user_id,
+            expo_push_token=expo_push_token,
+            platform="android",
+            notification_channel_id=notification_channel_id,
+        )
         session.commit()
     finally:
         session.close()
@@ -205,19 +218,24 @@ def _drain_push(
 
 
 class RecordingProvider(NotificationProvider):
-    """Always succeeds; records every (listing, destination) pair it was asked to send, in order."""
+    """Always succeeds; records every (listing, destination, channel_id)
+    triple it was asked to send, in order. `channel_id` is `None` for
+    every Telegram call (that path never passes it) and a real channel id
+    string for every push call - see `resolve_push_destinations`."""
 
     def __init__(self) -> None:
         self.sent: list[Listing] = []
         self.destinations: list[str] = []
+        self.channel_ids: list[str | None] = []
 
     @property
     def is_enabled(self) -> bool:
         return True
 
-    def send_listing_alert(self, listing: Listing, destination: str) -> None:
+    def send_listing_alert(self, listing: Listing, destination: str, *, channel_id: str | None = None) -> None:
         self.sent.append(listing)
         self.destinations.append(destination)
+        self.channel_ids.append(channel_id)
 
 
 class AlwaysFailingProvider(NotificationProvider):
@@ -225,7 +243,7 @@ class AlwaysFailingProvider(NotificationProvider):
     def is_enabled(self) -> bool:
         return True
 
-    def send_listing_alert(self, listing: Listing, destination: str) -> None:
+    def send_listing_alert(self, listing: Listing, destination: str, *, channel_id: str | None = None) -> None:
         raise NotificationError("simulated permanent failure")
 
 
@@ -238,7 +256,7 @@ class NeverCalledProvider(NotificationProvider):
     def is_enabled(self) -> bool:
         return True
 
-    def send_listing_alert(self, listing: Listing, destination: str) -> None:
+    def send_listing_alert(self, listing: Listing, destination: str, *, channel_id: str | None = None) -> None:
         raise AssertionError("must never be called when there is no resolvable destination")
 
 
@@ -1503,7 +1521,7 @@ def test_push_disabled_provider_claims_nothing_same_convention_as_telegram(sessi
         def is_enabled(self) -> bool:
             return False
 
-        def send_listing_alert(self, listing: Listing, destination: str) -> None:
+        def send_listing_alert(self, listing: Listing, destination: str, *, channel_id: str | None = None) -> None:
             raise AssertionError("must never be called while disabled")
 
     user_id = _create_user(session_factory, "disabled-push@example.com")
@@ -1528,7 +1546,7 @@ def test_push_fans_out_to_every_registered_device_and_succeeds_if_any_one_does(s
         def is_enabled(self) -> bool:
             return True
 
-        def send_listing_alert(self, listing: Listing, destination: str) -> None:
+        def send_listing_alert(self, listing: Listing, destination: str, *, channel_id: str | None = None) -> None:
             if destination == "ExponentPushToken[device-1]":
                 raise NotificationError("simulated failure for this one device")
 
@@ -1626,3 +1644,61 @@ def test_claim_push_batch_prioritizes_never_attempted_rows_over_a_large_no_devic
         session_factory, limit=10, lease_seconds=120, no_destination_retry_seconds=0.05
     )
     assert {c.notification_id for c in everything} == set(unclaimed_backlog_ids)
+
+
+# =====================================================================
+# Notification sound selection (Phase 1: backend + database)
+# =====================================================================
+
+
+def test_resolve_push_destinations_coalesces_a_null_preference_to_the_default_channel(session_factory) -> None:
+    """A device that has never had a sound explicitly chosen
+    (`notification_channel_id IS NULL`) must still resolve to a real,
+    explicit channel id - never `None` left for the caller to guess at."""
+    user_id = _create_user(session_factory, "resolve-null-pref@example.com")
+    _register_device_token(session_factory, user_id, "ExponentPushToken[resolve-null]")
+
+    resolved = resolve_push_destinations(session_factory, user_id=user_id, discovered_by_saved_search_id=None)
+
+    assert len(resolved.destinations) == 1
+    assert resolved.destinations[0].token == "ExponentPushToken[resolve-null]"
+    assert resolved.destinations[0].channel_id == DEFAULT_NOTIFICATION_CHANNEL_ID
+
+
+def test_resolve_push_destinations_preserves_an_explicit_channel_preference(session_factory) -> None:
+    user_id = _create_user(session_factory, "resolve-explicit-pref@example.com")
+    _register_device_token(
+        session_factory,
+        user_id,
+        "ExponentPushToken[resolve-explicit]",
+        notification_channel_id="listing-alerts-radar-v1",
+    )
+
+    resolved = resolve_push_destinations(session_factory, user_id=user_id, discovered_by_saved_search_id=None)
+
+    assert len(resolved.destinations) == 1
+    assert resolved.destinations[0].channel_id == "listing-alerts-radar-v1"
+
+
+def test_push_multi_device_user_gets_the_correct_channel_id_per_device(session_factory) -> None:
+    """Phone A = Radar, Phone B = Premium Chime - both devices must
+    receive the same listing alert, each routed through its own correct
+    Android channel, never a single shared or guessed value."""
+    user_id = _create_user(session_factory, "multi-sound@example.com")
+    saved_search_id = _create_owned_saved_search(session_factory, user_id)
+    _register_device_token(
+        session_factory, user_id, "ExponentPushToken[phone-a]", notification_channel_id="listing-alerts-radar-v1"
+    )
+    _register_device_token(
+        session_factory, user_id, "ExponentPushToken[phone-b]", notification_channel_id="listing-alerts-premium-v1"
+    )
+    _persist_and_enqueue(session_factory, "multi-sound-1", saved_search_id=saved_search_id, user_id=user_id)
+
+    provider = RecordingProvider()
+    result = _drain_push(session_factory, provider)
+
+    assert result.sent_count == 1
+    assert len(provider.destinations) == 2
+    channel_id_by_token = dict(zip(provider.destinations, provider.channel_ids))
+    assert channel_id_by_token["ExponentPushToken[phone-a]"] == "listing-alerts-radar-v1"
+    assert channel_id_by_token["ExponentPushToken[phone-b]"] == "listing-alerts-premium-v1"

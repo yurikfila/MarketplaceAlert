@@ -1679,10 +1679,15 @@ def test_running_a_migration_does_not_disable_other_application_loggers(
 
 
 def test_upgrade_head_reaches_the_device_tokens_revision(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No longer literally `head` - superseded by `a2c6e9f4b1d7` below, see
+    `test_upgrade_head_reaches_the_notification_channel_id_revision` -
+    kept as its own, explicitly-targeted-revision test rather than
+    deleted outright, same precedent as `7b3f0a1d9c44`'s own superseded
+    head test above."""
     db_path = tmp_path / "alembic_device_tokens_head_test.db"
     cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
 
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "3f9c1a5b7d2e")
 
     engine = create_db_engine(f"sqlite:///{db_path}")
     try:
@@ -1841,3 +1846,111 @@ def test_device_tokens_and_push_columns_round_trip_through_downgrade_and_re_upgr
         engine.dispose()
     assert "device_tokens" in table_names
     assert "push_status" in pending_columns
+
+
+# =====================================================================
+# `a2c6e9f4b1d7` - add `device_tokens.notification_channel_id`
+# =====================================================================
+
+
+def test_upgrade_head_reaches_the_notification_channel_id_revision(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "alembic_notification_channel_id_head_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert version == "a2c6e9f4b1d7"
+
+
+def test_upgrade_head_adds_notification_channel_id_column_nullable(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "alembic_notification_channel_id_column_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        columns = {col["name"]: col for col in inspect(engine).get_columns("device_tokens")}
+    finally:
+        engine.dispose()
+
+    assert "notification_channel_id" in columns
+    assert columns["notification_channel_id"]["nullable"] is True
+
+
+def test_existing_device_token_rows_stay_null_after_upgrading_to_notification_channel_id(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The migration must never backfill a value for a pre-existing row -
+    `NULL` ("never explicitly chosen") is the correct, safe state for
+    every device registered before this column existed."""
+    db_path = tmp_path / "alembic_notification_channel_id_no_backfill_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "3f9c1a5b7d2e")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    with engine.connect() as conn:
+        user_id = _insert_user(conn, "pre-existing-device@example.com")
+        conn.execute(
+            sa.text(
+                "INSERT INTO device_tokens (user_id, expo_push_token, created_at, last_seen_at) "
+                "VALUES (:user_id, 'ExponentPushToken[pre-existing]', '2026-01-01T00:00:00+00:00', "
+                "'2026-01-01T00:00:00+00:00')"
+            ),
+            {"user_id": user_id},
+        )
+        conn.commit()
+        device_token_id = conn.execute(
+            sa.text("SELECT id FROM device_tokens WHERE expo_push_token = 'ExponentPushToken[pre-existing]'")
+        ).scalar_one()
+    engine.dispose()
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            channel_id = conn.execute(
+                sa.text("SELECT notification_channel_id FROM device_tokens WHERE id = :id"),
+                {"id": device_token_id},
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert channel_id is None
+
+
+def test_notification_channel_id_round_trips_through_downgrade_and_re_upgrade(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "alembic_notification_channel_id_round_trip_test.db"
+    cfg = _alembic_config_for(f"sqlite:///{db_path}", monkeypatch)
+
+    command.upgrade(cfg, "head")
+    command.downgrade(cfg, "3f9c1a5b7d2e")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        columns = {col["name"] for col in inspect(engine).get_columns("device_tokens")}
+    finally:
+        engine.dispose()
+    assert "notification_channel_id" not in columns
+
+    command.upgrade(cfg, "head")
+
+    engine = create_db_engine(f"sqlite:///{db_path}")
+    try:
+        columns = {col["name"] for col in inspect(engine).get_columns("device_tokens")}
+    finally:
+        engine.dispose()
+    assert "notification_channel_id" in columns

@@ -11,6 +11,7 @@ import { AdminUsersScreen } from '../screens/AdminUsersScreen';
 import { CreateSearchScreen } from '../screens/CreateSearchScreen';
 import { HomeScreen } from '../screens/HomeScreen';
 import { ListingsScreen } from '../screens/ListingsScreen';
+import { NotificationSoundScreen } from '../screens/NotificationSoundScreen';
 import { RestorationErrorScreen } from '../screens/RestorationErrorScreen';
 import { SavedSearchDetailScreen } from '../screens/SavedSearchDetailScreen';
 import { SavedSearchesScreen } from '../screens/SavedSearchesScreen';
@@ -57,6 +58,11 @@ function AuthenticatedNavigator() {
       <Stack.Screen name="CreateSearch" component={CreateSearchScreen} options={{ title: 'Create Search' }} />
       <Stack.Screen name="SavedSearchDetail" component={SavedSearchDetailScreen} options={{ title: 'Saved Search' }} />
       <Stack.Screen name="AdminUsers" component={AdminUsersScreen} options={{ title: 'User Management' }} />
+      <Stack.Screen
+        name="NotificationSound"
+        component={NotificationSoundScreen}
+        options={{ title: 'Notification Sound' }}
+      />
     </Stack.Navigator>
   );
 }

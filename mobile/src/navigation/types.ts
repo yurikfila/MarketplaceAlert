@@ -22,6 +22,8 @@ export type RootStackParamList = {
   SavedSearchDetail: { id: number };
   /** Reached only from AccountScreen's Admin entry point, itself only shown when `useAuth().user?.is_admin` is true - see AccountScreen.tsx. The route is always registered (same as every other screen here); it's the entry point that's gated, not the route's existence. */
   AdminUsers: undefined;
+  /** Reached from AccountScreen's "Notification Sound" entry point - see NotificationSoundScreen.tsx. */
+  NotificationSound: undefined;
 };
 
 // Lets useNavigation()/navigation.navigate() infer route names/params

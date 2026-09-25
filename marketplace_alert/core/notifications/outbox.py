@@ -440,12 +440,37 @@ def drain_pending_notifications(
 #
 # A user can have more than one registered device (`DeviceToken` is one
 # row per token, not per user - see that model's docstring), so
-# `ResolvedPushDestinations.tokens` is a list, not a single value, and
-# `_deliver_push` fans out to every one of them: the row is considered
+# `ResolvedPushDestinations.destinations` is a list, not a single value,
+# and `_deliver_push` fans out to every one of them: the row is considered
 # delivered (`push_status=sent`) if *at least one* device received it,
 # not only if all of them did - one device with a stale/uninstalled
 # token must never prevent delivery to the user's other, working device.
+# Each device's own `notification_channel_id` travels with its token
+# (Phase 1 of notification sound selection - see `DeviceToken`'s own
+# docstring), so two of one user's devices with different sound
+# preferences each get their own correct Android channel routed
+# independently, never a single shared value guessed for both.
 # =========================================================================
+
+# The channel id a device with no explicit sound preference resolves to -
+# matches `NULL`'s meaning on `DeviceToken.notification_channel_id`
+# exactly (see that column's own docstring): "never explicitly chosen",
+# not a fourth, different state. Coalesced here, at resolution time, so
+# every Android push this code path sends always carries a real, explicit
+# `channelId` - never left to an undocumented OS/FCM fallback.
+DEFAULT_NOTIFICATION_CHANNEL_ID = "listing-alerts-default-v1"
+
+
+@dataclass(frozen=True)
+class PushDestination:
+    """One device to deliver to: its Expo push token, paired with the
+    Android notification channel id to route this specific send through.
+    `channel_id` is never `None` here - see `resolve_push_destinations`,
+    which always coalesces a device's `NULL` preference to
+    `DEFAULT_NOTIFICATION_CHANNEL_ID` before constructing this."""
+
+    token: str
+    channel_id: str
 
 
 @dataclass
@@ -453,16 +478,16 @@ class ResolvedPushDestinations:
     """Outcome of resolving one claimed notification's push destinations -
     the push-channel counterpart of `ResolvedDestination` above.
 
-    `tokens` is every currently-registered Expo push token for the
-    resolved owner - empty, one, or more than one. Empty with
-    `unresolved_reason` set to `NOTIFICATION_ERROR_NO_DEVICE_REGISTERED`
-    means the owner is known but has no registered device yet (Case A's
-    push counterpart); `NOTIFICATION_ERROR_OWNER_UNRESOLVED` means
-    ownership itself could not be established (Case B, identical to the
-    Telegram path).
+    `destinations` is every currently-registered device (token + resolved
+    channel id) for the resolved owner - empty, one, or more than one.
+    Empty with `unresolved_reason` set to
+    `NOTIFICATION_ERROR_NO_DEVICE_REGISTERED` means the owner is known but
+    has no registered device yet (Case A's push counterpart);
+    `NOTIFICATION_ERROR_OWNER_UNRESOLVED` means ownership itself could not
+    be established (Case B, identical to the Telegram path).
     """
 
-    tokens: list[str]
+    destinations: list[PushDestination]
     unresolved_reason: str | None = None
 
 
@@ -536,15 +561,19 @@ def resolve_push_destinations(
             if resolved_user_id is None:
                 return ResolvedPushDestinations([], NOTIFICATION_ERROR_OWNER_UNRESOLVED)
 
-        tokens = list(
-            session.execute(
-                select(DeviceToken.expo_push_token).where(DeviceToken.user_id == resolved_user_id)
-            ).scalars()
-        )
-        if not tokens:
+        rows = session.execute(
+            select(DeviceToken.expo_push_token, DeviceToken.notification_channel_id).where(
+                DeviceToken.user_id == resolved_user_id
+            )
+        ).all()
+        if not rows:
             return ResolvedPushDestinations([], NOTIFICATION_ERROR_NO_DEVICE_REGISTERED)
 
-        return ResolvedPushDestinations(tokens)
+        destinations = [
+            PushDestination(token=token, channel_id=channel_id or DEFAULT_NOTIFICATION_CHANNEL_ID)
+            for token, channel_id in rows
+        ]
+        return ResolvedPushDestinations(destinations)
     finally:
         session.close()
 
@@ -583,7 +612,7 @@ def _deliver_push(
     failure on one of a user's several devices must never be treated the
     same as a genuine, total delivery failure.
     """
-    if not resolved.tokens:
+    if not resolved.destinations:
         logger.info(
             "No device token for push notification %s (%s listing %s): %s - left for retry, never "
             "using a global fallback",
@@ -596,9 +625,9 @@ def _deliver_push(
 
     any_success = False
     last_error: str | None = None
-    for token in resolved.tokens:
+    for destination in resolved.destinations:
         try:
-            provider.send_listing_alert(claimed.listing, token)
+            provider.send_listing_alert(claimed.listing, destination.token, channel_id=destination.channel_id)
             any_success = True
         except NotificationError as exc:
             last_error = str(exc)

@@ -17,7 +17,14 @@ class DeviceTokenRepository:
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def upsert(self, *, user_id: int, expo_push_token: str, platform: str | None) -> DeviceToken:
+    def upsert(
+        self,
+        *,
+        user_id: int,
+        expo_push_token: str,
+        platform: str | None,
+        notification_channel_id: str | None = None,
+    ) -> DeviceToken:
         """Creates a new row for this token, or updates the existing one
         if the exact same token was already registered - looked up by
         `expo_push_token` alone (it's the unique column), never by
@@ -31,6 +38,23 @@ class DeviceTokenRepository:
         never accepted as a request parameter - so this method has no way
         to be tricked into reassigning a token to someone other than the
         actual caller.
+
+        **`notification_channel_id` update semantics are deliberately
+        asymmetric with every other field here** - confirmed necessary by
+        a real persistence bug caught before implementation: the mobile
+        app's automatic startup re-registration
+        (`usePushNotificationSetup`) never sends this field at all (it
+        has no reason to know the user's current sound choice), so if an
+        *existing* row's `notification_channel_id` were unconditionally
+        overwritten the same way `platform`/`user_id`/`last_seen_at`
+        already are, every ordinary app restart would silently erase
+        whatever sound the user had explicitly picked, resetting it to
+        `NULL`. So: on a brand-new row, `None` is stored as-is (a fresh
+        device that has never had a preference set is exactly what `NULL`
+        means). On an *existing* row, `None` leaves the stored value
+        untouched - only a real, non-`None` value (including the
+        explicit "listing-alerts-default-v1" System Default choice,
+        which is never `None`) ever overwrites it.
 
         Flushes, does not commit - same convention as every other
         repository in this codebase; the caller (a route, via
@@ -46,6 +70,7 @@ class DeviceTokenRepository:
                 user_id=user_id,
                 expo_push_token=expo_push_token,
                 platform=platform,
+                notification_channel_id=notification_channel_id,
                 created_at=now,
                 last_seen_at=now,
             )
@@ -54,6 +79,8 @@ class DeviceTokenRepository:
             existing.user_id = user_id
             existing.platform = platform
             existing.last_seen_at = now
+            if notification_channel_id is not None:
+                existing.notification_channel_id = notification_channel_id
             row = existing
         self._session.flush()
         return row

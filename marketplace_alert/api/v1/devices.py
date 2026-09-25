@@ -13,7 +13,7 @@ user - see that repository's own docstring.
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
-from marketplace_alert.api.v1.schemas import DeviceRegisterRequest, DeviceUnregisterRequest
+from marketplace_alert.api.v1.schemas import DeviceRegisterRequest, DeviceRegisterResponse, DeviceUnregisterRequest
 from marketplace_alert.core.auth.dependencies import get_current_user
 from marketplace_alert.core.auth.models import User
 from marketplace_alert.core.notifications.device_repository import DeviceTokenRepository
@@ -24,23 +24,28 @@ router = APIRouter(prefix="/devices", tags=["Mobile API - Devices"])
 
 @router.post(
     "",
-    status_code=status.HTTP_204_NO_CONTENT,
     summary="Register/update my Expo push token",
     description=(
         "Registers the caller's Expo push token, or updates it if the exact same token "
         "was already registered - safe to call on every app launch (idempotent upsert). "
         "If this token was previously registered under a different user, ownership is "
-        "transferred to the caller."
+        "transferred to the caller. Returns this device's current stored state (notably "
+        "its notification_channel_id) so the caller can learn its own preference without "
+        "a second request - see DeviceRegisterResponse's own docstring."
     ),
 )
 def register_device(
     data: DeviceRegisterRequest,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_db_session),
-) -> None:
-    DeviceTokenRepository(session).upsert(
-        user_id=current_user.id, expo_push_token=data.expo_push_token, platform=data.platform
+) -> DeviceRegisterResponse:
+    row = DeviceTokenRepository(session).upsert(
+        user_id=current_user.id,
+        expo_push_token=data.expo_push_token,
+        platform=data.platform,
+        notification_channel_id=data.notification_channel_id,
     )
+    return DeviceRegisterResponse(platform=row.platform, notification_channel_id=row.notification_channel_id)
 
 
 @router.delete(

@@ -31,6 +31,12 @@ export function AccountScreen() {
           <Text style={styles.email}>{user?.email ?? '—'}</Text>
         </View>
 
+        <PrimaryButton
+          label="Notification Sound"
+          onPress={() => navigation.navigate('NotificationSound')}
+          variant="secondary"
+        />
+
         {/* Server-authoritative only - never an email comparison. The
             backend enforces this independently on every admin request
             regardless of what this button does (see AdminUsersScreen). */}

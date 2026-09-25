@@ -37,7 +37,8 @@ def test_register_device_persists_a_row_owned_by_the_caller(client, db_session) 
         headers=_auth_headers(token),
     )
 
-    assert response.status_code == 204
+    assert response.status_code == 200
+    assert response.json() == {"platform": "android", "notification_channel_id": None}
     row = db_session.query(DeviceToken).filter_by(expo_push_token="ExponentPushToken[abc]").one()
     user = db_session.query(DeviceToken).filter_by(expo_push_token="ExponentPushToken[abc]").one().user_id
     assert row.platform == "android"
@@ -128,11 +129,110 @@ def test_user_cannot_unregister_another_users_device(client, db_session) -> None
 
 
 def test_device_registration_never_exposes_a_token_in_the_response_body(client) -> None:
+    """The response body (`DeviceRegisterResponse`) is deliberately
+    minimal - `platform`/`notification_channel_id` only, never the
+    `expo_push_token` itself, the row id, or any timestamp."""
     token = _access_token(client)
 
     response = client.post(
         "/api/v1/devices", json={"expo_push_token": "ExponentPushToken[secret-ish]"}, headers=_auth_headers(token)
     )
 
-    assert response.status_code == 204
-    assert response.text == ""
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {"platform", "notification_channel_id"}
+    assert "ExponentPushToken[secret-ish]" not in response.text
+
+
+# =====================================================================
+# Notification sound selection (Phase 1: backend + database)
+# =====================================================================
+
+
+def test_new_device_registration_with_no_channel_id_succeeds_with_a_null_column(client, db_session) -> None:
+    token = _access_token(client)
+
+    response = client.post(
+        "/api/v1/devices", json={"expo_push_token": "ExponentPushToken[no-sound-yet]"}, headers=_auth_headers(token)
+    )
+
+    assert response.status_code == 200
+    assert response.json()["notification_channel_id"] is None
+    row = db_session.query(DeviceToken).filter_by(expo_push_token="ExponentPushToken[no-sound-yet]").one()
+    assert row.notification_channel_id is None
+
+
+def test_registering_with_a_valid_explicit_channel_id_persists_it(client, db_session) -> None:
+    token = _access_token(client)
+
+    response = client.post(
+        "/api/v1/devices",
+        json={"expo_push_token": "ExponentPushToken[radar]", "notification_channel_id": "listing-alerts-radar-v1"},
+        headers=_auth_headers(token),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["notification_channel_id"] == "listing-alerts-radar-v1"
+    row = db_session.query(DeviceToken).filter_by(expo_push_token="ExponentPushToken[radar]").one()
+    assert row.notification_channel_id == "listing-alerts-radar-v1"
+
+
+def test_registering_with_an_invalid_channel_id_returns_422(client) -> None:
+    token = _access_token(client)
+
+    response = client.post(
+        "/api/v1/devices",
+        json={"expo_push_token": "ExponentPushToken[bad-sound]", "notification_channel_id": "not-a-real-channel"},
+        headers=_auth_headers(token),
+    )
+
+    assert response.status_code == 422
+
+
+def test_normal_startup_reregistration_with_channel_id_omitted_does_not_erase_an_existing_preference(
+    client, db_session
+) -> None:
+    """The critical persistence-safety case: the mobile app's automatic
+    startup registration never sends `notification_channel_id` at all -
+    re-registering the same token that way must never reset an already-
+    chosen sound preference back to NULL."""
+    token = _access_token(client)
+    client.post(
+        "/api/v1/devices",
+        json={"expo_push_token": "ExponentPushToken[keep-radar]", "notification_channel_id": "listing-alerts-radar-v1"},
+        headers=_auth_headers(token),
+    )
+
+    response = client.post(
+        "/api/v1/devices",
+        json={"expo_push_token": "ExponentPushToken[keep-radar]", "platform": "android"},
+        headers=_auth_headers(token),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["notification_channel_id"] == "listing-alerts-radar-v1"
+    row = db_session.query(DeviceToken).filter_by(expo_push_token="ExponentPushToken[keep-radar]").one()
+    assert row.notification_channel_id == "listing-alerts-radar-v1"
+
+
+def test_explicit_system_default_overwrites_a_previously_chosen_preference(client, db_session) -> None:
+    token = _access_token(client)
+    client.post(
+        "/api/v1/devices",
+        json={"expo_push_token": "ExponentPushToken[back-to-default]", "notification_channel_id": "listing-alerts-radar-v1"},
+        headers=_auth_headers(token),
+    )
+
+    response = client.post(
+        "/api/v1/devices",
+        json={
+            "expo_push_token": "ExponentPushToken[back-to-default]",
+            "notification_channel_id": "listing-alerts-default-v1",
+        },
+        headers=_auth_headers(token),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["notification_channel_id"] == "listing-alerts-default-v1"
+    row = db_session.query(DeviceToken).filter_by(expo_push_token="ExponentPushToken[back-to-default]").one()
+    assert row.notification_channel_id == "listing-alerts-default-v1"

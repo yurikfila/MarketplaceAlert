@@ -11,6 +11,7 @@ import type {
   AdminUserListResponse,
   AuthResponse,
   DeviceRegisterInput,
+  DeviceRegisterResponse,
   DeviceUnregisterInput,
   ForgotPasswordInput,
   ForgotPasswordResponse,
@@ -150,9 +151,13 @@ export function getAdminStats(): Promise<AdminStatsResponse> {
 // See src/utils/pushNotifications.ts for how these are actually used -
 // screens never call these directly.
 
-/** Resolves with no value on success (backend returns 204 No Content). */
-export function registerDeviceToken(input: DeviceRegisterInput): Promise<void> {
-  return apiRequest<void>('/devices', { method: 'POST', body: input });
+/**
+ * Resolves with this device's current stored state (backend returns 200
+ * with a small body, not 204 - see `DeviceRegisterResponse`'s own
+ * docstring for why).
+ */
+export function registerDeviceToken(input: DeviceRegisterInput): Promise<DeviceRegisterResponse> {
+  return apiRequest<DeviceRegisterResponse>('/devices', { method: 'POST', body: input });
 }
 
 /** Resolves with no value on success (backend returns 204 No Content). */

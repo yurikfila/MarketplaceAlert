@@ -48,6 +48,24 @@ function renderWithAdminUsersRoute() {
   );
 }
 
+/** Same pattern as `renderWithAdminUsersRoute`, for the "Notification Sound" entry point. */
+function renderWithNotificationSoundRoute() {
+  const Stack = createNativeStackNavigator();
+
+  function StubNotificationSoundScreen() {
+    return <Text>stub-notification-sound-screen</Text>;
+  }
+
+  return render(
+    <NavigationContainer>
+      <Stack.Navigator screenOptions={{ headerShown: false }}>
+        <Stack.Screen name="Account" component={AccountScreen} />
+        <Stack.Screen name="NotificationSound" component={StubNotificationSoundScreen} />
+      </Stack.Navigator>
+    </NavigationContainer>,
+  );
+}
+
 describe('AccountScreen', () => {
   afterEach(() => {
     jest.clearAllMocks();
@@ -91,5 +109,21 @@ describe('AccountScreen', () => {
     await fireEvent.press(getByText('Admin: User Management'));
 
     expect(await findByText('stub-admin-users-screen')).toBeTruthy();
+  });
+
+  it('shows a Notification Sound entry point for every user, admin or not', async () => {
+    mockAuthedUser({ is_admin: false });
+    const { findByText } = await renderWithNavigation(AccountScreen);
+
+    expect(await findByText('Notification Sound')).toBeTruthy();
+  });
+
+  it('navigates to NotificationSound when the Notification Sound entry point is pressed', async () => {
+    mockAuthedUser({ is_admin: false });
+    const { getByText, findByText } = await renderWithNotificationSoundRoute();
+
+    await fireEvent.press(getByText('Notification Sound'));
+
+    expect(await findByText('stub-notification-sound-screen')).toBeTruthy();
   });
 });

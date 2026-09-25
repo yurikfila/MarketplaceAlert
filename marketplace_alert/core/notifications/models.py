@@ -112,3 +112,23 @@ class DeviceToken(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
+
+    # The Android notification channel this device's user has explicitly
+    # chosen (one of a small fixed set of versioned channel ids, e.g.
+    # "listing-alerts-radar-v1") - `NULL` is a distinct state from an
+    # explicit "System Default" choice ("listing-alerts-default-v1"):
+    # `NULL` means "this device has never had anyone actively pick a
+    # sound" (every pre-existing row, or a fresh registration before the
+    # user ever opens the sound picker), while the explicit default is a
+    # deliberate selection. Both resolve to the same channel id at send
+    # time (`DeviceTokenRepository`/push delivery coalesce `NULL` to
+    # "listing-alerts-default-v1"), but keeping them distinct costs
+    # nothing and preserves the option to treat them differently later
+    # (e.g. prompting only genuinely-unset devices).
+    #
+    # **Upsert semantics are asymmetric by design** - see
+    # `DeviceTokenRepository.upsert()`'s own docstring: omitted/`None` on
+    # an *update* must never overwrite an already-chosen preference,
+    # since the automatic startup re-registration
+    # (`usePushNotificationSetup`) never sends this field at all.
+    notification_channel_id: Mapped[str | None] = mapped_column(String, nullable=True)

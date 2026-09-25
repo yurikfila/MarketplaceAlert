@@ -25,8 +25,25 @@
     },
     "plugins": [
       "expo-secure-store",
-      "expo-notifications",
-      "expo-font"
+      [
+        "expo-notifications",
+        {
+          "sounds": [
+            "./assets/sounds/clean_ping.wav",
+            "./assets/sounds/double_ping.wav",
+            "./assets/sounds/radar.wav",
+            "./assets/sounds/premium_chime.wav"
+          ]
+        }
+      ],
+      "expo-font",
+      [
+        "expo-audio",
+        {
+          "recordAudioAndroid": false,
+          "enableBackgroundPlayback": false
+        }
+      ]
     ],
     "extra": {
       "eas": {

@@ -21,6 +21,7 @@ import { Platform } from 'react-native';
 import * as Notifications from 'expo-notifications';
 
 import { registerDeviceToken, unregisterDeviceToken } from '../api/endpoints';
+import type { NotificationChannelId } from '../api/types';
 import { navigationRef } from '../navigation/navigationRef';
 import { openListingUrl } from './linking';
 
@@ -40,11 +41,115 @@ Notifications.setNotificationHandler({
   }),
 });
 
+/**
+ * Notification sound selection - the five approved, versioned Android
+ * channels (see `NotificationChannelId`/backend `DeviceToken.
+ * notification_channel_id` docstrings for why versioned ids, not a
+ * mutable shared one: an Android channel's sound is locked in forever
+ * once created, so changing a sound later means introducing a new
+ * channel id, never editing an existing one). `sound: null` for the
+ * default channel means "use Android's own default notification sound" -
+ * every other channel names one of the four bundled `.wav` files
+ * (`app.json`'s `expo-notifications` plugin config), referenced here by
+ * filename without extension, matching how the plugin registers them as
+ * native Android raw resources.
+ */
+export const NOTIFICATION_CHANNELS: ReadonlyArray<{
+  id: NotificationChannelId;
+  name: string;
+  sound: string | null;
+}> = [
+  { id: 'listing-alerts-default-v1', name: 'New listing alerts', sound: null },
+  { id: 'listing-alerts-ping-v1', name: 'New listing alerts (Clean Ping)', sound: 'clean_ping' },
+  { id: 'listing-alerts-double-v1', name: 'New listing alerts (Double Ping)', sound: 'double_ping' },
+  { id: 'listing-alerts-radar-v1', name: 'New listing alerts (Radar)', sound: 'radar' },
+  { id: 'listing-alerts-premium-v1', name: 'New listing alerts (Premium Chime)', sound: 'premium_chime' },
+];
+
+/**
+ * Creates all five notification channels, Android-only (channels are an
+ * Android-only concept; iOS/web have no equivalent and `setNotification
+ * ChannelAsync` doesn't exist there). Safe to call unconditionally, every
+ * app start, regardless of auth status - creating a channel that already
+ * exists on this device is a no-op, and channels are a device-level
+ * setup concern, not a per-session one. Best-effort, like everything
+ * else in this file: channel creation failing must never crash the app
+ * or block anything else here.
+ */
+export async function ensureNotificationChannelsExist(): Promise<void> {
+  if (Platform.OS !== 'android') {
+    return;
+  }
+  try {
+    for (const channel of NOTIFICATION_CHANNELS) {
+      await Notifications.setNotificationChannelAsync(channel.id, {
+        name: channel.name,
+        importance: Notifications.AndroidImportance.HIGH,
+        sound: channel.sound,
+      });
+    }
+  } catch {
+    // Best-effort - see this function's own docstring.
+  }
+}
+void ensureNotificationChannelsExist();
+
 // The currently-registered token for this app instance, if any - module-
 // level (not React state) so `unregisterCurrentDeviceToken` can read it
 // from outside any component, exactly the way `api/client.ts` tracks the
 // current access token in a module-level variable for the same reason.
 let registeredDeviceToken: string | null = null;
+
+/**
+ * This device's last server-confirmed registration state - `null` until
+ * the first successful `registerDeviceToken` call this session. Updated
+ * by both the automatic startup registration below AND
+ * `updateNotificationChannelPreference` (never invented/duplicated
+ * client-side - see `DeviceRegisterResponse`'s own backend docstring for
+ * why: the backend is the only source of truth for this device's
+ * `notification_channel_id`, and every registration call already
+ * returns it for free). `NotificationSoundScreen` reads this via
+ * `getLastKnownDeviceRegistration()` to know what to display as
+ * currently selected, and `updateNotificationChannelPreference` reuses
+ * `expoPushToken`/`platform` from here so the explicit save action never
+ * has to re-derive them.
+ */
+interface DeviceRegistrationState {
+  expoPushToken: string;
+  platform: string;
+  notificationChannelId: NotificationChannelId | null;
+}
+let lastKnownRegistration: DeviceRegistrationState | null = null;
+
+/**
+ * Guards every write to `lastKnownRegistration` against a slow, stale
+ * response overwriting a newer one - a confirmed race between the
+ * automatic startup registration and an explicit
+ * `updateNotificationChannelPreference` save (or two overlapping
+ * automatic runs), since either can be in flight at once and nothing
+ * previously stopped an older request's response from winning just
+ * because it happened to resolve last.
+ *
+ * Every operation that's about to call `registerDeviceToken` captures
+ * its own ticket via `++registrationWriteSequence` *before* the request
+ * starts, and only applies its write afterward if its ticket still
+ * equals the current `registrationWriteSequence` - i.e. no newer
+ * operation has started since. This is a "newest start wins" rule, not
+ * "newest resolution wins": a slow older request can never clobber a
+ * newer one's result, regardless of which happens to resolve first.
+ *
+ * `unregisterCurrentDeviceToken` also bumps this on logout, specifically
+ * so a registration request already in flight *at* logout time - which
+ * hasn't written anything yet - is invalidated too, and can never
+ * repopulate the cache for a session that's already gone once it
+ * eventually resolves.
+ */
+let registrationWriteSequence = 0;
+
+/** See `lastKnownRegistration`'s own docstring. */
+export function getLastKnownDeviceRegistration(): DeviceRegistrationState | null {
+  return lastKnownRegistration;
+}
 
 /**
  * Requests notification permission (if not already granted/denied) and
@@ -129,9 +234,26 @@ export function usePushNotificationSetup(status: string): void {
       if (!token || registrationRunIdRef.current !== runId) {
         return;
       }
+      const writeTicket = ++registrationWriteSequence;
       try {
-        await registerDeviceToken({ expo_push_token: token, platform: Platform.OS });
+        // Deliberately never sends `notification_channel_id` - see
+        // `DeviceRegisterInput`'s own docstring for why an omitted value
+        // must always mean "leave the existing preference as it is" to
+        // the backend, never "clear it". The response still teaches
+        // this app its current preference either way (see
+        // `lastKnownRegistration`'s own docstring).
+        const response = await registerDeviceToken({ expo_push_token: token, platform: Platform.OS });
         registeredDeviceToken = token;
+        // Only apply if no newer write (an explicit save, a newer
+        // automatic run, or a logout) has started since this one did -
+        // see `registrationWriteSequence`'s own docstring.
+        if (writeTicket === registrationWriteSequence) {
+          lastKnownRegistration = {
+            expoPushToken: token,
+            platform: Platform.OS,
+            notificationChannelId: response.notification_channel_id,
+          };
+        }
       } catch {
         // Best-effort - see this function's own docstring.
       }
@@ -158,6 +280,16 @@ export function usePushNotificationSetup(status: string): void {
  * never makes a network call it has nothing to ask for.
  */
 export async function unregisterCurrentDeviceToken(): Promise<void> {
+  // Unconditional, and before the early-return below: a registration
+  // request can already be in flight (started, not yet resolved -
+  // `registeredDeviceToken` isn't set until it resolves) at the exact
+  // moment logout happens. Bumping the sequence here, regardless of
+  // whether there's anything to actually unregister yet, guarantees
+  // that request's eventual write is invalidated too - see
+  // `registrationWriteSequence`'s own docstring.
+  registrationWriteSequence += 1;
+  lastKnownRegistration = null;
+
   const token = registeredDeviceToken;
   if (!token) {
     return;
@@ -171,5 +303,48 @@ export async function unregisterCurrentDeviceToken(): Promise<void> {
     // behind this way is harmless: the next real notification attempt
     // to it will simply fail delivery to that one device, the same as
     // any other unreachable/uninstalled device.
+  }
+}
+
+/**
+ * Explicit, user-driven save from `NotificationSoundScreen` - the one
+ * place `notification_channel_id` is ever actually sent. Reuses this
+ * session's already-registered token/platform (see
+ * `lastKnownRegistration`'s own docstring) rather than re-deriving them,
+ * and updates the cache from the real response on success so the screen
+ * reflects exactly what the backend now has stored.
+ *
+ * Deliberately NOT best-effort/silently-swallowed, unlike the automatic
+ * registration above - this is a direct result of a user action, and
+ * `NotificationSoundScreen` must be able to tell a failed save from a
+ * successful one (never display a new selection as saved if the request
+ * failed - see that screen's own docstring).
+ *
+ * @throws if no device has been registered yet this session, or if the
+ * API call itself fails - the caller is expected to catch and display
+ * this.
+ */
+export async function updateNotificationChannelPreference(channelId: NotificationChannelId): Promise<void> {
+  if (!lastKnownRegistration) {
+    throw new Error('No device is registered yet - open the app with notifications enabled first.');
+  }
+  const { expoPushToken, platform } = lastKnownRegistration;
+  const writeTicket = ++registrationWriteSequence;
+  const response = await registerDeviceToken({
+    expo_push_token: expoPushToken,
+    platform,
+    notification_channel_id: channelId,
+  });
+  // Same "newest start wins" rule as the automatic registration effect -
+  // see `registrationWriteSequence`'s own docstring. In practice this
+  // save's own ticket is almost always still the newest by the time its
+  // response arrives (it's the most recent explicit user action), but
+  // the guard stays consistent and correct regardless.
+  if (writeTicket === registrationWriteSequence) {
+    lastKnownRegistration = {
+      expoPushToken,
+      platform,
+      notificationChannelId: response.notification_channel_id,
+    };
   }
 }

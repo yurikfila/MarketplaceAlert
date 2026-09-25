@@ -107,10 +107,19 @@ class ExpoPushProvider(NotificationProvider):
         present, unlike every other provider in this codebase."""
         return self._enabled
 
-    def send_listing_alert(self, listing: Listing, destination: str) -> None:
+    def send_listing_alert(self, listing: Listing, destination: str, *, channel_id: str | None = None) -> None:
         """Send one push notification for `listing` to `destination` (an
         Expo push token), retrying transient failures up to `max_retries`
         times.
+
+        `channel_id` (a versioned Android notification channel id, e.g.
+        "listing-alerts-radar-v1") is added to the payload as `channelId`
+        only when supplied - the caller (`core/notifications/outbox.py`'s
+        push drain loop) is responsible for resolving it per device and
+        always coalescing a device with no explicit preference to the
+        default channel id before calling this method, so in practice
+        this is never `None` on that call path; `None` here only means
+        "omit the field entirely" for any other caller.
 
         Raises `NotificationError` once every attempt has been exhausted
         (transient failure), immediately for a permanent HTTP-level
@@ -156,6 +165,8 @@ class ExpoPushProvider(NotificationProvider):
             "sound": "default",
             "priority": "high",
         }
+        if channel_id is not None:
+            payload["channelId"] = channel_id
 
         total_attempts = self._max_retries + 1
 

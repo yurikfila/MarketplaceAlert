@@ -18,6 +18,7 @@ persisted yet (see `api/v1/listings.py`).
 
 import re
 from datetime import datetime, timezone
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -422,15 +423,53 @@ class NotificationPreferenceUpdate(BaseModel):
 # rule as the notification-preferences schemas above).
 
 
+# The five approved Android notification-channel ids (notification sound
+# selection) - shared between the request and response schemas below so
+# they can never drift apart. Mirrors the versioned channel ids actually
+# created client-side (mobile/src/utils/pushNotifications.ts).
+NotificationChannelId = Literal[
+    "listing-alerts-default-v1",
+    "listing-alerts-ping-v1",
+    "listing-alerts-double-v1",
+    "listing-alerts-radar-v1",
+    "listing-alerts-premium-v1",
+]
+
+
 class DeviceRegisterRequest(BaseModel):
     """`POST /api/v1/devices` request body - registers or updates (upserts)
     the caller's Expo push token. Re-registering the exact same token
     under a different authenticated user transfers ownership to that
     user - see `core/notifications/models.py:DeviceToken`'s own
-    docstring for why."""
+    docstring for why.
+
+    `notification_channel_id`: omitted/`None` on every automatic startup
+    re-registration (`usePushNotificationSetup` never sends this field at
+    all) - `DeviceTokenRepository.upsert()` treats that as "do not change
+    the existing stored preference" on an update, never as "clear it".
+    Rejected by ordinary Pydantic validation if it's anything other than
+    one of the fixed, known channel ids below - never an arbitrary
+    client-supplied string.
+    """
 
     expo_push_token: str = Field(min_length=1)
     platform: str | None = None
+    notification_channel_id: NotificationChannelId | None = None
+
+
+class DeviceRegisterResponse(BaseModel):
+    """`POST /api/v1/devices` response body. Echoes back this device's
+    current stored state so the mobile app can learn its own
+    `notification_channel_id` from the exact same call it already makes
+    automatically on every authenticated startup - no second network
+    call, no client-side persistence duplicating this table's role as
+    the source of truth (see `NotificationSoundScreen` on the mobile
+    side). Deliberately minimal: never the token itself, never the row
+    id, never timestamps - only what a client legitimately needs back.
+    """
+
+    platform: str | None
+    notification_channel_id: NotificationChannelId | None
 
 
 class DeviceUnregisterRequest(BaseModel):

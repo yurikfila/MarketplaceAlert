@@ -35,7 +35,7 @@ class NotificationProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def send_listing_alert(self, listing: Listing, destination: str) -> None:
+    def send_listing_alert(self, listing: Listing, destination: str, *, channel_id: str | None = None) -> None:
         """Send an alert for one newly discovered listing to `destination`.
 
         `destination` is always supplied explicitly by the caller (e.g. a
@@ -45,6 +45,12 @@ class NotificationProvider(ABC):
         all (see `core/notifications/outbox.py`'s module docstring
         "SECURITY RULE") - there is no sentinel value that means "use
         something else instead".
+
+        `channel_id` is Android-push-specific (a versioned notification
+        channel id, e.g. "listing-alerts-radar-v1") - optional, and
+        meaningless for any other provider/channel. A provider that has
+        no concept of channels (Telegram) simply ignores it; only
+        `ExpoPushProvider` acts on it.
 
         Raises `NotificationError` on failure (network error, API error
         response, etc). Never called when `is_enabled` is False.

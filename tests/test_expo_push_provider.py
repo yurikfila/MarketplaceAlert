@@ -166,6 +166,54 @@ def test_send_payload_carries_the_destination_title_body_and_listing_data(
     assert captured["data"]["external_listing_id"] == "xyz789"
 
 
+def test_send_payload_includes_channel_id_when_supplied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Notification sound selection (Phase 1) - the caller
+    (`core/notifications/outbox.py`'s push drain loop) resolves each
+    device's own Android notification channel id and passes it through;
+    this provider's only job is to add it to the payload unchanged."""
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):
+        captured.update(json)
+        return _ok_response()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    _provider().send_listing_alert(_listing(), "ExponentPushToken[abc]", channel_id="listing-alerts-radar-v1")
+
+    assert captured["channelId"] == "listing-alerts-radar-v1"
+
+
+def test_send_payload_omits_channel_id_when_not_supplied(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):
+        captured.update(json)
+        return _ok_response()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    _provider().send_listing_alert(_listing(), "ExponentPushToken[abc]")
+
+    assert "channelId" not in captured
+
+
+def test_send_payload_still_carries_the_existing_sound_and_priority_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pre-existing fields must be unaffected by adding channelId support."""
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):
+        captured.update(json)
+        return _ok_response()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    _provider().send_listing_alert(_listing(), "ExponentPushToken[abc]", channel_id="listing-alerts-radar-v1")
+
+    assert captured["sound"] == "default"
+    assert captured["priority"] == "high"
+
+
 # =====================================================================
 # Ticket-level success/failure
 # =====================================================================

@@ -104,9 +104,13 @@ class TelegramNotificationProvider(NotificationProvider):
     def is_enabled(self) -> bool:
         return bool(self._bot_token)
 
-    def send_listing_alert(self, listing: Listing, destination: str) -> None:
+    def send_listing_alert(self, listing: Listing, destination: str, *, channel_id: str | None = None) -> None:
         """Send one alert to `destination`, retrying transient failures up
         to `max_retries` times.
+
+        `channel_id` is Android-push-specific and meaningless for
+        Telegram - accepted only to satisfy the shared
+        `NotificationProvider` interface, always ignored.
 
         Raises `NotificationError` only once every attempt has been
         exhausted (transient failure) or immediately for a permanent one -

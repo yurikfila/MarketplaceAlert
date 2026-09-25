@@ -219,14 +219,53 @@ export interface AdminStatsResponse {
 }
 
 /**
+ * The five approved Android notification-channel ids (notification sound
+ * selection) - mirrors the backend's `DeviceRegisterRequest.
+ * notification_channel_id` Literal exactly (marketplace_alert/api/v1/
+ * schemas.py). Kept as one shared type here rather than redeclared at
+ * each use site (`DeviceRegisterInput`/`DeviceRegisterResponse` below,
+ * and `utils/pushNotifications.ts`'s channel-creation list).
+ */
+export type NotificationChannelId =
+  | 'listing-alerts-default-v1'
+  | 'listing-alerts-ping-v1'
+  | 'listing-alerts-double-v1'
+  | 'listing-alerts-radar-v1'
+  | 'listing-alerts-premium-v1';
+
+/**
  * POST /api/v1/devices body - mirrors the backend's `DeviceRegisterRequest`.
  * Re-registering the exact same token under a different authenticated user
  * transfers ownership to that user (see backend's `DeviceToken` docstring) -
  * this app never needs to worry about "unregister the old owner first".
+ *
+ * `notification_channel_id`: deliberately omitted by the automatic
+ * startup re-registration in `utils/pushNotifications.ts` - the backend's
+ * upsert treats an omitted value as "leave the existing preference
+ * unchanged", never as "clear it". Only `NotificationSoundScreen`'s
+ * explicit save action ever sends this field.
  */
 export interface DeviceRegisterInput {
   expo_push_token: string;
   platform?: string;
+  notification_channel_id?: NotificationChannelId;
+}
+
+/**
+ * POST /api/v1/devices response - mirrors the backend's
+ * `DeviceRegisterResponse`. Echoes back this device's current stored
+ * state so the app can learn its own `notification_channel_id` from the
+ * same call it already makes automatically on every authenticated
+ * startup, without a second network call or any client-side persistence
+ * duplicating the server's source of truth. `null` means "never
+ * explicitly chosen" - display it as "System Default", same as the
+ * explicit `'listing-alerts-default-v1'` value, but the two remain
+ * distinct values (see `DeviceToken.notification_channel_id`'s own
+ * backend docstring).
+ */
+export interface DeviceRegisterResponse {
+  platform: string | null;
+  notification_channel_id: NotificationChannelId | null;
 }
 
 /** DELETE /api/v1/devices body - mirrors the backend's `DeviceUnregisterRequest`. */

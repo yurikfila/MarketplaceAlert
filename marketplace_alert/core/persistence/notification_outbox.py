@@ -199,7 +199,15 @@ class NotificationOutboxRepository:
                     & (PendingNotification.claimed_at < lease_cutoff)
                 )
             )
-            .order_by(PendingNotification.created_at.asc())
+            # Never-attempted rows first, oldest-first within each group -
+            # a plain `created_at ASC` order alone lets a large, permanently
+            # recycling backlog of Case A retries (never eligible to reach
+            # `failed` - see `complete()` below) monopolize every batch
+            # forever, starving fresh notifications that have never even
+            # been attempted once. This ordering doesn't change eligibility,
+            # retry timing, or batch size - a retry-eligible row is still
+            # claimed whenever there's spare capacity in the batch.
+            .order_by(PendingNotification.last_attempted_at.is_(None).desc(), PendingNotification.created_at.asc())
             .limit(limit)
             .with_for_update(of=PendingNotification, skip_locked=True)
         )
@@ -305,7 +313,16 @@ class NotificationOutboxRepository:
                     & (PendingNotification.push_claimed_at < lease_cutoff)
                 )
             )
-            .order_by(PendingNotification.created_at.asc())
+            # Never-attempted rows first, oldest-first within each group -
+            # see `claim_batch` above's identical comment for why a plain
+            # `created_at ASC` order alone lets a large, permanently
+            # recycling backlog of no-device retries (never eligible to
+            # reach `failed` - see `complete_push()` below) monopolize
+            # every batch forever, starving fresh notifications that have
+            # never even been attempted once.
+            .order_by(
+                PendingNotification.push_last_attempted_at.is_(None).desc(), PendingNotification.created_at.asc()
+            )
             .limit(limit)
             .with_for_update(of=PendingNotification, skip_locked=True)
         )

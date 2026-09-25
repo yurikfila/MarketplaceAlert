@@ -705,6 +705,55 @@ def test_claim_batch_respects_limit_and_fifo_order(session_factory) -> None:
     assert [c.notification_id for c in claimed] == ids_in_enqueue_order[:2]
 
 
+def test_claim_batch_prioritizes_never_attempted_rows_over_a_large_case_a_backlog(session_factory) -> None:
+    """Regression test for a confirmed production starvation bug: a large,
+    permanently-recycling Case A backlog (never eligible to reach `failed`
+    - see `complete()` below) sorted purely by `created_at ASC` would
+    occupy every batch slot forever, starving a notification that has
+    never even been attempted once behind older users who simply haven't
+    configured a destination yet. `claim_batch`'s ordering now puts
+    never-attempted rows first - proven here with a backlog larger than
+    the claim limit, which would have fully excluded the fresh row under
+    the old plain-FIFO ordering."""
+    backlog_ids = []
+    for i in range(3):
+        user_id = _create_user(session_factory, f"backlog-{i}@example.com")
+        saved_search_id = _create_owned_saved_search(session_factory, user_id)
+        backlog_ids.append(_persist_and_enqueue(session_factory, f"backlog-{i}", saved_search_id=saved_search_id))
+
+    # Drain once so every backlog row becomes a completed Case A row (a
+    # real `last_attempted_at`, `last_error=AWAITING_DESTINATION_CONFIG`),
+    # then let the throttle window elapse so they're reclaim-eligible
+    # again - exactly the permanently-recycling state the production
+    # backlog was found in.
+    first = _drain(session_factory, NeverCalledProvider(), no_destination_retry_seconds=0.05)
+    assert first.claimed_count == 3
+    time.sleep(0.1)
+
+    fresh_id = _routed_notification(session_factory, "fresh-never-attempted")
+
+    claimed = claim_due_notifications(session_factory, limit=2, lease_seconds=120, no_destination_retry_seconds=0.05)
+
+    claimed_ids = [c.notification_id for c in claimed]
+    assert len(claimed) == 2
+    assert fresh_id in claimed_ids, "a never-attempted notification must never be starved by an older Case A backlog"
+
+    # Retry semantics for the backlog rows not claimed this round must be
+    # unaffected - still pending, still carrying their Case A error, and
+    # still claimable once given enough batch capacity.
+    unclaimed_backlog_ids = [nid for nid in backlog_ids if nid not in claimed_ids]
+    assert len(unclaimed_backlog_ids) == 2
+    verify = session_factory()
+    for nid in unclaimed_backlog_ids:
+        row = verify.get(PendingNotification, nid)
+        assert row.status == NOTIFICATION_STATUS_PENDING
+        assert row.last_error == NOTIFICATION_ERROR_AWAITING_DESTINATION_CONFIG
+    verify.close()
+
+    everything = claim_due_notifications(session_factory, limit=10, lease_seconds=120, no_destination_retry_seconds=0.05)
+    assert {c.notification_id for c in everything} == set(unclaimed_backlog_ids)
+
+
 def test_claim_batch_carries_the_discovering_saved_search_id(session_factory) -> None:
     """`ClaimedNotification.discovered_by_saved_search_id` is what
     `resolve_destination` uses to find the owning user - proven captured
@@ -1517,3 +1566,63 @@ def test_push_claim_lease_mirrors_telegrams_own_behavior(session_factory) -> Non
     assert row.push_status == NOTIFICATION_STATUS_PROCESSING
     assert row.push_attempt_count == 1
     verify.close()
+
+
+def test_claim_push_batch_prioritizes_never_attempted_rows_over_a_large_no_device_backlog(session_factory) -> None:
+    """Push-channel counterpart of `test_claim_batch_prioritizes_never_
+    attempted_rows_over_a_large_case_a_backlog` above - the same confirmed
+    production starvation bug, but for a permanently-recycling
+    NO_DEVICE_REGISTERED backlog starving a fresh notification for a user
+    who genuinely has a registered device. `claim_push_batch` mirrors
+    `claim_batch`'s fix exactly - see that test's docstring for the full
+    mechanism."""
+    backlog_ids = []
+    for i in range(3):
+        user_id = _create_user(session_factory, f"push-backlog-{i}@example.com")
+        saved_search_id = _create_owned_saved_search(session_factory, user_id)
+        backlog_ids.append(
+            _persist_and_enqueue(
+                session_factory, f"push-backlog-{i}", saved_search_id=saved_search_id, user_id=user_id
+            )
+        )
+        # Deliberately no `_register_device_token` call - this is the
+        # permanently-recycling NO_DEVICE_REGISTERED backlog.
+
+    first = _drain_push(session_factory, NeverCalledProvider(), no_destination_retry_seconds=0.05)
+    assert first.claimed_count == 3
+    assert first.awaiting_device_count == 3
+    time.sleep(0.1)
+
+    fresh_user_id = _create_user(session_factory, "push-fresh@example.com")
+    fresh_saved_search_id = _create_owned_saved_search(session_factory, fresh_user_id)
+    _register_device_token(session_factory, fresh_user_id)
+    fresh_id = _persist_and_enqueue(
+        session_factory, "push-fresh-never-attempted", saved_search_id=fresh_saved_search_id, user_id=fresh_user_id
+    )
+
+    claimed = claim_due_push_notifications(
+        session_factory, limit=2, lease_seconds=120, no_destination_retry_seconds=0.05
+    )
+
+    claimed_ids = [c.notification_id for c in claimed]
+    assert len(claimed) == 2
+    assert fresh_id in claimed_ids, (
+        "a never-attempted push notification must never be starved by an older no-device backlog"
+    )
+
+    # Retry semantics for the backlog rows not claimed this round must be
+    # unaffected - still pending, still carrying their no-device error,
+    # and still claimable once given enough batch capacity.
+    unclaimed_backlog_ids = [nid for nid in backlog_ids if nid not in claimed_ids]
+    assert len(unclaimed_backlog_ids) == 2
+    verify = session_factory()
+    for nid in unclaimed_backlog_ids:
+        row = verify.get(PendingNotification, nid)
+        assert row.push_status == NOTIFICATION_STATUS_PENDING
+        assert row.push_last_error == NOTIFICATION_ERROR_NO_DEVICE_REGISTERED
+    verify.close()
+
+    everything = claim_due_push_notifications(
+        session_factory, limit=10, lease_seconds=120, no_destination_retry_seconds=0.05
+    )
+    assert {c.notification_id for c in everything} == set(unclaimed_backlog_ids)

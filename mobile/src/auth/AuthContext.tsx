@@ -55,6 +55,16 @@
  * `status` - it re-checks that its generation is still current, and
  * silently discards its result otherwise. See `performRefresh` for the
  * one subtlety this requires around token rotation specifically.
+ *
+ * **One automatic retry for a transient startup failure.** A Render
+ * free-tier cold start (or any other momentary network/5xx blip) can
+ * easily outlast a single request's timeout while still resolving fine
+ * a couple of seconds later. `performRestore` gives a transient failure -
+ * at the refresh step, or at the immediately-following `/me` step - one
+ * bounded automatic retry of the whole sequence before ever surfacing
+ * RestorationErrorScreen. A definitive 401 never gets this treatment; it
+ * still lands on Login exactly as before. See `performRestore` and
+ * `TRANSIENT_RESTORE_RETRY_DELAY_MS` below.
  */
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
@@ -70,6 +80,13 @@ import {
 import type { UserPublic } from '../api/types';
 import { unregisterCurrentDeviceToken } from '../utils/pushNotifications';
 import * as tokenStorage from './tokenStorage';
+
+/** See the module docstring's "One automatic retry for a transient startup failure" section. */
+const TRANSIENT_RESTORE_RETRY_DELAY_MS = 1500;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export type AuthStatus = 'restoring' | 'authenticated' | 'unauthenticated' | 'restoration-error';
 
@@ -260,47 +277,80 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setStatus('restoring');
     }
     const generation = generationRef.current;
-    const outcome = await performRefresh(generation);
 
-    if (generationRef.current !== generation || !isMountedRef.current) {
-      return;
-    }
+    // Waits out one retry delay, then reports whether this operation is
+    // still current - see the module docstring's "One automatic retry"
+    // section. Called at most once per cycle (the `attempt` loop below
+    // never retries a retry).
+    const waitForAutomaticRetry = async (): Promise<boolean> => {
+      await delay(TRANSIENT_RESTORE_RETRY_DELAY_MS);
+      return generationRef.current === generation && isMountedRef.current;
+    };
 
-    if (outcome.kind === 'no-session') {
-      setStatus('unauthenticated');
-      return;
-    }
-    if (outcome.kind === 'definitive-failure') {
-      await clearSession();
-      return;
-    }
-    if (outcome.kind === 'transient-failure') {
-      // Deliberately does NOT touch SecureStore or `user` - the stored
-      // refresh token is still there, untouched, ready for the next
-      // Retry (or the next natural 401-triggered refresh once the app
-      // does get past this screen).
-      setStatus('restoration-error');
-      return;
-    }
-    if (outcome.kind === 'stale') {
-      return; // unreachable given the guard above - kept for exhaustiveness
-    }
+    // attempt 1 is the initial try; attempt 2 is the one automatic retry -
+    // never more. A transient failure at *either* step below (the refresh
+    // call, or the /me call right after a successful refresh) gets
+    // exactly one retry of the whole sequence; a definitive 401 never
+    // reaches the retry branch at all - it returns immediately.
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const outcome = await performRefresh(generation);
 
-    setAccessToken(outcome.accessToken);
-    try {
-      const me = await getCurrentUser();
       if (generationRef.current !== generation || !isMountedRef.current) {
         return;
       }
-      setUser(me);
-      setStatus('authenticated');
-    } catch {
-      // Got a fresh access token but /me itself failed right after
-      // (extremely unlikely, but could be its own transient blip) - the
-      // same "don't discard the session over an unconfirmed problem"
-      // principle applies here too.
-      if (generationRef.current === generation && isMountedRef.current) {
-        setStatus('restoration-error');
+
+      if (outcome.kind === 'no-session') {
+        setStatus('unauthenticated');
+        return;
+      }
+      if (outcome.kind === 'definitive-failure') {
+        await clearSession();
+        return;
+      }
+      if (outcome.kind === 'stale') {
+        return; // unreachable given the guard above - kept for exhaustiveness
+      }
+      if (outcome.kind === 'transient-failure') {
+        if (attempt === 1 && (await waitForAutomaticRetry())) {
+          continue;
+        }
+        // Either the retry budget is spent, or this operation was
+        // superseded/unmounted during the delay - in the latter case,
+        // returning without setting `restoration-error` is correct.
+        // Deliberately does NOT touch SecureStore or `user` - the stored
+        // refresh token is still there, untouched, ready for the next
+        // Retry (or the next natural 401-triggered refresh once the app
+        // does get past this screen).
+        if (generationRef.current === generation && isMountedRef.current) {
+          setStatus('restoration-error');
+        }
+        return;
+      }
+
+      setAccessToken(outcome.accessToken);
+      try {
+        const me = await getCurrentUser();
+        if (generationRef.current !== generation || !isMountedRef.current) {
+          return;
+        }
+        setUser(me);
+        setStatus('authenticated');
+        return;
+      } catch {
+        // Got a fresh access token but /me itself failed right after
+        // (network/timeout/5xx) - the same one-retry treatment as a
+        // refresh-level transient failure, since the underlying cause is
+        // indistinguishable (and just as likely transient).
+        if (generationRef.current !== generation || !isMountedRef.current) {
+          return;
+        }
+        if (attempt === 1 && (await waitForAutomaticRetry())) {
+          continue;
+        }
+        if (generationRef.current === generation && isMountedRef.current) {
+          setStatus('restoration-error');
+        }
+        return;
       }
     }
   }, [performRefresh, clearSession, setAccessToken]);

@@ -24,20 +24,27 @@ export function isOpenableListingUrl(url: string | null | undefined): url is str
  * Opens a listing's URL in the device's default browser - `Linking.openURL`
  * always hands off to an external browser/app, so the user is never
  * trapped inside this app. Returns whether it actually opened; never
- * throws - every failure mode (an invalid URL, no app able to handle it,
- * the OS call itself rejecting) is reported through a plain `Alert`
- * instead of an unhandled promise rejection or a silent no-op.
+ * throws - every failure mode (an invalid URL, the OS call itself
+ * rejecting) is reported through a plain `Alert` instead of an unhandled
+ * promise rejection or a silent no-op.
+ *
+ * **Deliberately does NOT call `Linking.canOpenURL()` first.** On Android
+ * 11+ (API 30+), `canOpenURL()` for an `http(s)` URL is gated by package-
+ * visibility rules separate from the actual open action, and reliably
+ * returns `false` on a real device even when a browser is installed and
+ * `openURL` would succeed - confirmed as the cause of a real production
+ * bug (every real marketplace listing link failed to open with "Your
+ * device doesn't have an app available to open this link.", even though
+ * the URL was a perfectly valid `https://` listing page). `isOpenableListingUrl`
+ * above is already the real security gate (scheme allowlist); asking the
+ * OS a second, differently-permissioned question before opening a URL
+ * already known to be `http(s)` added no safety, only a false negative.
  */
 export async function openListingUrl(url: string | null | undefined): Promise<boolean> {
   if (!isOpenableListingUrl(url)) {
     return false;
   }
   try {
-    const canOpen = await Linking.canOpenURL(url);
-    if (!canOpen) {
-      Alert.alert('Could not open link', "Your device doesn't have an app available to open this link.");
-      return false;
-    }
     await Linking.openURL(url);
     return true;
   } catch {

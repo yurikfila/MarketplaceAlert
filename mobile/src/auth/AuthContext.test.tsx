@@ -48,9 +48,22 @@ async function renderAuth() {
   return { ...utils, getAuth: (): Auth => auth as Auth };
 }
 
-async function waitForStatus(getAuth: () => Auth, status: AuthStatus) {
-  await waitFor(() => expect(getAuth().status).toBe(status));
+/**
+ * Default `waitFor` timeout (1000ms) comfortably covers everything except
+ * a case that must wait out AuthContext's real ~1.5s automatic-retry delay
+ * (see `TRANSIENT_RESTORE_RETRY_DELAY_MS` there) - those pass an explicit
+ * longer `timeout`. Real timers, not fake ones: mocking global timers here
+ * was tried and found to corrupt React's own scheduler for whichever
+ * describe block ran next in this same file (a real, reproduced failure,
+ * not a hypothetical) - a handful of real-time waits of ~1.5s each keeps
+ * this file slow by single-digit seconds but reliable.
+ */
+async function waitForStatus(getAuth: () => Auth, status: AuthStatus, timeout?: number) {
+  await waitFor(() => expect(getAuth().status).toBe(status), timeout ? { timeout } : undefined);
 }
+
+/** Comfortably exceeds AuthContext's real automatic-retry delay - see `waitForStatus`'s docstring. */
+const PAST_AUTOMATIC_RETRY_TIMEOUT_MS = 5000;
 
 /** A promise this test controls the settlement of - used to hold a mocked network/storage call open so a "stale" operation can be raced against a session-replacing one (logout/login). */
 function deferred<T>() {
@@ -96,28 +109,49 @@ describe('AuthContext - session restoration', () => {
     expect(mockedTokenStorage.clearRefreshToken).not.toHaveBeenCalled();
   });
 
-  it('a transient network failure during restoration preserves the stored token and shows restoration-error', async () => {
+  it('A: a transient failure on the first refresh attempt automatically retries and succeeds -> authenticated, never showing restoration-error', async () => {
+    mockedTokenStorage.getRefreshToken.mockResolvedValue('stored-refresh-token');
+    mockedEndpoints.refreshToken.mockRejectedValueOnce(new ApiError('Could not reach the server.', 'network'));
+    mockedEndpoints.refreshToken.mockResolvedValueOnce({ access_token: 'a', refresh_token: 'b', token_type: 'bearer' });
+    mockedTokenStorage.setRefreshToken.mockResolvedValue(undefined);
+    mockedEndpoints.getCurrentUser.mockResolvedValue(USER);
+
+    const { getAuth } = await renderAuth();
+    await waitFor(() => expect(mockedEndpoints.refreshToken).toHaveBeenCalledTimes(1));
+    // Still restoring, not restoration-error - the failure hasn't been
+    // surfaced yet, it's waiting out the automatic retry delay.
+    expect(getAuth().status).toBe('restoring');
+
+    await waitForStatus(getAuth, 'authenticated', PAST_AUTOMATIC_RETRY_TIMEOUT_MS);
+    expect(getAuth().user).toEqual(USER);
+    expect(mockedEndpoints.refreshToken).toHaveBeenCalledTimes(2);
+    expect(mockedTokenStorage.clearRefreshToken).not.toHaveBeenCalled();
+  }, 10000);
+
+  it('B: a transient network failure on both the initial attempt and the automatic retry preserves the stored token and shows restoration-error after exactly two attempts', async () => {
     mockedTokenStorage.getRefreshToken.mockResolvedValue('stored-refresh-token');
     mockedEndpoints.refreshToken.mockRejectedValue(new ApiError('Could not reach the server.', 'network'));
 
     const { getAuth } = await renderAuth();
 
-    await waitForStatus(getAuth, 'restoration-error');
+    await waitForStatus(getAuth, 'restoration-error', PAST_AUTOMATIC_RETRY_TIMEOUT_MS);
+    expect(mockedEndpoints.refreshToken).toHaveBeenCalledTimes(2);
     expect(mockedTokenStorage.clearRefreshToken).not.toHaveBeenCalled();
     expect(mockedTokenStorage.setRefreshToken).not.toHaveBeenCalled();
-  });
+  }, 10000);
 
-  it('a 5xx from refresh during restoration also preserves the stored token and shows restoration-error', async () => {
+  it('a 5xx from refresh on both attempts also preserves the stored token and shows restoration-error after exactly two attempts', async () => {
     mockedTokenStorage.getRefreshToken.mockResolvedValue('stored-refresh-token');
     mockedEndpoints.refreshToken.mockRejectedValue(new ApiError('The server reported an error (HTTP 503).', 'http', 503));
 
     const { getAuth } = await renderAuth();
 
-    await waitForStatus(getAuth, 'restoration-error');
+    await waitForStatus(getAuth, 'restoration-error', PAST_AUTOMATIC_RETRY_TIMEOUT_MS);
+    expect(mockedEndpoints.refreshToken).toHaveBeenCalledTimes(2);
     expect(mockedTokenStorage.clearRefreshToken).not.toHaveBeenCalled();
-  });
+  }, 10000);
 
-  it('a definitive 401 from refresh during restoration clears the stored token exactly once and lands on unauthenticated', async () => {
+  it('C: a definitive 401 from refresh during restoration never retries, clears the stored token exactly once, and lands on unauthenticated', async () => {
     mockedTokenStorage.getRefreshToken.mockResolvedValue('stored-refresh-token');
     mockedEndpoints.refreshToken.mockRejectedValue(new ApiError('Invalid or expired refresh token', 'http', 401));
 
@@ -125,7 +159,57 @@ describe('AuthContext - session restoration', () => {
 
     await waitForStatus(getAuth, 'unauthenticated');
     expect(mockedTokenStorage.clearRefreshToken).toHaveBeenCalledTimes(1);
+    expect(mockedEndpoints.refreshToken).toHaveBeenCalledTimes(1);
   });
+
+  it('D: a timeout ApiError from refresh is classified as transient and gets the automatic retry, same as network/5xx', async () => {
+    mockedTokenStorage.getRefreshToken.mockResolvedValue('stored-refresh-token');
+    mockedEndpoints.refreshToken.mockRejectedValueOnce(
+      new ApiError('The server took too long to respond. The backend may be starting up after being idle - please try again in a moment.', 'timeout'),
+    );
+    mockedEndpoints.refreshToken.mockResolvedValueOnce({ access_token: 'a', refresh_token: 'b', token_type: 'bearer' });
+    mockedTokenStorage.setRefreshToken.mockResolvedValue(undefined);
+    mockedEndpoints.getCurrentUser.mockResolvedValue(USER);
+
+    const { getAuth } = await renderAuth();
+
+    await waitForStatus(getAuth, 'authenticated', PAST_AUTOMATIC_RETRY_TIMEOUT_MS);
+    expect(mockedEndpoints.refreshToken).toHaveBeenCalledTimes(2);
+  }, 10000);
+
+  it('E: refresh succeeds but /auth/me transient-fails once - the automatic retry re-runs the whole sequence and can recover', async () => {
+    mockedTokenStorage.getRefreshToken.mockResolvedValue('stored-refresh-token');
+    mockedEndpoints.refreshToken.mockResolvedValue({ access_token: 'a', refresh_token: 'b', token_type: 'bearer' });
+    mockedTokenStorage.setRefreshToken.mockResolvedValue(undefined);
+    mockedEndpoints.getCurrentUser.mockRejectedValueOnce(new ApiError('Could not reach the server.', 'network'));
+    mockedEndpoints.getCurrentUser.mockResolvedValueOnce(USER);
+
+    const { getAuth } = await renderAuth();
+    await waitFor(() => expect(mockedEndpoints.getCurrentUser).toHaveBeenCalledTimes(1));
+    expect(getAuth().status).toBe('restoring');
+
+    await waitForStatus(getAuth, 'authenticated', PAST_AUTOMATIC_RETRY_TIMEOUT_MS);
+    expect(getAuth().user).toEqual(USER);
+    expect(mockedEndpoints.getCurrentUser).toHaveBeenCalledTimes(2);
+    // The whole sequence is retried, not just the failed /auth/me call -
+    // see AuthContext.tsx's `performRestore` docstring.
+    expect(mockedEndpoints.refreshToken).toHaveBeenCalledTimes(2);
+  }, 10000);
+
+  it('G: no more than one automatic retry ever occurs per restoration cycle, even if time keeps passing', async () => {
+    mockedTokenStorage.getRefreshToken.mockResolvedValue('stored-refresh-token');
+    mockedEndpoints.refreshToken.mockRejectedValue(new ApiError('Could not reach the server.', 'network'));
+
+    const { getAuth } = await renderAuth();
+    await waitForStatus(getAuth, 'restoration-error', PAST_AUTOMATIC_RETRY_TIMEOUT_MS);
+    expect(mockedEndpoints.refreshToken).toHaveBeenCalledTimes(2);
+
+    // Waiting well past a second retry delay must never trigger a third
+    // automatic attempt - the cycle already ended in `restoration-error`.
+    await new Promise((resolve) => setTimeout(resolve, 1800));
+    expect(mockedEndpoints.refreshToken).toHaveBeenCalledTimes(2);
+    expect(getAuth().status).toBe('restoration-error');
+  }, 10000);
 
   it('a rotation storage failure (refresh succeeds, SecureStore write fails) clears the session and never retries with the old token', async () => {
     mockedTokenStorage.getRefreshToken.mockResolvedValue('stored-refresh-token');
@@ -151,13 +235,20 @@ describe('AuthContext - session restoration', () => {
     expect(getAuth().user).toEqual(USER);
   });
 
-  it('retryRestoration re-runs restoration from a restoration-error state', async () => {
+  it('F: retryRestoration re-runs restoration from a restoration-error state, and the new cycle gets its own bounded automatic retry', async () => {
     mockedTokenStorage.getRefreshToken.mockResolvedValue('stored-refresh-token');
-    mockedEndpoints.refreshToken.mockRejectedValueOnce(new ApiError('Could not reach the server.', 'network'));
+    mockedEndpoints.refreshToken.mockRejectedValue(new ApiError('Could not reach the server.', 'network'));
 
     const { getAuth } = await renderAuth();
-    await waitForStatus(getAuth, 'restoration-error');
+    await waitForStatus(getAuth, 'restoration-error', PAST_AUTOMATIC_RETRY_TIMEOUT_MS);
+    expect(mockedEndpoints.refreshToken).toHaveBeenCalledTimes(2); // initial cycle: 2 attempts, both transient
 
+    // The manual retry's own cycle also transient-fails once, then
+    // automatically retries once more and succeeds - proving the bounded
+    // retry applies fresh to a manually triggered cycle too, not just to
+    // the initial mount, and that it isn't carried over/exhausted from
+    // the previous cycle.
+    mockedEndpoints.refreshToken.mockRejectedValueOnce(new ApiError('Could not reach the server.', 'network'));
     mockedEndpoints.refreshToken.mockResolvedValueOnce({ access_token: 'a', refresh_token: 'b', token_type: 'bearer' });
     mockedEndpoints.getCurrentUser.mockResolvedValue(USER);
 
@@ -165,15 +256,16 @@ describe('AuthContext - session restoration', () => {
       getAuth().retryRestoration();
     });
 
-    await waitForStatus(getAuth, 'authenticated');
-  });
+    await waitForStatus(getAuth, 'authenticated', PAST_AUTOMATIC_RETRY_TIMEOUT_MS);
+    expect(mockedEndpoints.refreshToken).toHaveBeenCalledTimes(4); // 2 (initial cycle) + 2 (manual cycle's own retry)
+  }, 10000);
 
   it('signInInstead discards the local session without calling the refresh endpoint again', async () => {
     mockedTokenStorage.getRefreshToken.mockResolvedValue('stored-refresh-token');
     mockedEndpoints.refreshToken.mockRejectedValue(new ApiError('Could not reach the server.', 'network'));
 
     const { getAuth } = await renderAuth();
-    await waitForStatus(getAuth, 'restoration-error');
+    await waitForStatus(getAuth, 'restoration-error', PAST_AUTOMATIC_RETRY_TIMEOUT_MS);
     mockedEndpoints.refreshToken.mockClear();
 
     await act(async () => {
@@ -183,7 +275,7 @@ describe('AuthContext - session restoration', () => {
     await waitForStatus(getAuth, 'unauthenticated');
     expect(mockedTokenStorage.clearRefreshToken).toHaveBeenCalledTimes(1);
     expect(mockedEndpoints.refreshToken).not.toHaveBeenCalled();
-  });
+  }, 10000);
 });
 
 describe('AuthContext - reactive 401 handler (registered with api/client.ts)', () => {
@@ -365,10 +457,13 @@ describe('AuthContext - session generation guard (logout/login vs. stale refresh
 
   it('C: two concurrent retryRestoration calls share a single in-flight refresh request', async () => {
     mockedTokenStorage.getRefreshToken.mockResolvedValue('stored-refresh-token');
-    mockedEndpoints.refreshToken.mockRejectedValueOnce(new ApiError('Could not reach the server.', 'network'));
+    mockedEndpoints.refreshToken.mockRejectedValue(new ApiError('Could not reach the server.', 'network'));
 
     const { getAuth } = await renderAuth();
-    await waitForStatus(getAuth, 'restoration-error');
+    // The initial cycle's one automatic retry is also transient before it
+    // reaches restoration-error - see "session restoration" describe
+    // block's test B for the dedicated version of this behavior.
+    await waitForStatus(getAuth, 'restoration-error', PAST_AUTOMATIC_RETRY_TIMEOUT_MS);
 
     mockedEndpoints.refreshToken.mockClear();
     const pending = deferred<TokenPair>();
@@ -388,7 +483,7 @@ describe('AuthContext - session generation guard (logout/login vs. stale refresh
 
     await waitForStatus(getAuth, 'authenticated');
     expect(mockedEndpoints.refreshToken).toHaveBeenCalledTimes(1); // still just one, even once settled
-  });
+  }, 10000);
 
   it('D: a refresh that becomes stale mid-write triggers a compare-and-clear, never leaving its token in SecureStore', async () => {
     const { getAuth, registeredHandler } = await renderAuthenticated();

@@ -18,6 +18,7 @@
       },
       "predictiveBackGestureEnabled": false,
       "package": "com.yurikfila.marketplacealert",
+      "versionCode": 1,
       "googleServicesFile": "./google-services.json"
     },
     "web": {

@@ -1,5 +1,6 @@
 import pytest
 
+from marketplace_alert.config import settings
 from marketplace_alert.connectors.bonanza.connector import BonanzaMarketplaceConnector
 from marketplace_alert.connectors.ebay.connector import EbayMarketplaceConnector
 from marketplace_alert.connectors.etsy.connector import EtsyMarketplaceConnector
@@ -76,3 +77,78 @@ def test_display_name_for_bonanza_is_brand_cased() -> None:
 
 def test_display_name_for_unknown_marketplace_falls_back_to_title_case() -> None:
     assert display_name_for("vinted") == "Vinted"
+
+
+# =====================================================================
+# Mock connector production gating - confirmed production bug: Mock (a
+# fake, hardcoded catalog) had no gating at all and was fully reachable
+# by a real deployment. Gated on `settings.environment`, the existing,
+# already-documented deployment-kind setting (never a heuristic derived
+# from an unrelated signal like `database_url`).
+# =====================================================================
+
+
+def test_mock_is_supported_in_the_default_development_environment() -> None:
+    """The Python-level default (`environment = "development"`, unset in
+    local/test environments) - confirms existing local dev/test usage of
+    Mock is completely unaffected by this gate."""
+    assert settings.environment == "development"
+    assert is_marketplace_supported("mock") is True
+    assert isinstance(get_connector("mock"), MockMarketplaceConnector)
+    assert "mock" in list_supported_marketplaces()
+
+
+def test_mock_is_not_supported_outside_development(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "environment", "production")
+
+    assert is_marketplace_supported("mock") is False
+
+
+def test_get_connector_raises_for_mock_outside_development(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "environment", "production")
+
+    with pytest.raises(UnsupportedMarketplaceError):
+        get_connector("mock")
+
+
+def test_list_supported_marketplaces_excludes_mock_outside_development(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "environment", "production")
+
+    marketplaces = list_supported_marketplaces()
+
+    assert "mock" not in marketplaces
+    # Every real connector must remain completely unaffected by this gate.
+    assert "etsy" in marketplaces
+    assert "ebay" in marketplaces
+    assert "reverb" in marketplaces
+    assert "bonanza" in marketplaces
+
+
+def test_real_connectors_remain_supported_outside_development(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "environment", "production")
+
+    assert is_marketplace_supported("etsy") is True
+    assert is_marketplace_supported("ebay") is True
+    assert is_marketplace_supported("reverb") is True
+    assert is_marketplace_supported("bonanza") is True
+    assert isinstance(get_connector("etsy"), EtsyMarketplaceConnector)
+
+
+def test_mock_gate_is_not_tied_to_database_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicitly proves the gate uses `environment`, not `database_url` -
+    a local/test-like environment with a real Postgres URl configured
+    (e.g. testing against a local Postgres) must still be able to use
+    Mock; only `environment` decides this."""
+    monkeypatch.setattr(settings, "database_url", "postgresql://user:pw@localhost/db")
+
+    assert settings.environment == "development"
+    assert is_marketplace_supported("mock") is True
+
+
+def test_mock_becomes_supported_again_once_environment_is_development(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gate is re-evaluated live, not cached from import time."""
+    monkeypatch.setattr(settings, "environment", "production")
+    assert is_marketplace_supported("mock") is False
+
+    monkeypatch.setattr(settings, "environment", "development")
+    assert is_marketplace_supported("mock") is True

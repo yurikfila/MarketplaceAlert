@@ -79,30 +79,62 @@ _CONNECTOR_FACTORIES: dict[str, Callable[[], MarketplaceConnector]] = {
 }
 
 
+def _mock_connector_allowed() -> bool:
+    """Mock is a fake, hardcoded 6-item catalog - built only as a stand-in
+    while real marketplace API access was pending (see its own module
+    docstring and PROJECT_CONTEXT.md), never intended to be reachable by a
+    real deployment. Gated on the existing, already-documented
+    `environment` setting (`ENVIRONMENT` env var, `.env.example`) rather
+    than any heuristic derived from an unrelated signal - this field
+    already exists specifically to describe what kind of deployment this
+    is, and until now was purely descriptive/log-only (see
+    `core/main.py`'s startup log line) - this is its first actual gating
+    use.
+
+    Deliberately re-evaluated on every call (not baked into
+    `_CONNECTOR_FACTORIES` once at import time) so this stays correct
+    even if `settings.environment` is read differently across a process's
+    lifetime (e.g. under test), and so a caller can't accidentally get a
+    stale answer from before configuration was fully loaded.
+    """
+    return settings.environment == "development"
+
+
 def is_marketplace_supported(marketplace_name: str) -> bool:
-    """Whether a connector is currently registered for this marketplace name."""
+    """Whether a connector is currently registered for this marketplace
+    name - and, for "mock" specifically, whether this deployment is even
+    allowed to use it at all (see `_mock_connector_allowed`'s own
+    docstring). This is the one function every other check in this
+    module, and every external caller (saved-search validation, the
+    mobile marketplaces API, the legacy dashboard), is built on top of -
+    fixing the mock-in-production gap here is what makes it apply
+    everywhere at once.
+    """
+    if marketplace_name == "mock" and not _mock_connector_allowed():
+        return False
     return marketplace_name in _CONNECTOR_FACTORIES
 
 
 def list_supported_marketplaces() -> list[str]:
-    """All marketplace names with a registered connector, sorted for stable display order.
+    """All marketplace names with a registered connector *and* actually
+    usable in this deployment, sorted for stable display order.
 
     The single source of truth for anything that needs to list marketplaces
     (e.g. the dashboard's marketplace dropdown) - never hard-code the name
     list anywhere else.
     """
-    return sorted(_CONNECTOR_FACTORIES)
+    return sorted(name for name in _CONNECTOR_FACTORIES if is_marketplace_supported(name))
 
 
 def get_connector(marketplace_name: str) -> MarketplaceConnector:
     """Return a fresh connector instance for the given marketplace name.
 
-    Raises UnsupportedMarketplaceError if no connector is registered.
+    Raises UnsupportedMarketplaceError if no connector is registered, or
+    if it's registered but not usable in this deployment (currently only
+    "mock", outside development - see `is_marketplace_supported`).
     """
-    try:
-        factory = _CONNECTOR_FACTORIES[marketplace_name]
-    except KeyError:
+    if not is_marketplace_supported(marketplace_name):
         raise UnsupportedMarketplaceError(
             f"No connector implementation registered for marketplace {marketplace_name!r}"
-        ) from None
-    return factory()
+        )
+    return _CONNECTOR_FACTORIES[marketplace_name]()

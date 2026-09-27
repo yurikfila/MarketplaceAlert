@@ -42,10 +42,85 @@ def _connector(**overrides) -> BonanzaMarketplaceConnector:
 
 
 def _response(items: list[dict] | None, ack: str = "Success") -> dict:
-    envelope: dict = {"ack": ack}
+    """Builds a response body in the REAL, verified shape (confirmed via
+    a live request, 2026-09-27): `ack` at the response's own top level,
+    and `item` directly under `findItemsByKeywordsResponse` - NOT nested
+    under a `searchResult` wrapper, which is what this connector
+    originally (and incorrectly) assumed. See connector.py's module
+    docstring "Verified against a real live response" section."""
+    envelope: dict = {}
     if items is not None:
-        envelope["searchResult"] = {"item": items}
-    return {"findItemsByKeywordsResponse": envelope}
+        envelope["item"] = items
+    return {"ack": ack, "findItemsByKeywordsResponse": envelope}
+
+
+def _real_shape_raw_listing(**overrides) -> dict:
+    """Mirrors the exact field set/nesting of a real live Bonapitit
+    `findItemsByKeywords` response item, captured 2026-09-27 (see
+    PROJECT_CONTEXT.md and connector.py's module docstring) - seller/store
+    identifiers and image/URL hostnames are sanitized placeholders, but
+    every field name, nesting level, and value TYPE is the genuine
+    verified shape: `sellingStatus.currentPrice` is a plain numeric
+    string (never the eBay-Finding-API value/attribute object originally
+    assumed), there is no currency field anywhere on the item, no
+    `country` key alongside `location`, no `condition` key at all, and a
+    real `descriptionBrief` field this connector did not previously map."""
+    base = {
+        "descriptionBrief": "A great guitar amplifier, barely used.",
+        "galleryURL": "https://images-bucket.example.com/afu/images/example/s-l1600_thumb155_crop.jpg",
+        "globalId": "BONANZLE",
+        "itemId": 1342281715,
+        "listingInfo": {
+            "bestOfferEnabled": "false",
+            "buyItNowPrice": "99.8",
+            "convertedBuyItNowPrice": "99.8",
+            "listingType": "FixedPrice",
+            "price": "99.8",
+            "startTime": "2022-09-20T09:24:13.000Z",
+            "lastChangeTime": "2023-03-30T23:30:51.000Z",
+        },
+        "location": "Canada",
+        "paymentMethod": ["PayPal"],
+        "postalCode": "n3t1g7",
+        "primaryCategory": {
+            "categoryId": 180009,
+            "categoryName": "Musical Instruments & Gear >> Guitars & Basses >> Parts & Accessories",
+            "categoryIdHierarchy": [3858, 619],
+        },
+        "sellerInfo": {
+            "feedbackRatingStar": "Green",
+            "positiveFeedbackPercent": "97.8",
+            "sellerUserName": "test-seller",
+            "availableForChat": "false",
+            "membershipLevel": None,
+            "userPicture": "https://images-bucket.example.com/user_profile_image/example.jpg",
+        },
+        "sellingStatus": {
+            "convertedCurrentPrice": "99.8",
+            "currentPrice": "99.8",
+            "sellingState": "Active",
+        },
+        "shippingInfo": {
+            "shippingServiceCost": 0,
+            "shippingType": "Free",
+            "shipToLocations": ["United States", "Canada", "United Kingdom", "Germany"],
+            "internationalShipping": [
+                {"region": "United States", "shippingType": "Free", "shippingServiceCost": 0},
+                {"region": "Canada", "shippingType": "Flat", "shippingServiceCost": "16.8"},
+            ],
+        },
+        "sku": None,
+        "storeInfo": {
+            "storeDiscount": None,
+            "storeItemCount": 2882,
+            "storeName": "test-seller's booth",
+            "storeURL": "https://www.bonanza.com/booths/test-seller",
+        },
+        "title": "Rowin WS-30 Wireless Guitar System Transmitters,Upgrades Portable Digital",
+        "viewItemURL": "https://www.bonanza.com/booths/test-seller/items/1342281715",
+    }
+    base.update(overrides)
+    return base
 
 
 # --- request construction --------------------------------------------------
@@ -222,8 +297,27 @@ def test_normalize_listing_handles_missing_optional_fields() -> None:
     assert listing.created_at is None
     assert listing.location is None
     assert listing.condition is None
-    # Not present on search results at all - never invented.
+    # This fixture has no `descriptionBrief` key - never invented.
     assert listing.description is None
+
+
+def test_normalize_listing_maps_the_verified_live_response_shape() -> None:
+    """Regression test for the real root cause found 2026-09-27 (see
+    connector.py's module docstring): this exact field set/nesting/typing
+    is what a real Bonapitit response actually looks like."""
+    listing = _connector().normalize_listing(_real_shape_raw_listing())
+
+    assert listing.external_listing_id == "1342281715"
+    assert listing.title == "Rowin WS-30 Wireless Guitar System Transmitters,Upgrades Portable Digital"
+    assert str(listing.listing_url) == "https://www.bonanza.com/booths/test-seller/items/1342281715"
+    assert listing.price == 99.8
+    assert listing.currency is None  # genuinely not present anywhere in the real response
+    assert listing.seller == "test-seller"
+    assert listing.location == "Canada"
+    assert listing.condition is None  # genuinely not present in the real response
+    assert str(listing.image_url) == "https://images-bucket.example.com/afu/images/example/s-l1600_thumb155_crop.jpg"
+    assert listing.created_at == datetime(2022, 9, 20, 9, 24, 13, tzinfo=timezone.utc)
+    assert listing.description == "A great guitar amplifier, barely used."
 
 
 def test_normalize_listing_preserves_unicode_content() -> None:
@@ -312,6 +406,71 @@ def test_ack_failure_on_first_page_raises(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_response_missing_envelope_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(200, json={}))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().search("Fender")
+
+
+def test_search_correctly_parses_the_real_response_envelope_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The actual root-cause regression test. A real live response nests
+    `ack` at the response's top level and `item` directly under
+    `findItemsByKeywordsResponse` - NOT under a `searchResult` wrapper,
+    which is what this connector incorrectly assumed until this fix
+    (sourced from Bonanza's own auto-converted docs page, never
+    byte-exact-confirmed before now - see module docstring). Before this
+    fix, `search()` silently returned `[]` for this exact real shape,
+    even though the real API had 6941 total matching entries."""
+    body = {
+        "ack": "Success",
+        "version": "1.1.2",
+        "timestamp": "2026-09-27T09:51:04.000Z",
+        "findItemsByKeywordsResponse": {
+            "paginationOutput": {"entriesPerPage": 1, "pageNumber": 1, "totalEntries": 6941},
+            "item": [_real_shape_raw_listing()],
+        },
+    }
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(200, json=body))
+
+    results = _connector(result_limit=1).search("guitar")
+
+    assert len(results) == 1
+    assert results[0].external_listing_id == "1342281715"
+
+
+def test_search_still_accepts_the_originally_assumed_searchresult_nested_shape_as_a_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defensive fallback only, never tried first anymore - see
+    `_extract_raw_listings`. Kept in case a differently-configured
+    account or a future response variant nests results this way."""
+    body = {"ack": "Success", "findItemsByKeywordsResponse": {"searchResult": {"item": [_raw_listing()]}}}
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(200, json=body))
+
+    results = _connector().search("Fender")
+
+    assert len(results) == 1
+    assert results[0].external_listing_id == "998877"
+
+
+def test_missing_item_key_with_unrecognized_ack_raises_not_silently_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing `item` key is only a legitimate zero-result search when
+    `ack` is a confirmed `"Success"` (see
+    test_missing_item_key_treated_as_zero_results). Any other/unrecognized
+    `ack` value combined with no `item` key at all is an unexpected
+    response shape and must raise - never be silently treated as a
+    zero-result search. This is the actual protection added for the real
+    bug found 2026-09-27, where a real, non-empty response was
+    misread as zero results with nothing logged to explain why."""
+    body = {"ack": "Warning", "findItemsByKeywordsResponse": {}}
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(200, json=body))
+    with pytest.raises(MarketplaceConnectorError):
+        _connector().search("Fender")
+
+
+def test_missing_item_key_with_no_ack_at_all_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = {"findItemsByKeywordsResponse": {}}
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(200, json=body))
     with pytest.raises(MarketplaceConnectorError):
         _connector().search("Fender")
 

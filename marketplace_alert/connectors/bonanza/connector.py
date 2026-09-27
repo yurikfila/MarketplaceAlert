@@ -37,17 +37,43 @@ fields that couldn't be pinned down with full confidence.
    publishes, not a guess, but the auto-converted doc page didn't
    preserve a byte-exact example response the way Reverb's docs did.
 
-**What is NOT independently confirmed** (same honest-uncertainty
-approach as the Reverb connector, see its module docstring): whether
-`sellingStatus.currentPrice` is a bare number or - matching a well-known
-quirk of eBay's own (XML-derived) Finding API, which Bonanza explicitly
-copied - a `{"__value__": ..., "@currencyId": ...}` value/attribute
-object; and whether a `condition` field is present at all for a given
-item. `normalize_listing` tries the historically-eBay-Finding-API-typical
-shape first, then a plain-number fallback, landing on `None` - never an
-invented value - if neither matches. A wrong guess about one field's
-exact shape only ever means that field is `null` for a listing, never
-fabricated data.
+**What was NOT independently confirmed before 2026-09-27** (same
+honest-uncertainty approach as the Reverb connector, see its module
+docstring): whether `sellingStatus.currentPrice` is a bare number or -
+matching a well-known quirk of eBay's own (XML-derived) Finding API,
+which Bonanza explicitly copied - a `{"__value__": ..., "@currencyId":
+...}` value/attribute object; whether a `condition` field is present at
+all for a given item; and, most importantly, whether the item list is
+really nested at `findItemsByKeywordsResponse.searchResult.item[]` as
+the auto-converted docs page implied. `normalize_listing` tries the
+historically-eBay-Finding-API-typical shape first, then a plain-number
+fallback, landing on `None` - never an invented value - if neither
+matches. A wrong guess about one field's exact shape only ever means
+that field is `null` for a listing, never fabricated data.
+
+**Verified against a real live response, 2026-09-27 - and two of the
+above guesses were wrong.** The first live `findItemsByKeywords` call
+(after the Bonapitit developer account became active) returned real
+listings, but this connector's `search()` still returned `[]` for it -
+a real production bug, not a hypothetical one. Root cause, confirmed
+directly from the saved raw response: (1) `ack` is a sibling of
+`findItemsByKeywordsResponse` at the response body's own top level, not
+nested inside it as `search()` assumed; (2) the item list lives directly
+at `findItemsByKeywordsResponse.item[]` - there is no `searchResult`
+wrapper at all in the real API. Both are fixed in `search()`/
+`_extract_raw_listings()` below (the `searchResult.item` shape is kept
+as a defensive fallback only, never tried first anymore). Also newly
+confirmed from that same response: `sellingStatus.currentPrice` was a
+plain numeric string with no currency field anywhere on the item
+(`currency` correctly lands on `None` for such a listing - never
+guessed); no `condition` key was present; no `country` key was present
+alongside `location`; and a real `descriptionBrief` field exists and is
+now mapped into `Listing.description` (previously hard-coded to `None`
+under the unverified assumption that no description is ever available
+from search results). Everything else in this docstring (wire protocol,
+parameter names, `itemId`/`title`/`viewItemURL`/`galleryURL`/
+`sellerInfo.sellerUserName`/`listingInfo.startTime`) matched the real
+response exactly, unchanged.
 
 Authentication: a single developer name (`BONANZA_DEV_NAME`, Bonanza's
 own `X-BONANZLE-API-DEV-NAME` header), obtained by registering a
@@ -147,6 +173,20 @@ class BonanzaMarketplaceConnector(MarketplaceConnector):
 
         while page_number <= MAX_PAGES and len(listings) < self._result_limit:
             body = self._fetch_results_page(query, page_number)
+
+            # Confirmed via a real live response (2026-09-27): `ack` is a
+            # sibling of `findItemsByKeywordsResponse`, at the response
+            # body's own top level - NOT nested inside it, as this code
+            # previously assumed. That earlier assumption meant a real
+            # `ack != "Success"` was never actually seen by this check at
+            # all (see below for why that mattered).
+            ack = body.get("ack")
+            if ack == "Failure":
+                if not listings:
+                    logger.error("Bonanza API reported ack=Failure")
+                    raise MarketplaceConnectorError("Bonanza API reported a failure for this search")
+                break
+
             envelope = body.get("findItemsByKeywordsResponse")
             if not isinstance(envelope, dict):
                 if not listings:
@@ -154,23 +194,32 @@ class BonanzaMarketplaceConnector(MarketplaceConnector):
                     raise MarketplaceConnectorError("Bonanza API returned a malformed response")
                 break
 
-            ack = envelope.get("ack")
-            if ack == "Failure":
-                if not listings:
-                    logger.error("Bonanza API reported ack=Failure")
-                    raise MarketplaceConnectorError("Bonanza API reported a failure for this search")
-                break
-
-            search_result = envelope.get("searchResult")
-            raw_listings = search_result.get("item") if isinstance(search_result, dict) else None
+            raw_listings = self._extract_raw_listings(envelope)
             if raw_listings is None:
-                # No matches at all - Bonanza (like eBay's Finding API it
-                # mirrors) may omit the `item` key entirely for a
-                # zero-result search rather than returning an empty list.
+                # Bonanza (like eBay's Finding API it mirrors) may omit
+                # the `item` key entirely for a zero-result search rather
+                # than returning an empty list - but that's only a safe
+                # assumption when `ack` is a *confirmed* "Success". This
+                # is the actual root-cause fix for a real bug: before it,
+                # ANY response reaching this point with no recognized
+                # item list silently became `[]`, regardless of what (or
+                # whether) `ack` said - which is exactly how a real,
+                # confirmed-live response silently returned zero results.
+                # An `ack` that is missing or anything other than
+                # "Success" combined with no item list at all is an
+                # unexpected response shape, not a legitimate empty
+                # search, and must not be swallowed the same way.
+                if ack != "Success":
+                    if not listings:
+                        logger.error(
+                            "Bonanza API response had no recognized item list and ack was %r (not 'Success')",
+                            ack,
+                        )
+                        raise MarketplaceConnectorError("Bonanza API returned an unexpected response shape")
                 break
             if not isinstance(raw_listings, list):
                 if not listings:
-                    logger.error("Bonanza API response's searchResult.item was not a list")
+                    logger.error("Bonanza API response's item list was not a list")
                     raise MarketplaceConnectorError("Bonanza API returned a malformed response")
                 break
 
@@ -232,6 +281,28 @@ class BonanzaMarketplaceConnector(MarketplaceConnector):
             logger.error("Bonanza API returned a non-JSON response")
             raise MarketplaceConnectorError("Bonanza API returned a malformed response") from None
 
+    @staticmethod
+    def _extract_raw_listings(envelope: dict[str, Any]) -> Any:
+        """Where the item list actually lives. Confirmed via a real live
+        response (2026-09-27, see PROJECT_CONTEXT.md): directly under the
+        envelope (`findItemsByKeywordsResponse.item`) - NOT nested one
+        level deeper under `searchResult`, as Bonanza's own auto-converted
+        API reference page had suggested and this connector originally
+        assumed (see this module's docstring - that assumption was never
+        byte-exact-confirmed until now, and was wrong; it's what caused a
+        real, live, non-empty search to silently return `[]`). The
+        originally-assumed `searchResult.item` shape is kept as a
+        defensive fallback only, never tried first anymore, in case a
+        differently-configured account or a future response variant
+        nests results that way.
+        """
+        if "item" in envelope:
+            return envelope.get("item")
+        search_result = envelope.get("searchResult")
+        if isinstance(search_result, dict):
+            return search_result.get("item")
+        return None
+
     def normalize_listing(self, raw_listing: dict[str, Any]) -> Listing:
         price, currency = self._parse_price(raw_listing.get("sellingStatus"))
 
@@ -239,7 +310,12 @@ class BonanzaMarketplaceConnector(MarketplaceConnector):
             marketplace=self.marketplace_name,
             external_listing_id=str(raw_listing["itemId"]),
             title=raw_listing["title"],
-            description=None,  # not present on search results - only on a single-item fetch
+            # Confirmed present in a real live response (2026-09-27) as
+            # `descriptionBrief` - this connector's original assumption
+            # that no description is ever available from search results
+            # was wrong; it had never actually been checked against a
+            # live response until now.
+            description=raw_listing.get("descriptionBrief"),
             price=price,
             currency=currency,
             location=self._parse_location(raw_listing),

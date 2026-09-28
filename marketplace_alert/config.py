@@ -226,6 +226,20 @@ class Settings(BaseSettings):
     # safety cap - see connectors/bonanza/connector.py).
     bonanza_result_limit: int = 25
 
+    # Tradera REST API v4 (Sweden's largest general marketplace) - two
+    # static app-level credentials (Tradera's own X-App-Id/X-App-Key
+    # headers), not an OAuth flow. Optional - if either is unset, the
+    # Tradera connector reports a clear configuration error when actually
+    # used, but the app still starts normally and other connectors are
+    # unaffected. Never hard-code real values here.
+    tradera_app_id: str | None = None
+    tradera_app_key: str | None = None
+
+    # Safe, configurable result limit for Tradera searches - this
+    # connector fetches a single page (the basic search endpoint has no
+    # documented page-size parameter - see connectors/tradera/connector.py).
+    tradera_result_limit: int = 25
+
     # Historical listing metadata backfill
     # (core/persistence/backfill.py, scripts/backfill_listing_metadata.py) -
     # re-fetches individual pre-existing listings from their source

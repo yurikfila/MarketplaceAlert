@@ -21,6 +21,7 @@ const MARKETPLACE_DISPLAY_NAMES: Record<string, string> = {
   mock: 'Mock',
   reverb: 'Reverb',
   bonanza: 'Bonanza',
+  tradera: 'Tradera',
 };
 
 function titleCase(value: string): string {

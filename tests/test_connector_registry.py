@@ -6,6 +6,7 @@ from marketplace_alert.connectors.ebay.connector import EbayMarketplaceConnector
 from marketplace_alert.connectors.etsy.connector import EtsyMarketplaceConnector
 from marketplace_alert.connectors.mock.connector import MockMarketplaceConnector
 from marketplace_alert.connectors.reverb.connector import ReverbMarketplaceConnector
+from marketplace_alert.connectors.tradera.connector import TraderaMarketplaceConnector
 from marketplace_alert.connectors.registry import (
     UnsupportedMarketplaceError,
     display_name_for,
@@ -44,6 +45,12 @@ def test_get_connector_returns_bonanza_connector_for_bonanza() -> None:
     assert connector.marketplace_name == "bonanza"
 
 
+def test_get_connector_returns_tradera_connector_for_tradera() -> None:
+    connector = get_connector("tradera")
+    assert isinstance(connector, TraderaMarketplaceConnector)
+    assert connector.marketplace_name == "tradera"
+
+
 def test_get_connector_raises_for_unregistered_marketplace() -> None:
     with pytest.raises(UnsupportedMarketplaceError):
         get_connector("vinted")
@@ -55,6 +62,7 @@ def test_is_marketplace_supported_true_for_all_registered_marketplaces() -> None
     assert is_marketplace_supported("ebay") is True
     assert is_marketplace_supported("reverb") is True
     assert is_marketplace_supported("bonanza") is True
+    assert is_marketplace_supported("tradera") is True
 
 
 def test_is_marketplace_supported_false_for_not_yet_implemented_marketplaces() -> None:
@@ -65,6 +73,7 @@ def test_is_marketplace_supported_false_for_not_yet_implemented_marketplaces() -
 def test_list_supported_marketplaces_includes_reverb_and_bonanza() -> None:
     assert "reverb" in list_supported_marketplaces()
     assert "bonanza" in list_supported_marketplaces()
+    assert "tradera" in list_supported_marketplaces()
 
 
 def test_display_name_for_reverb_is_brand_cased() -> None:
@@ -73,6 +82,10 @@ def test_display_name_for_reverb_is_brand_cased() -> None:
 
 def test_display_name_for_bonanza_is_brand_cased() -> None:
     assert display_name_for("bonanza") == "Bonanza"
+
+
+def test_display_name_for_tradera_is_brand_cased() -> None:
+    assert display_name_for("tradera") == "Tradera"
 
 
 def test_display_name_for_unknown_marketplace_falls_back_to_title_case() -> None:
@@ -122,6 +135,7 @@ def test_list_supported_marketplaces_excludes_mock_outside_development(monkeypat
     assert "ebay" in marketplaces
     assert "reverb" in marketplaces
     assert "bonanza" in marketplaces
+    assert "tradera" in marketplaces
 
 
 def test_real_connectors_remain_supported_outside_development(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -131,6 +145,7 @@ def test_real_connectors_remain_supported_outside_development(monkeypatch: pytes
     assert is_marketplace_supported("ebay") is True
     assert is_marketplace_supported("reverb") is True
     assert is_marketplace_supported("bonanza") is True
+    assert is_marketplace_supported("tradera") is True
     assert isinstance(get_connector("etsy"), EtsyMarketplaceConnector)
 
 

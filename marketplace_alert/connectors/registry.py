@@ -23,6 +23,7 @@ from marketplace_alert.connectors.ebay.connector import EbayMarketplaceConnector
 from marketplace_alert.connectors.etsy.connector import EtsyMarketplaceConnector
 from marketplace_alert.connectors.mock.connector import MockMarketplaceConnector
 from marketplace_alert.connectors.reverb.connector import ReverbMarketplaceConnector
+from marketplace_alert.connectors.tradera.connector import TraderaMarketplaceConnector
 from marketplace_alert.core.connectors.base import MarketplaceConnector
 
 
@@ -45,6 +46,7 @@ _DISPLAY_NAMES: dict[str, str] = {
     "mock": "Mock",
     "reverb": "Reverb",
     "bonanza": "Bonanza",
+    "tradera": "Tradera",
 }
 
 
@@ -75,6 +77,11 @@ _CONNECTOR_FACTORIES: dict[str, Callable[[], MarketplaceConnector]] = {
     "bonanza": lambda: BonanzaMarketplaceConnector(
         dev_name=settings.bonanza_dev_name,
         result_limit=settings.bonanza_result_limit,
+    ),
+    "tradera": lambda: TraderaMarketplaceConnector(
+        app_id=settings.tradera_app_id,
+        app_key=settings.tradera_app_key,
+        result_limit=settings.tradera_result_limit,
     ),
 }
 

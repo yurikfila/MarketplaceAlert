@@ -22,6 +22,7 @@ from marketplace_alert.api.v1 import (
     listings,
     marketplaces,
     notification_preferences,
+    rakuten_diagnostic,
     saved_searches,
     status,
 )
@@ -35,3 +36,6 @@ router.include_router(auth.router)
 router.include_router(notification_preferences.router)
 router.include_router(admin.router)
 router.include_router(devices.router)
+# TEMPORARY - see rakuten_diagnostic.py's own module docstring for exactly
+# what this is and how to remove it once no longer needed.
+router.include_router(rakuten_diagnostic.router)

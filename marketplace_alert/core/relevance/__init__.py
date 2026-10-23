@@ -17,12 +17,14 @@ places (and only two) that ever turn connector results into persisted/
 notified listings.
 """
 
+from marketplace_alert.core.relevance.engine_v2 import evaluate_relevance_v2
 from marketplace_alert.core.relevance.evaluator import evaluate_relevance
 from marketplace_alert.core.relevance.models import RelevanceEvaluation, RelevanceFilterResult
 from marketplace_alert.core.relevance.service import filter_relevant_listings
 
 __all__ = [
     "evaluate_relevance",
+    "evaluate_relevance_v2",
     "filter_relevant_listings",
     "RelevanceEvaluation",
     "RelevanceFilterResult",

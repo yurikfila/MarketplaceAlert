@@ -5,7 +5,7 @@ existing convention of using dataclasses for internal result shapes (e.g.
 for the normalized `Listing` model and API schemas.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from marketplace_alert.core.models.listing import Listing
 
@@ -18,6 +18,11 @@ class RelevanceEvaluation:
     score: int
     matched_terms: list[str]
     rejected_reason: str | None = None
+    # Added for the v2 engine (the legacy engine leaves these empty): the score
+    # components, e.g. {"product": 70, "brand": 15, "accessory": -50}, and the
+    # query terms that were not found - both machine-readable explanations.
+    breakdown: dict[str, int] = field(default_factory=dict)
+    missing_terms: tuple[str, ...] = ()
 
 
 @dataclass

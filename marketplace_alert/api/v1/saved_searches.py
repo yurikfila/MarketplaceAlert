@@ -18,9 +18,12 @@ from sqlalchemy.orm import Session
 from marketplace_alert.api.v1.schemas import (
     MarketplaceRunOutcome,
     SavedSearchCreate,
+    SavedSearchDuplicateCheckRequest,
+    SavedSearchDuplicateCheckResponse,
     SavedSearchRead,
     SavedSearchRunResult,
     SavedSearchUpdate,
+    SimilarSavedSearchOut,
 )
 from marketplace_alert.connectors.registry import get_connector
 from marketplace_alert.core.auth.dependencies import get_current_user
@@ -52,6 +55,43 @@ def create_saved_search(
     except UnsupportedMarketplaceError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
     return SavedSearchRead.model_validate(saved_search)
+
+
+@router.post(
+    "/check-duplicates",
+    summary="Check a proposed search against my existing ones",
+    description=(
+        "Advisory only - creates and changes nothing, and creation is never blocked by it. "
+        "Reports which of the caller's own saved searches overlap the proposed query and "
+        "marketplace selection (identical, same query on overlapping marketplaces, an existing "
+        "broader search, or a narrower one), plus query warnings such as `brand_only_query` "
+        "(an intentionally broad search is allowed). Pass `exclude_saved_search_id` when editing."
+    ),
+)
+def check_saved_search_duplicates(
+    data: SavedSearchDuplicateCheckRequest,
+    current_user: User = Depends(get_current_user),
+    service: SavedSearchService = Depends(get_saved_search_service),
+) -> SavedSearchDuplicateCheckResponse:
+    result = service.check_duplicates_owned(
+        user_id=current_user.id,
+        query=data.query,
+        marketplaces=data.marketplaces,
+        exclude_saved_search_id=data.exclude_saved_search_id,
+    )
+    return SavedSearchDuplicateCheckResponse(
+        similar=[
+            SimilarSavedSearchOut(
+                saved_search_id=item.saved_search_id,
+                query=item.query,
+                marketplaces=item.marketplaces,
+                is_active=item.is_active,
+                relationship=item.relationship,
+            )
+            for item in result.similar
+        ],
+        warnings=result.warnings,
+    )
 
 
 @router.get("", summary="List saved searches")

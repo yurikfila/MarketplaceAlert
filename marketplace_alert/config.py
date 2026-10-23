@@ -131,6 +131,21 @@ class Settings(BaseSettings):
     # real-world failure characteristics ever diverge.
     push_notification_max_attempts: int = 10
 
+    # Which relevance engine decides whether a marketplace result matches a
+    # saved search (`core/relevance/service.py`): "legacy" (the original
+    # dictionary-based evaluator - the default, so deploying this code
+    # changes nothing), "v2" (the general lexical engine,
+    # `core/relevance/engine_v2.py`), or "shadow" (decide with legacy, but
+    # also run v2 and log where they disagree - ids and verdict codes only,
+    # never the query - to measure v2 on real traffic before switching).
+    # Any other value is treated as "legacy". `relevance_min_score` is v2's
+    # accept threshold (0-100); the legacy engine's threshold is unchanged.
+    relevance_engine: str = "legacy"
+    relevance_min_score: int = 55
+    # Shadow mode logs one summary line per saved search x marketplace per scan,
+    # plus at most this many per-listing detail lines in that same call.
+    relevance_shadow_max_detail_logs: int = 3
+
     # How often the background scanner checks for due saved searches
     # (polling granularity, not a per-search interval - see
     # core/saved_searches/schemas.py for the per-search minimum).

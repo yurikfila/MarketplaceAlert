@@ -8,10 +8,12 @@ in. See ARCHITECTURE.md.
 """
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
 from marketplace_alert.core.connectors.base import MarketplaceConnector
+from marketplace_alert.core.saved_searches.duplicates import fingerprint, query_warnings, relationship
 from marketplace_alert.core.saved_searches.models import SavedSearch
 from marketplace_alert.core.saved_searches.repository import SavedSearchRepository
 from marketplace_alert.core.saved_searches.runner import SavedSearchRunResult, SavedSearchRunner
@@ -20,6 +22,23 @@ from marketplace_alert.core.saved_searches.schemas import SavedSearchCreate, Sav
 
 class UnsupportedMarketplaceError(ValueError):
     """Raised when a saved search names one or more marketplaces with no registered connector."""
+
+
+@dataclass(frozen=True)
+class SimilarSavedSearch:
+    """An existing search of the same user that overlaps a proposed one."""
+
+    saved_search_id: int
+    query: str
+    marketplaces: list[str]
+    is_active: bool
+    relationship: str
+
+
+@dataclass(frozen=True)
+class DuplicateCheck:
+    similar: list[SimilarSavedSearch]
+    warnings: list[str]
 
 
 class SavedSearchService:
@@ -98,6 +117,40 @@ class SavedSearchService:
             scan_interval_seconds=data.scan_interval_seconds,
             is_active=data.is_active,
         )
+
+    def check_duplicates_owned(
+        self,
+        *,
+        user_id: int,
+        query: str,
+        marketplaces: list[str],
+        exclude_saved_search_id: int | None = None,
+    ) -> DuplicateCheck:
+        """Advisory only: how a proposed (or edited) search overlaps this
+        user's existing ones. Never writes anything, never looks at another
+        user's searches. `exclude_saved_search_id` is the search being
+        edited, so it does not report itself."""
+        proposed = fingerprint(query)
+        proposed_marketplaces = frozenset(marketplaces)
+        similar: list[SimilarSavedSearch] = []
+        for existing in self._repository.list_owned(user_id=user_id):
+            if existing.id == exclude_saved_search_id:
+                continue
+            existing_marketplaces = list(existing.marketplaces)
+            kind = relationship(
+                proposed, proposed_marketplaces, fingerprint(existing.query), frozenset(existing_marketplaces)
+            )
+            if kind is not None:
+                similar.append(
+                    SimilarSavedSearch(
+                        saved_search_id=existing.id,
+                        query=existing.query,
+                        marketplaces=existing_marketplaces,
+                        is_active=existing.is_active,
+                        relationship=kind,
+                    )
+                )
+        return DuplicateCheck(similar=similar, warnings=query_warnings(query))
 
     def delete_owned(self, saved_search_id: int, *, user_id: int) -> bool:
         return self._repository.delete_owned(saved_search_id, user_id=user_id)

@@ -42,6 +42,9 @@ __all__ = [
     "MarketplaceInfo",
     "MarketplaceRunOutcome",
     "SavedSearchRunResult",
+    "SavedSearchDuplicateCheckRequest",
+    "SimilarSavedSearchOut",
+    "SavedSearchDuplicateCheckResponse",
     "ListingOut",
     "ListingListResponse",
     "SignupRequest",
@@ -114,6 +117,42 @@ class SavedSearchRunResult(BaseModel):
     marketplaces: dict[str, MarketplaceRunOutcome]
     total_new_count: int
     total_already_seen_count: int
+
+
+class SavedSearchDuplicateCheckRequest(BaseModel):
+    """`POST /api/v1/saved-searches/check-duplicates` request - a proposed
+    (or edited) search, checked against the caller's own existing ones.
+    Advisory only; nothing is created or changed."""
+
+    query: str
+    marketplaces: list[str] = Field(min_length=1)
+    # The search being edited, so it is not reported as its own duplicate.
+    exclude_saved_search_id: int | None = None
+
+    @field_validator("query")
+    @classmethod
+    def query_must_not_be_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("query cannot be empty")
+        return stripped
+
+
+class SimilarSavedSearchOut(BaseModel):
+    saved_search_id: int
+    query: str
+    marketplaces: list[str]
+    is_active: bool
+    # identical | same_query_overlapping_marketplaces |
+    # covered_by_broader_search | covers_narrower_search
+    relationship: str
+
+
+class SavedSearchDuplicateCheckResponse(BaseModel):
+    similar: list[SimilarSavedSearchOut]
+    # Machine-readable query warnings: brand_only_query (broad but allowed),
+    # no_searchable_terms.
+    warnings: list[str]
 
 
 class ListingOut(BaseModel):

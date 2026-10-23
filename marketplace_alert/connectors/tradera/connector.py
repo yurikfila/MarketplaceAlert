@@ -96,6 +96,7 @@ base class's default, which raises `ListingLookupNotSupportedError`.
 """
 
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -119,6 +120,24 @@ _DEFAULT_CURRENCY = "SEK"
 # this many normalized listings from it.
 DEFAULT_RESULT_LIMIT = 25
 MAX_RESULT_LIMIT = 100
+
+
+_ERROR_CODE_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def _safe_error_codes(errors: list[Any]) -> list[str]:
+    """The short machine-readable `code` of each API error, and nothing else.
+
+    A code is only kept if it looks like an identifier (e.g. "InvalidQuery");
+    a free-text `message` - which may echo the user's search keyword - is
+    never read, and a `code` that is not identifier-shaped is dropped.
+    """
+    codes: list[str] = []
+    for error in errors:
+        code = error.get("code") if isinstance(error, dict) else None
+        if isinstance(code, str) and _ERROR_CODE_PATTERN.fullmatch(code):
+            codes.append(code)
+    return codes
 
 
 class TraderaMarketplaceConnector(MarketplaceConnector):
@@ -165,7 +184,13 @@ class TraderaMarketplaceConnector(MarketplaceConnector):
         # HTTP 200 - see module docstring.
         errors = body.get("errors")
         if isinstance(errors, list) and errors:
-            logger.error("Tradera API reported errors for this search: %r", errors)
+            # Never log the raw `errors` array: Tradera's error messages may
+            # echo the search keyword back. Count and short error codes only.
+            logger.error(
+                "Tradera API reported %d error(s) for this search (codes=%s)",
+                len(errors),
+                _safe_error_codes(errors),
+            )
             raise MarketplaceConnectorError("Tradera API reported a failure for this search")
 
         items = body.get("items")

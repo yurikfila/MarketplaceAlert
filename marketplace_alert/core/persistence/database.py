@@ -88,7 +88,11 @@ def create_db_engine(database_url: str) -> Engine:
     ``database_url`` - it may contain a real password.
     """
     connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
-    return create_engine(database_url, connect_args=connect_args, pool_pre_ping=True)
+    # hide_parameters=True: a failed statement's SQLAlchemy exception message
+    # normally ends with "[parameters: (...)]", i.e. the bound values - for an
+    # insert/update of a saved search that is the user's search keyword, and any
+    # traceback (ours or uvicorn's) would log it. This only changes error text.
+    return create_engine(database_url, connect_args=connect_args, pool_pre_ping=True, hide_parameters=True)
 
 
 engine = create_db_engine(resolve_database_url(settings.database_url))

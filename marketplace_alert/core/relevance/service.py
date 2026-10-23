@@ -32,12 +32,13 @@ def filter_relevant_listings(
             relevant.append(listing)
             continue
         rejected_count += 1
+        # The saved search is identified by id only - never log `query`: it is
+        # user-entered text (see tests/test_log_privacy.py).
         logger.info(
-            "Relevance: rejected %s listing %s for saved search %s (query=%r): score=%d reason=%s",
+            "Relevance: rejected %s listing %s for saved search %s: score=%d reason=%s",
             marketplace,
             listing.external_listing_id,
             saved_search_id if saved_search_id is not None else "-",
-            query,
             evaluation.score,
             evaluation.rejected_reason,
         )

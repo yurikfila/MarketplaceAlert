@@ -101,7 +101,10 @@ class EbayMarketplaceConnector(MarketplaceConnector):
         return self._token_manager.is_configured
 
     def search(self, query: str, filters: dict[str, Any] | None = None) -> list[Listing]:
-        logger.info("eBay search started (query=%r)", query)
+        # Never log `query`: a saved-search keyword is user-entered text (see
+        # tests/test_log_privacy.py). Nothing else is needed to follow a scan -
+        # the runner already logs the saved-search id and marketplace.
+        logger.info("eBay search started")
         body = self._fetch_results_page(query, offset=0)
 
         if "itemSummaries" not in body:

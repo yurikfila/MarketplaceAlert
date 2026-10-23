@@ -846,8 +846,11 @@ def test_filter_relevant_listings_logs_required_fields_without_leaking_full_list
 
     assert len(caplog.records) == 1
     message = caplog.records[0].getMessage()
-    for expected in ("42", "Makita drill", "mock", "rej-1", "accessory_without_core_product_match"):
+    for expected in ("42", "mock", "rej-1", "accessory_without_core_product_match"):
         assert expected in message
+    # The saved search is identified by id only - its keyword is user-entered
+    # text and must never be logged (see tests/test_log_privacy.py).
+    assert "Makita drill" not in message
 
 
 def test_filter_relevant_listings_does_not_log_for_accepted_listings(caplog: pytest.LogCaptureFixture) -> None:

@@ -8,6 +8,25 @@ import json
 import logging
 import sys
 from datetime import datetime, timezone
+from types import TracebackType
+
+
+def exception_summary(exc: BaseException) -> str:
+    """A log-safe description of an exception: its type and where it was raised.
+
+    Deliberately never includes ``str(exc)``/``repr(exc)`` or a traceback's
+    exception line: an arbitrary exception's message can contain anything the
+    failing code was handling - including a saved-search keyword (e.g. a URL
+    with ``?query=...`` in an HTTP-library error). Use this instead of
+    ``logger.exception(...)`` wherever user-entered text may be in scope.
+    """
+    frame: TracebackType | None = exc.__traceback__
+    location = "unknown location"
+    while frame is not None:
+        code = frame.tb_frame.f_code
+        location = f"{code.co_filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{frame.tb_lineno} in {code.co_name}"
+        frame = frame.tb_next
+    return f"{type(exc).__name__} at {location}"
 
 
 class JSONFormatter(logging.Formatter):
@@ -37,3 +56,7 @@ def configure_logging(level: str = "INFO") -> None:
     # bot token (https://api.telegram.org/bot<TOKEN>/...) - never let that
     # reach our logs regardless of the configured app log level.
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    # Same reasoning for the transport layer underneath it: at DEBUG it traces
+    # per-request details, and connector requests carry the user's search
+    # keyword as a query parameter - keep it out even when LOG_LEVEL=DEBUG.
+    logging.getLogger("httpcore").setLevel(logging.WARNING)

@@ -17,7 +17,9 @@ class MarketplaceConnectorError(Exception):
 
     Covers configuration problems (missing credentials) as well as runtime
     failures (network error, timeout, non-2xx response, malformed body).
-    Messages must never include credentials - they may end up in logs.
+    Messages must never include credentials, nor the user's search keyword
+    (``query``) or anything echoed back from the marketplace's response -
+    they end up in logs (see ``tests/test_log_privacy.py``).
     """
 
 

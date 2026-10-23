@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from sqlalchemy.orm import Session
 
 from marketplace_alert.core.connectors.base import MarketplaceConnector, MarketplaceConnectorError
+from marketplace_alert.core.logging_config import exception_summary
 from marketplace_alert.core.persistence.notification_outbox import NotificationOutboxRepository
 from marketplace_alert.core.persistence.service import ListingDiscoveryService
 from marketplace_alert.core.relevance import filter_relevant_listings
@@ -122,9 +123,16 @@ class SavedSearchRunner:
                 "Saved search %s / %s failed: %s", saved_search.id, marketplace, exc
             )
             return MarketplaceRunResult(marketplace=marketplace, error=str(exc))
-        except Exception:
-            logger.exception(
-                "Saved search %s / %s failed unexpectedly", saved_search.id, marketplace
+        except Exception as exc:
+            # Not `logger.exception(...)`: an unexpected exception's message
+            # can contain the saved-search keyword (e.g. an HTTP-library error
+            # quoting a `?query=...` URL), and a traceback would log it. Type
+            # and location keep this diagnosable (see tests/test_log_privacy.py).
+            logger.error(
+                "Saved search %s / %s failed unexpectedly (%s)",
+                saved_search.id,
+                marketplace,
+                exception_summary(exc),
             )
             return MarketplaceRunResult(marketplace=marketplace, error="An unexpected error occurred")
 

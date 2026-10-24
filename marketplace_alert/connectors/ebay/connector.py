@@ -53,7 +53,7 @@ from urllib.parse import quote
 import httpx
 from pydantic import ValidationError
 
-from marketplace_alert.connectors.ebay.token_manager import EbayTokenManager
+from marketplace_alert.connectors.ebay.token_manager import EbayTokenManager, get_shared_token_manager
 from marketplace_alert.core.connectors.base import MarketplaceAuthError, MarketplaceConnector, MarketplaceConnectorError
 from marketplace_alert.core.connectors.retry import request_with_retry
 from marketplace_alert.core.models.listing import Listing
@@ -87,8 +87,12 @@ class EbayMarketplaceConnector(MarketplaceConnector):
         cert_id: str | None,
         timeout: float = 10.0,
         result_limit: int = DEFAULT_RESULT_LIMIT,
+        token_manager: EbayTokenManager | None = None,
     ) -> None:
-        self._token_manager = EbayTokenManager(app_id=app_id, cert_id=cert_id, timeout=timeout)
+        # A connector is built per search (`registry.get_connector`), so the token
+        # manager is shared per credentials instead of owned: one OAuth token is
+        # fetched and reused until it nears expiry. Tests may inject their own.
+        self._token_manager = token_manager or get_shared_token_manager(app_id, cert_id, timeout)
         self._timeout = timeout
         self._result_limit = max(1, min(result_limit, MAX_RESULT_LIMIT))
 

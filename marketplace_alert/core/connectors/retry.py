@@ -25,6 +25,8 @@ from collections.abc import Callable
 
 import httpx
 
+from marketplace_alert.core.connectors.metrics import record_request
+
 logger = logging.getLogger(__name__)
 
 RETRIABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
@@ -54,7 +56,12 @@ def request_with_retry(
     total_attempts = max(0, max_retries) + 1
     response: httpx.Response | None = None
     for attempt in range(1, total_attempts + 1):
-        response = make_request()
+        try:
+            response = make_request()
+        except Exception:
+            record_request(marketplace_name, None)  # a transport failure is still an attempt
+            raise
+        record_request(marketplace_name, response.status_code)
         if response.status_code not in RETRIABLE_STATUS_CODES:
             return response
         if attempt >= total_attempts:

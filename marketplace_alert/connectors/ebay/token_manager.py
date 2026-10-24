@@ -25,12 +25,14 @@ token yet, or the cached one is about to expire) - never once per search.
 
 import base64
 import logging
+import threading
 import time
 from typing import Any
 
 import httpx
 
 from marketplace_alert.core.connectors.base import MarketplaceConnectorError
+from marketplace_alert.core.connectors.metrics import OAUTH_LABEL, record_request
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,10 @@ class EbayTokenManager:
         self._timeout = timeout
         self._access_token: str | None = None
         self._expires_at: float = 0.0
+        # One manager is now shared by every eBay connector in the process (see
+        # `get_shared_token_manager`), possibly across threads (the in-process
+        # scanner and web requests), so refresh/invalidate must not interleave.
+        self._lock = threading.RLock()
 
     @property
     def is_configured(self) -> bool:
@@ -69,10 +75,11 @@ class EbayTokenManager:
             raise MarketplaceConnectorError(
                 "eBay connector is not configured: EBAY_APP_ID and/or EBAY_CERT_ID are not set"
             )
-        if self._access_token is None or time.monotonic() >= self._expires_at:
-            self._refresh()
-        assert self._access_token is not None  # _refresh() always sets it or raises
-        return self._access_token
+        with self._lock:
+            if self._access_token is None or time.monotonic() >= self._expires_at:
+                self._refresh()
+            assert self._access_token is not None  # _refresh() always sets it or raises
+            return self._access_token
 
     def invalidate(self) -> None:
         """Drop the cached token, forcing a fresh one on the next `get_token()` call.
@@ -80,8 +87,9 @@ class EbayTokenManager:
         Used after a search request comes back 401/403, in case the cached
         token was revoked or otherwise went bad before its tracked expiry.
         """
-        self._access_token = None
-        self._expires_at = 0.0
+        with self._lock:
+            self._access_token = None
+            self._expires_at = 0.0
 
     def _refresh(self) -> None:
         credentials = base64.b64encode(f"{self._app_id}:{self._cert_id}".encode()).decode()
@@ -94,8 +102,10 @@ class EbayTokenManager:
         try:
             response = httpx.post(_TOKEN_URL, headers=headers, data=data, timeout=self._timeout)
         except httpx.HTTPError as exc:
+            record_request(OAUTH_LABEL, None)
             logger.error("eBay OAuth token request failed (%s)", type(exc).__name__)
             raise MarketplaceConnectorError("eBay OAuth token request failed") from None
+        record_request(OAUTH_LABEL, response.status_code)
 
         if response.status_code != 200:
             logger.error("eBay OAuth token request returned HTTP %s", response.status_code)
@@ -118,3 +128,34 @@ class EbayTokenManager:
         self._access_token = access_token
         self._expires_at = time.monotonic() + expires_in - _EXPIRY_SAFETY_MARGIN_SECONDS
         logger.info("eBay OAuth application access token acquired (expires_in=%s seconds)", expires_in)
+
+
+_shared_managers: dict[tuple[str, str, float], EbayTokenManager] = {}
+_shared_managers_lock = threading.Lock()
+
+
+def get_shared_token_manager(app_id: str | None, cert_id: str | None, timeout: float = 10.0) -> EbayTokenManager:
+    """The process-wide token manager for exactly these credentials.
+
+    `registry.get_connector` builds a fresh connector for every search, and each used to
+    own a private `EbayTokenManager` - so every single eBay search first requested a brand
+    new OAuth token. Connectors now share one manager per (app id, cert id, timeout), so a
+    token is fetched once and reused until it is within the safety margin of expiring.
+    Different credentials never share a manager (and therefore never share a token).
+    Unconfigured credentials get an unshared manager that never makes a request.
+    """
+    if not app_id or not cert_id:
+        return EbayTokenManager(app_id=app_id, cert_id=cert_id, timeout=timeout)
+    key = (app_id, cert_id, timeout)
+    with _shared_managers_lock:
+        manager = _shared_managers.get(key)
+        if manager is None:
+            manager = EbayTokenManager(app_id=app_id, cert_id=cert_id, timeout=timeout)
+            _shared_managers[key] = manager
+        return manager
+
+
+def reset_shared_token_managers() -> None:
+    """Forget every shared manager (and its cached token). For tests and credential rotation."""
+    with _shared_managers_lock:
+        _shared_managers.clear()

@@ -116,6 +116,17 @@ class FakePasswordResetEmailSender:
             raise self.error
 
 
+@pytest.fixture(autouse=True)
+def _fresh_ebay_token_managers() -> Iterator[None]:
+    """eBay connectors now share one token manager per credentials for the whole process; a
+    token cached by one test (with fake credentials) must never leak into another."""
+    from marketplace_alert.connectors.ebay.token_manager import reset_shared_token_managers
+
+    reset_shared_token_managers()
+    yield
+    reset_shared_token_managers()
+
+
 @pytest.fixture()
 def db_engine(tmp_path) -> Iterator[Engine]:
     """An isolated SQLite engine backed by a temp file, with tables created."""

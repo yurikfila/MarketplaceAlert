@@ -159,6 +159,13 @@ class Settings(BaseSettings):
     # interval. In-process scanning is unaffected (it always uses 0).
     scan_due_grace_seconds: float = 30.0
 
+    # When on, saved searches that are due in the same scanner pass and ask the same
+    # marketplace for the exact same query text share one marketplace request; every
+    # search is still processed (relevance, attribution, dedup, notifications) on its
+    # own. Off by default: scanning behaves exactly as before. See
+    # `core/saved_searches/coalescing.py`.
+    scan_coalescing_enabled: bool = False
+
     # Whether the Web Service process runs the saved-search scanner
     # in-process (a background thread, started in `main.py`'s `lifespan`)
     # or leaves scanning entirely to an external trigger (a Render Cron

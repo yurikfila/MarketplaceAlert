@@ -42,6 +42,7 @@ from marketplace_alert.core.logging_config import exception_summary
 from marketplace_alert.core.persistence.notification_outbox import NotificationOutboxRepository
 from marketplace_alert.core.persistence.service import ListingDiscoveryService
 from marketplace_alert.core.relevance import filter_relevant_listings
+from marketplace_alert.core.saved_searches.coalescing import ScanFetchCache
 from marketplace_alert.core.saved_searches.models import SavedSearch
 from marketplace_alert.core.saved_searches.repository import SavedSearchRepository
 
@@ -93,7 +94,11 @@ class SavedSearchRunner:
         self._resolve_connector = resolve_connector
 
     def run(
-        self, session: Session, saved_search: SavedSearch, scanned_at: datetime | None = None
+        self,
+        session: Session,
+        saved_search: SavedSearch,
+        scanned_at: datetime | None = None,
+        fetch_cache: ScanFetchCache | None = None,
     ) -> SavedSearchRunResult:
         """`scanned_at` is the schedule anchor stamped as `last_scanned_at` - the
         scheduler passes its pass start time; when omitted (manual "Run now") the
@@ -103,7 +108,7 @@ class SavedSearchRunner:
         logger.info("Saved search %s started (marketplaces=%s)", saved_search.id, marketplaces)
 
         results = [
-            self._run_one_marketplace(session, saved_search, marketplace) for marketplace in marketplaces
+            self._run_one_marketplace(session, saved_search, marketplace, fetch_cache) for marketplace in marketplaces
         ]
 
         SavedSearchRepository(session).mark_scanned(saved_search, scanned_at=scanned_at)
@@ -120,11 +125,25 @@ class SavedSearchRunner:
         return SavedSearchRunResult(saved_search_id=saved_search.id, results=results)
 
     def _run_one_marketplace(
-        self, session: Session, saved_search: SavedSearch, marketplace: str
+        self,
+        session: Session,
+        saved_search: SavedSearch,
+        marketplace: str,
+        fetch_cache: ScanFetchCache | None = None,
     ) -> MarketplaceRunResult:
         try:
-            connector = self._resolve_connector(marketplace)
-            listings = connector.search(saved_search.query)
+            if fetch_cache is None:
+                connector = self._resolve_connector(marketplace)
+                listings = connector.search(saved_search.query)
+            else:
+                # Same marketplace + exact same query already fetched in this scan pass:
+                # reuse that result (a private copy). Everything below - relevance, dedup,
+                # attribution, outbox - still runs for this saved search alone.
+                listings = fetch_cache.fetch(
+                    marketplace,
+                    saved_search.query,
+                    lambda: self._resolve_connector(marketplace).search(saved_search.query),
+                )
         except MarketplaceConnectorError as exc:
             logger.error(
                 "Saved search %s / %s failed: %s", saved_search.id, marketplace, exc
@@ -196,7 +215,11 @@ class SavedSearchRunner:
         )
 
     def run_by_id(
-        self, session: Session, saved_search_id: int, scanned_at: datetime | None = None
+        self,
+        session: Session,
+        saved_search_id: int,
+        scanned_at: datetime | None = None,
+        fetch_cache: ScanFetchCache | None = None,
     ) -> SavedSearchRunResult | None:
         """Load the saved search fresh in this session and run it.
 
@@ -207,4 +230,4 @@ class SavedSearchRunner:
         if saved_search is None:
             logger.warning("Saved search %s not found - skipping", saved_search_id)
             return None
-        return self.run(session, saved_search, scanned_at=scanned_at)
+        return self.run(session, saved_search, scanned_at=scanned_at, fetch_cache=fetch_cache)

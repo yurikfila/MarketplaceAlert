@@ -53,6 +53,7 @@ def main() -> int:
         session_factory=SessionLocal,
         runner=saved_search_runner,
         run_guard=saved_search_run_guard,
+        due_grace_seconds=settings.scan_due_grace_seconds,
     )
     try:
         scanner.run_due_searches()

@@ -151,6 +151,14 @@ class Settings(BaseSettings):
     # core/saved_searches/schemas.py for the per-search minimum).
     scheduler_tick_seconds: float = 5.0
 
+    # Used only by the one-shot cron entrypoint (`scripts/run_due_scans.py`): how
+    # many seconds early a saved search may count as due, to absorb the jitter in
+    # when a cron pass actually starts. Without it a search whose interval equals
+    # the cron period (e.g. 5 minutes) is skipped whenever a pass starts a moment
+    # early and ends up running every second pass. Capped per search at half its
+    # interval. In-process scanning is unaffected (it always uses 0).
+    scan_due_grace_seconds: float = 30.0
+
     # Whether the Web Service process runs the saved-search scanner
     # in-process (a background thread, started in `main.py`'s `lifespan`)
     # or leaves scanning entirely to an external trigger (a Render Cron

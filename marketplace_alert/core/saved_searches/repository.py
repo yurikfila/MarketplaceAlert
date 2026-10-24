@@ -130,15 +130,32 @@ class SavedSearchRepository:
         self._session.flush()
         return True
 
-    def mark_scanned(self, saved_search: SavedSearch) -> None:
-        """Record that a scan just ran - never touches updated_at (definition unchanged)."""
-        saved_search.last_scanned_at = datetime.now(timezone.utc)
+    def mark_scanned(self, saved_search: SavedSearch, scanned_at: datetime | None = None) -> None:
+        """Record that a scan ran - never touches updated_at (definition unchanged).
+
+        `scanned_at` is the time the scan was *scheduled/started*, not when it
+        finished: "due" is `last_scanned_at + interval`, so stamping the
+        completion time made every search run later than its interval by its own
+        scan duration, and skipped whole cron ticks (a 5-minute search ran every
+        ~10 minutes). Defaults to now for callers that have no better anchor.
+        """
+        saved_search.last_scanned_at = scanned_at or datetime.now(timezone.utc)
         self._session.add(saved_search)
         self._session.flush()
 
-    def list_due_for_scan(self, now: datetime | None = None) -> list[SavedSearch]:
-        """Active saved searches never scanned, or whose interval has elapsed."""
+    def list_due_for_scan(self, now: datetime | None = None, grace_seconds: float = 0.0) -> list[SavedSearch]:
+        """Active saved searches never scanned, or whose interval has elapsed.
+
+        `grace_seconds` lets a search count as due slightly *before* its interval
+        has fully elapsed. It exists for the one-shot cron entrypoint, whose passes
+        start on a fixed period but with a few seconds of scheduler jitter: without
+        it a search whose interval equals the cron period is skipped whenever a pass
+        starts a moment early. The grace is capped at half the search's interval, so
+        it can never make a short-interval search due again right after it ran. The
+        default (0) keeps the strict behaviour used by in-process scanning.
+        """
         now = now or datetime.now(timezone.utc)
+        grace = max(0.0, grace_seconds)
         stmt = select(SavedSearch).where(SavedSearch.is_active.is_(True))
         due = []
         for saved_search in self._session.execute(stmt).scalars().all():
@@ -146,7 +163,8 @@ class SavedSearchRepository:
                 due.append(saved_search)
                 continue
             last_scanned_at = _as_aware_utc(saved_search.last_scanned_at)
-            next_due_at = last_scanned_at + timedelta(seconds=saved_search.scan_interval_seconds)
+            effective_grace = min(grace, saved_search.scan_interval_seconds / 2)
+            next_due_at = last_scanned_at + timedelta(seconds=saved_search.scan_interval_seconds - effective_grace)
             if next_due_at <= now:
                 due.append(saved_search)
         return due

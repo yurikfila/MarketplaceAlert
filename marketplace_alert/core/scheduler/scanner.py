@@ -11,6 +11,7 @@ stops the others or the loop itself.
 import logging
 import threading
 from collections.abc import Callable
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -30,11 +31,17 @@ class BackgroundScanner:
         runner: SavedSearchRunner,
         run_guard: SavedSearchRunGuard,
         tick_seconds: float = 5.0,
+        due_grace_seconds: float = 0.0,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._runner = runner
         self._run_guard = run_guard
         self._tick_seconds = tick_seconds
+        # Only the one-shot cron entrypoint sets a grace window (see
+        # `SavedSearchRepository.list_due_for_scan`); in-process scanning keeps 0.
+        self._due_grace_seconds = due_grace_seconds
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
@@ -62,17 +69,27 @@ class BackgroundScanner:
             self._stop_event.wait(self._tick_seconds)
 
     def run_due_searches(self) -> None:
-        """One tick: find due saved searches and run each in its own session/transaction."""
+        """One tick: find due saved searches and run each in its own session/transaction.
+
+        Every search in this pass is stamped with the *pass start* time (taken once,
+        before anything runs), so how long an earlier search took can neither delay
+        a later one nor push the next pass's due check past its tick."""
+        pass_started_at = self._clock()
         list_session = self._session_factory()
         try:
-            due_ids = [s.id for s in SavedSearchRepository(list_session).list_due_for_scan()]
+            due_ids = [
+                s.id
+                for s in SavedSearchRepository(list_session).list_due_for_scan(
+                    now=pass_started_at, grace_seconds=self._due_grace_seconds
+                )
+            ]
         finally:
             list_session.close()
 
         for saved_search_id in due_ids:
-            self._run_one(saved_search_id)
+            self._run_one(saved_search_id, pass_started_at)
 
-    def _run_one(self, saved_search_id: int) -> None:
+    def _run_one(self, saved_search_id: int, scanned_at: datetime) -> None:
         with self._run_guard.acquire(saved_search_id) as acquired:
             if not acquired:
                 logger.info("Saved search %s already running - skipping this tick", saved_search_id)
@@ -80,7 +97,7 @@ class BackgroundScanner:
 
             session = self._session_factory()
             try:
-                self._runner.run_by_id(session, saved_search_id)
+                self._runner.run_by_id(session, saved_search_id, scanned_at=scanned_at)
                 session.commit()
             except Exception:
                 session.rollback()

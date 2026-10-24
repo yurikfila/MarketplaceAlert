@@ -31,6 +31,7 @@ unchanged.
 """
 
 import logging
+from datetime import datetime, timezone
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -91,7 +92,13 @@ class SavedSearchRunner:
     ) -> None:
         self._resolve_connector = resolve_connector
 
-    def run(self, session: Session, saved_search: SavedSearch) -> SavedSearchRunResult:
+    def run(
+        self, session: Session, saved_search: SavedSearch, scanned_at: datetime | None = None
+    ) -> SavedSearchRunResult:
+        """`scanned_at` is the schedule anchor stamped as `last_scanned_at` - the
+        scheduler passes its pass start time; when omitted (manual "Run now") the
+        time this run *began* is used, never the completion time."""
+        scanned_at = scanned_at or datetime.now(timezone.utc)
         marketplaces = saved_search.marketplaces
         logger.info("Saved search %s started (marketplaces=%s)", saved_search.id, marketplaces)
 
@@ -99,7 +106,7 @@ class SavedSearchRunner:
             self._run_one_marketplace(session, saved_search, marketplace) for marketplace in marketplaces
         ]
 
-        SavedSearchRepository(session).mark_scanned(saved_search)
+        SavedSearchRepository(session).mark_scanned(saved_search, scanned_at=scanned_at)
 
         total_new = sum(r.new_count for r in results)
         total_seen = sum(r.already_seen_count for r in results)
@@ -188,7 +195,9 @@ class SavedSearchRunner:
             rejected_count=filter_result.rejected_count,
         )
 
-    def run_by_id(self, session: Session, saved_search_id: int) -> SavedSearchRunResult | None:
+    def run_by_id(
+        self, session: Session, saved_search_id: int, scanned_at: datetime | None = None
+    ) -> SavedSearchRunResult | None:
         """Load the saved search fresh in this session and run it.
 
         Returns None if it no longer exists (e.g. deleted between being
@@ -198,4 +207,4 @@ class SavedSearchRunner:
         if saved_search is None:
             logger.warning("Saved search %s not found - skipping", saved_search_id)
             return None
-        return self.run(session, saved_search)
+        return self.run(session, saved_search, scanned_at=scanned_at)
